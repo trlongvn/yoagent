@@ -1,0 +1,21 @@
+{
+  "model_id": "qwen3-0.6b",
+  "name": "Qwen + Ollama embedding",
+  "provider": "local",
+  "api": "openai_completions",
+  "base_url": "http://localhost:1234/v1",
+  "reasoning": false,
+  "context_window": 4096,
+  "max_tokens": 1024,
+  "compat": "qwen",
+  "headers": {},
+  "memory": {
+    "backend": "ollama",
+    "model": "nomic-embed-text",
+    "base_url": "http://localhost:11434",
+    "api_key": "",
+    "dims": 768,
+    "endpoint_path": "",
+    "db_path": "memory/ollama"
+  }
+}

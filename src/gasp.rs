@@ -1,15 +1,15 @@
-//! GASP bridge — record agent runs into a [GASP](https://github.com/yologdev/gasp)
+//! GASP bridge â€” record agent runs into a [GASP](https://github.com/yologdev/gasp)
 //! agent repo (feature `gasp`).
 //!
 //! GASP ("the repo is the agent") keeps an agent's durable self in a git
 //! repository: an append-only semantic event log (`state/events.jsonl`) that
 //! folds into a typed goal/run/model/tool graph, with restore = `clone +
-//! replay`. This module is the bridge between yoagent's [`AgentEvent`] stream
-//! and the [`yoagent_state`] reference runtime — **zero agent-loop changes**;
+//! replay`. This module is the bridge between agent's [`AgentEvent`] stream
+//! and the [`yoagent_state`] reference runtime â€” **zero agent-loop changes**;
 //! the recorder is just another consumer of the event stream.
 //!
 //! ```no_run
-//! use yoagent::{Agent, gasp::{GaspRecorder, GoalRef}, provider::ModelConfig};
+//! use agent::{Agent, gasp::{GaspRecorder, GoalRef}, provider::ModelConfig};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,14 +31,14 @@
 //!
 //! # What is persisted
 //!
-//! The semantic log stores bounded one-line summaries — the **task string
+//! The semantic log stores bounded one-line summaries â€” the **task string
 //! (verbatim)**, model ids, and the **first 200 characters of tool inputs,
-//! tool outputs, and assistant text** — never full transcripts. If secrets
+//! tool outputs, and assistant text** â€” never full transcripts. If secrets
 //! can flow through tool arguments or outputs (API keys, connection
 //! strings), install a redacting summarizer via
 //! [`GaspRecorder::with_summarizer`] **before** recording: the log lives in a
 //! git repo designed to be cloned and shared, and committed history is hard
-//! to scrub. Full transcripts belong in GASP's cold `transcripts/` tier —
+//! to scrub. Full transcripts belong in GASP's cold `transcripts/` tier â€”
 //! [`Session::to_jsonl`](crate::Session::to_jsonl) is a natural format for it.
 //!
 //! Recording requires a git identity (`user.name`/`user.email`), like any
@@ -55,12 +55,12 @@ use yoagent_state::{
 // goal/task/verdict tier need no direct `yoagent-state` dependency, so every
 // type on that path must be nameable here. Three rounds of bug reports each
 // found one tier still missing, so the rule is now mechanical rather than
-// judged — see `tests/gasp_test.rs`:
+// judged â€” see `tests/gasp_test.rs`:
 //
-//   1. the receiver (`YoAgentState`) and what it needs        — #111
-//   2. the recorded structs and their id types                — #115
+//   1. the receiver (`YoAgentState`) and what it needs        â€” #111
+//   2. the recorded structs and their id types                â€” #115
 //   3. those structs' *field* types, and the argument types
-//      of every `YoAgentState` method                         — #117
+//      of every `YoAgentState` method                         â€” #117
 //
 // (3) is the one that subsumes the others: a struct can be constructible
 // without being usable, because a smart constructor defaults a field whose
@@ -93,7 +93,7 @@ type Summarizer = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// One recorder = one writer (`worker_id` names it in the repo lease) and one
 /// goal; each [`recording_sender`](Self::recording_sender) call records one
 /// run. **Runs are sequential**: a second in-flight `recording_sender` run
-/// fails (`run X is already open`) — one run at a time per repo. Events are
+/// fails (`run X is already open`) â€” one run at a time per repo. Events are
 /// appended to `state/events.jsonl` as they arrive and committed when the run
 /// closes, so the git history stays append-only (GASP conformance check 4).
 /// The repo must have a **single writer**: two live workers sharing a repo
@@ -133,7 +133,7 @@ impl GaspRecorder {
     /// Open a recorder on a store the caller owns.
     ///
     /// This is the extension path for applications that record more than the
-    /// run/model/tool tier — goals, tasks, verdicts, evals — into the *same*
+    /// run/model/tool tier â€” goals, tasks, verdicts, evals â€” into the *same*
     /// ledger: open the [`GitEventStore`] yourself, build a
     /// [`YoAgentState`](yoagent_state::YoAgentState) on a clone of it for your
     /// own `record_*` calls, and hand the recorder this handle. One store, one
@@ -146,7 +146,7 @@ impl GaspRecorder {
     /// - `worker_id` (in [`GitEventStore::open`]) distinguishes writers in the
     ///   log; use a distinct id per host/CI lane.
     /// - The recorder commits at **run close** (stream end). Events appended
-    ///   between commits are durable in the working tree but unpushed —
+    ///   between commits are durable in the working tree but unpushed â€”
     ///   callers on ephemeral runners should push after each run, or crashed
     ///   sessions vanish from the corpus.
     /// - A run left open by a crashed process is closed as `"interrupted"` on
@@ -161,7 +161,7 @@ impl GaspRecorder {
 
         // The open-run marker is in-memory only; `resume_open_run` restores
         // it from the log. A run left open by a crashed process is closed
-        // here for log hygiene — no unpaired `run.started` may leak across
+        // here for log hygiene â€” no unpaired `run.started` may leak across
         // process boundaries.
         if let Some(stale) = state.resume_open_run().await? {
             tracing::warn!(run = %stale, "closing stale open run as interrupted");
@@ -171,7 +171,7 @@ impl GaspRecorder {
                 .map_err(|e| {
                     StateError::Validation(format!(
                         "found an open run and could not close it ({e}); if another \
-                         worker is live on this repo, do not share it — GASP repos \
+                         worker is live on this repo, do not share it â€” GASP repos \
                          are single-writer"
                     ))
                 })?;
@@ -196,8 +196,8 @@ impl GaspRecorder {
         };
 
         // Commit the scaffolding (AGENT.md, identity/, .gitignore) plus any
-        // events recorded above. Without this, a fresh `git clone` — the
-        // restore operation GASP is built around — has no manifest and fails
+        // events recorded above. Without this, a fresh `git clone` â€” the
+        // restore operation GASP is built around â€” has no manifest and fails
         // conformance check 6.
         commit_scaffolding(&store)?;
 
@@ -210,7 +210,7 @@ impl GaspRecorder {
         })
     }
 
-    /// Replace the default summarizer (single line, 200 chars) — e.g. to
+    /// Replace the default summarizer (single line, 200 chars) â€” e.g. to
     /// redact secrets from tool arguments/outputs before they are persisted
     /// to the shareable git repo.
     pub fn with_summarizer(
@@ -224,14 +224,14 @@ impl GaspRecorder {
     /// The goal this recorder's runs belong to (persist it to reuse across
     /// processes via [`GoalRef::Existing`]).
     /// The recorder's own [`YoAgentState`], for recording tiers this crate
-    /// does not model — goals, tasks, evals, decisions, patches.
+    /// does not model â€” goals, tasks, evals, decisions, patches.
     ///
     /// Prefer this over opening a second [`GitEventStore`] on the same root: a
     /// GASP repo is single-writer behind a 600-second lease, so a second store
     /// collides with this one rather than cooperating.
     ///
     /// ```no_run
-    /// # use yoagent::gasp::{GaspRecorder, GoalRef, Task, TaskId, TaskStatus};
+    /// # use agent::gasp::{GaspRecorder, GoalRef, Task, TaskId, TaskStatus};
     /// # async fn demo(recorder: &GaspRecorder) -> Result<(), Box<dyn std::error::Error>> {
     /// recorder.state().record_task(Task {
     ///     id: TaskId::new("task_1"),
@@ -250,12 +250,12 @@ impl GaspRecorder {
     }
 
     /// The underlying event store, for callers that need it directly (e.g. to
-    /// scan events). Shares this recorder's lease — see [`state`](Self::state).
+    /// scan events). Shares this recorder's lease â€” see [`state`](Self::state).
     pub fn store(&self) -> &GitEventStore {
         &self.store
     }
 
-    /// The actor recorded events are attributed to — the first argument of the
+    /// The actor recorded events are attributed to â€” the first argument of the
     /// `YoAgentState::record_*` methods.
     pub fn actor(&self) -> &ActorRef {
         &self.actor
@@ -267,11 +267,11 @@ impl GaspRecorder {
 
     /// Returns a sender to pass to
     /// [`Agent::prompt_with_sender`](crate::Agent::prompt_with_sender) (or
-    /// the raw loop) and a handle resolving to the recorded [`RunId`] —
+    /// the raw loop) and a handle resolving to the recorded [`RunId`] â€”
     /// `Ok(None)` when the stream carried no run at all (`AgentStart` never
     /// arrived), so callers never receive an id that isn't in the log.
     ///
-    /// **The handle is the only error channel** — always await it. If
+    /// **The handle is the only error channel** â€” always await it. If
     /// recording fails mid-run (disk, lease, git), recording stops and the
     /// error is returned by the handle, but **event forwarding continues**:
     /// every event is teed to `forward` (your UI) before recording, so a
@@ -307,7 +307,7 @@ struct RunTracking {
 
 /// Map the event stream onto the GASP sink. Runs in its own task; ends when
 /// the sender side is dropped (the loop finished, or the caller dropped the
-/// `*_with_sender` future mid-run / the loop task panicked — `AgentEnd` is
+/// `*_with_sender` future mid-run / the loop task panicked â€” `AgentEnd` is
 /// otherwise sent unconditionally).
 async fn consume(
     sink: YoAgentStateAdapter<GitEventStore>,
@@ -353,7 +353,7 @@ async fn consume(
         return Err(e);
     }
     if !tracking.started {
-        // No AgentStart ever arrived: nothing was recorded — say so instead
+        // No AgentStart ever arrived: nothing was recorded â€” say so instead
         // of fabricating a RunId that exists nowhere in the log.
         return Ok(None);
     }
@@ -481,13 +481,13 @@ async fn record_event(
             ..
         } if tracking.started => {
             // Without this the run's outcome stays whatever the last stop
-            // reason mapped to — `ToolUse` -> "completed" — so the durable log
+            // reason mapped to â€” `ToolUse` -> "completed" â€” so the durable log
             // recorded a budget-exhausting loop abort as a clean success, the
             // exact opposite of what this event exists to make auditable.
             tracking.outcome = format!("loop_aborted:{tool_name}");
         }
         AgentEvent::InputRejected { .. } if tracking.started => {
-            // A policy rejection is not a crash — label it distinctly in the
+            // A policy rejection is not a crash â€” label it distinctly in the
             // durable log.
             tracking.outcome = "rejected".to_string();
         }
@@ -505,7 +505,7 @@ async fn record_event(
                     let mut m = serde_json::to_value(stats).unwrap_or_else(
                         |_| serde_json::json!({ "error": "session stats not serializable" }),
                     );
-                    // Derived, so it is not a struct field — but it is the
+                    // Derived, so it is not a struct field â€” but it is the
                     // number an audit actually reads.
                     if let Some(obj) = m.as_object_mut() {
                         obj.insert(
@@ -562,9 +562,9 @@ fn commit_scaffolding(store: &GitEventStore) -> Result<(), StateError> {
     Ok(())
 }
 
-/// One-line, bounded summary for semantic events — full content belongs in
+/// One-line, bounded summary for semantic events â€” full content belongs in
 /// the transcripts tier, not the event log.
-/// Stable identity for a tool call, so calls can be *matched* across a log —
+/// Stable identity for a tool call, so calls can be *matched* across a log â€”
 /// `input_summary` is a truncated human summary and cannot be.
 ///
 /// Normalized per tool rather than hashing the raw argument bytes: the file
@@ -612,7 +612,7 @@ fn summarize(text: &str) -> String {
         one_line
     } else {
         let truncated: String = one_line.chars().take(200).collect();
-        format!("{truncated}…")
+        format!("{truncated}\u{2026}")
     }
 }
 
@@ -681,11 +681,11 @@ mod tests {
     #[test]
     fn summarize_collapses_and_truncates_on_char_boundaries() {
         assert_eq!(summarize("a\nb\t c"), "a b c");
-        // 300 multibyte chars: must truncate at 200 CHARS (not bytes) + '…'.
-        let long: String = "ö".repeat(300);
+        // 300 multibyte chars: must truncate at 200 CHARS (not bytes) + U+2026.
+        let long: String = "ä".repeat(300);
         let s = summarize(&long);
         assert_eq!(s.chars().count(), 201);
-        assert!(s.ends_with('…'));
+        assert!(s.ends_with('\u{2026}'));
         // Exactly 200 chars: untouched.
         let exact: String = "x".repeat(200);
         assert_eq!(summarize(&exact), exact);

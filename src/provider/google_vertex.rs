@@ -12,6 +12,9 @@
 
 use super::model::ModelConfig;
 use super::traits::*;
+// Reuse the shared Google SSE error helpers instead of reimplementing.
+use super::google::is_error_payload;
+use super::traits::classify_sse_error_event;
 use crate::types::*;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -139,8 +142,11 @@ async fn parse_google_sse_response(
                 match chunk {
                     None => break,
                     Some(Err(e)) => {
-                        warn!("Vertex stream error: {}", e);
-                        break;
+                        // Match the other providers: a transport failure is an
+                        // error (and retryable), not a silently truncated turn.
+                        let provider_err = ProviderError::Network(e.to_string());
+                        warn!("Vertex stream error: {}", provider_err);
+                        return Err(provider_err);
                     }
                     Some(Ok(bytes)) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -157,6 +163,18 @@ async fn parse_google_sse_response(
 
                             if data.is_empty() {
                                 continue;
+                            }
+
+                            // Google reports mid-stream failures as
+                            // {"error": {...}} payloads, which would otherwise
+                            // deserialize into an empty chunk and vanish. Without
+                            // this check a context-overflow envelope parses as
+                            // Chunk{candidates:None} and the turn returns a
+                            // silently truncated Ok — compaction never fires.
+                            if is_error_payload(data) {
+                                let provider_err = classify_sse_error_event(data);
+                                warn!("Vertex in-stream error: {}", provider_err);
+                                return Err(provider_err);
                             }
 
                             #[derive(Deserialize)]

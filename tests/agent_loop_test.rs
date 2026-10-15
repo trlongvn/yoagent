@@ -1,12 +1,12 @@
 //! Tests for the core agent loop using MockProvider.
 
+use ::agent::agent_loop::{agent_loop, agent_loop_continue, AgentLoopConfig};
+use ::agent::context::ExecutionLimits;
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yoagent::agent_loop::{agent_loop, agent_loop_continue, AgentLoopConfig};
-use yoagent::context::ExecutionLimits;
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::*;
 
 fn make_config(provider: MockProvider) -> AgentLoopConfig {
     AgentLoopConfig {
@@ -19,6 +19,7 @@ fn make_config(provider: MockProvider) -> AgentLoopConfig {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -28,7 +29,7 @@ fn make_config(provider: MockProvider) -> AgentLoopConfig {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(),
+        retry_config: agent::RetryConfig::default(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -718,7 +719,7 @@ struct FailThenSucceedProvider {
     inner: MockProvider,
 }
 
-use yoagent::provider::{ProviderError, StreamConfig, StreamEvent, StreamProvider};
+use ::agent::provider::{ProviderError, StreamConfig, StreamEvent, StreamProvider};
 
 struct UsageProvider {
     usage: Usage,
@@ -732,7 +733,7 @@ impl StreamProvider for UsageProvider {
         _config: StreamConfig,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<yoagent::Message, ProviderError> {
+    ) -> Result<agent::Message, ProviderError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let message = Message::assistant(
@@ -777,6 +778,7 @@ async fn test_execution_limit_counts_cached_tokens() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: Some(Box::new(|| {
             vec![AgentMessage::Llm(Message::user("follow up"))]
@@ -793,7 +795,7 @@ async fn test_execution_limit_counts_cached_tokens() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(),
+        retry_config: agent::RetryConfig::default(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -843,7 +845,7 @@ impl StreamProvider for FailThenSucceedProvider {
         config: StreamConfig,
         tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<yoagent::Message, ProviderError> {
+    ) -> Result<agent::Message, ProviderError> {
         let attempt = self
             .fail_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -883,6 +885,7 @@ async fn test_retry_on_rate_limit_succeeds() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -892,7 +895,7 @@ async fn test_retry_on_rate_limit_succeeds() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig {
+        retry_config: agent::RetryConfig {
             max_retries: 3,
             initial_delay_ms: 10,
             backoff_multiplier: 2.0,
@@ -954,6 +957,7 @@ async fn test_retry_exhausted_returns_error() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -963,7 +967,7 @@ async fn test_retry_exhausted_returns_error() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig {
+        retry_config: agent::RetryConfig {
             max_retries: 2,
             initial_delay_ms: 10,
             backoff_multiplier: 2.0,
@@ -1032,6 +1036,7 @@ async fn test_no_retry_on_auth_error() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -1041,7 +1046,7 @@ async fn test_no_retry_on_auth_error() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(), // 3 retries, but auth is not retryable
+        retry_config: agent::RetryConfig::default(), // 3 retries, but auth is not retryable
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -1093,6 +1098,7 @@ async fn test_retry_none_disables_retries() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -1102,7 +1108,7 @@ async fn test_retry_none_disables_retries() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::none(), // disabled
+        retry_config: agent::RetryConfig::none(), // disabled
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -1330,6 +1336,7 @@ async fn test_on_error_fires_on_provider_error() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -1339,7 +1346,7 @@ async fn test_on_error_fires_on_provider_error() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::none(),
+        retry_config: agent::RetryConfig::none(),
         before_turn: None,
         after_turn: None,
         on_error: Some(std::sync::Arc::new(move |err| {
@@ -1960,8 +1967,8 @@ async fn test_filter_non_text_content_only_text_extracted() {
 
 #[tokio::test]
 async fn test_default_compaction_matches_compact_messages() {
-    use yoagent::context::{compact_messages, ContextConfig, DefaultCompaction};
-    use yoagent::CompactionStrategy;
+    use agent::context::{compact_messages, ContextConfig, DefaultCompaction};
+    use agent::CompactionStrategy;
 
     let mut messages = Vec::new();
     for i in 0..100 {
@@ -1999,8 +2006,8 @@ async fn test_default_compaction_matches_compact_messages() {
 
 #[tokio::test]
 async fn test_custom_compaction_strategy_is_called() {
-    use yoagent::context::ContextConfig;
-    use yoagent::CompactionStrategy;
+    use agent::context::ContextConfig;
+    use agent::CompactionStrategy;
 
     /// A custom strategy that prepends a marker message, then delegates
     /// to the default compaction.
@@ -2034,6 +2041,7 @@ async fn test_custom_compaction_strategy_is_called() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: Some(ContextConfig {
@@ -2050,7 +2058,7 @@ async fn test_custom_compaction_strategy_is_called() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::none(),
+        retry_config: agent::RetryConfig::none(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -2099,7 +2107,7 @@ async fn test_custom_compaction_strategy_is_called() {
 
 #[tokio::test]
 async fn test_none_compaction_strategy_uses_default() {
-    use yoagent::context::ContextConfig;
+    use agent::context::ContextConfig;
 
     // Provider returns a simple text response
     let provider = MockProvider::text("Got it.");
@@ -2114,6 +2122,7 @@ async fn test_none_compaction_strategy_uses_default() {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: Some(ContextConfig {
@@ -2130,7 +2139,7 @@ async fn test_none_compaction_strategy_uses_default() {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::none(),
+        retry_config: agent::RetryConfig::none(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -2263,11 +2272,11 @@ struct RecordingCompaction {
     calls: std::sync::Mutex<Vec<(usize, usize)>>, // (max_context_tokens, system_prompt_tokens)
 }
 
-impl yoagent::CompactionStrategy for RecordingCompaction {
+impl agent::CompactionStrategy for RecordingCompaction {
     fn compact(
         &self,
         messages: Vec<AgentMessage>,
-        config: &yoagent::context::ContextConfig,
+        config: &agent::context::ContextConfig,
     ) -> Vec<AgentMessage> {
         self.calls
             .lock()
@@ -2292,11 +2301,12 @@ fn calibration_config(
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: Some(Box::new(|| {
             vec![AgentMessage::Llm(Message::user("follow up"))]
         })),
-        context_config: Some(yoagent::context::ContextConfig {
+        context_config: Some(agent::context::ContextConfig {
             max_context_tokens,
             system_prompt_tokens: 500,
             keep_recent: 1,
@@ -2315,7 +2325,7 @@ fn calibration_config(
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::none(),
+        retry_config: agent::RetryConfig::none(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -2441,7 +2451,7 @@ fn tool_then_text() -> MockProvider {
 }
 
 async fn run_with_context_config(
-    config: Option<yoagent::context::ContextConfig>,
+    config: Option<agent::context::ContextConfig>,
 ) -> (Vec<AgentMessage>, Vec<AgentEvent>) {
     let mut loop_config = make_config(tool_then_text());
     loop_config.context_config = config;
@@ -2480,7 +2490,7 @@ fn tool_result_lines(messages: &[AgentMessage]) -> usize {
 
 #[tokio::test]
 async fn tool_output_is_capped_on_append_when_enabled() {
-    let (messages, events) = run_with_context_config(Some(yoagent::context::ContextConfig {
+    let (messages, events) = run_with_context_config(Some(agent::context::ContextConfig {
         // Budget far above the output: without on-append capping nothing is
         // truncated, which is exactly the history compaction later rewrites.
         max_context_tokens: 1_000_000,
@@ -2507,7 +2517,7 @@ async fn tool_output_is_capped_on_append_when_enabled() {
 
 #[tokio::test]
 async fn tool_output_is_capped_on_append_by_default() {
-    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+    let (messages, _) = run_with_context_config(Some(agent::context::ContextConfig {
         max_context_tokens: 1_000_000,
         system_prompt_tokens: 0,
         tool_output_max_lines: 25,
@@ -2524,7 +2534,7 @@ async fn tool_output_is_capped_on_append_by_default() {
 
 #[tokio::test]
 async fn on_append_capping_can_be_turned_off() {
-    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+    let (messages, _) = run_with_context_config(Some(agent::context::ContextConfig {
         max_context_tokens: 1_000_000,
         system_prompt_tokens: 0,
         tool_output_max_lines: 25,
@@ -2543,7 +2553,7 @@ async fn per_tool_override_exempts_a_tool_from_capping() {
     let mut overrides = std::collections::HashMap::new();
     overrides.insert("big_output".to_string(), usize::MAX);
 
-    let (messages, _) = run_with_context_config(Some(yoagent::context::ContextConfig {
+    let (messages, _) = run_with_context_config(Some(agent::context::ContextConfig {
         max_context_tokens: 1_000_000,
         system_prompt_tokens: 0,
         tool_output_max_lines: 25,
@@ -2757,8 +2767,8 @@ async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
         tools: vec![],
         system_prompt: String::new(),
     };
-    let mut priced = yoagent::provider::ModelConfig::anthropic("mock", "Mock");
-    priced.cost = yoagent::provider::CostConfig::new(3.0, 15.0);
+    let mut priced = agent::provider::ModelConfig::anthropic("mock", "Mock");
+    priced.cost = agent::provider::CostConfig::new(3.0, 15.0);
     let mut config = make_config(MockProvider::new(responses()));
     config.model_config = Some(priced);
     config.get_follow_up_messages = follow_up_once();
@@ -2829,11 +2839,11 @@ async fn total_tokens_is_not_summed_into_the_rollup() {
 #[tokio::test]
 async fn a_no_op_compaction_is_not_counted() {
     struct NoOp;
-    impl yoagent::context::CompactionStrategy for NoOp {
+    impl agent::context::CompactionStrategy for NoOp {
         fn compact(
             &self,
             messages: Vec<AgentMessage>,
-            _config: &yoagent::context::ContextConfig,
+            _config: &agent::context::ContextConfig,
         ) -> Vec<AgentMessage> {
             messages
         }
@@ -2850,7 +2860,7 @@ async fn a_no_op_compaction_is_not_counted() {
         MockResponse::TextWithUsage("b".into(), usage(10, 10, 0, 0)),
     ]));
     // A tiny budget guarantees `compact` is called on every turn.
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         max_context_tokens: 10,
         system_prompt_tokens: 0,
         ..Default::default()
@@ -2880,11 +2890,11 @@ async fn a_no_op_compaction_is_not_counted() {
 #[tokio::test]
 async fn an_in_place_rewrite_is_counted_despite_an_unchanged_message_count() {
     struct ShrinkInPlace;
-    impl yoagent::context::CompactionStrategy for ShrinkInPlace {
+    impl agent::context::CompactionStrategy for ShrinkInPlace {
         fn compact(
             &self,
             messages: Vec<AgentMessage>,
-            _config: &yoagent::context::ContextConfig,
+            _config: &agent::context::ContextConfig,
         ) -> Vec<AgentMessage> {
             let before = messages.len();
             let out: Vec<AgentMessage> = messages
@@ -2914,7 +2924,7 @@ async fn an_in_place_rewrite_is_counted_despite_an_unchanged_message_count() {
         "a".into(),
         usage(10, 10, 0, 0),
     )]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         max_context_tokens: 10,
         system_prompt_tokens: 0,
         ..Default::default()
@@ -2976,7 +2986,7 @@ impl AgentTool for StashBigTool {
     }
 }
 
-async fn run_with_sink(sink: Option<yoagent::shared_state::SharedState>) -> Vec<AgentMessage> {
+async fn run_with_sink(sink: Option<agent::shared_state::SharedState>) -> Vec<AgentMessage> {
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -2991,7 +3001,7 @@ async fn run_with_sink(sink: Option<yoagent::shared_state::SharedState>) -> Vec<
         }]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -3041,7 +3051,7 @@ async fn without_a_sink_truncation_is_unchanged() {
 /// The whole point: what head-tail truncation elided is retrievable.
 #[tokio::test]
 async fn a_truncated_output_is_stashed_and_the_marker_names_the_key() {
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let messages = run_with_sink(Some(state.clone())).await;
     let text = tool_result_text(&messages);
 
@@ -3101,7 +3111,7 @@ async fn output_that_fits_is_not_stashed() {
         }
     }
 
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -3116,7 +3126,7 @@ async fn output_that_fits_is_not_stashed() {
         }]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -3141,29 +3151,22 @@ async fn output_that_fits_is_not_stashed() {
 struct FailingBackend;
 
 #[async_trait::async_trait]
-impl yoagent::shared_state::SharedStateBackend for FailingBackend {
-    async fn get(
-        &self,
-        _k: &str,
-    ) -> Result<Option<String>, yoagent::shared_state::SharedStateError> {
+impl agent::shared_state::SharedStateBackend for FailingBackend {
+    async fn get(&self, _k: &str) -> Result<Option<String>, agent::shared_state::SharedStateError> {
         Ok(None)
     }
-    async fn set(
-        &self,
-        _k: &str,
-        _v: String,
-    ) -> Result<(), yoagent::shared_state::SharedStateError> {
-        Err(yoagent::shared_state::SharedStateError::Io(
+    async fn set(&self, _k: &str, _v: String) -> Result<(), agent::shared_state::SharedStateError> {
+        Err(agent::shared_state::SharedStateError::Io(
             std::io::Error::other("disk on fire"),
         ))
     }
-    async fn remove(&self, _k: &str) -> Result<bool, yoagent::shared_state::SharedStateError> {
+    async fn remove(&self, _k: &str) -> Result<bool, agent::shared_state::SharedStateError> {
         Ok(false)
     }
-    async fn keys(&self) -> Result<Vec<String>, yoagent::shared_state::SharedStateError> {
+    async fn keys(&self) -> Result<Vec<String>, agent::shared_state::SharedStateError> {
         Ok(vec![])
     }
-    async fn summary(&self) -> Result<String, yoagent::shared_state::SharedStateError> {
+    async fn summary(&self) -> Result<String, agent::shared_state::SharedStateError> {
         Ok(String::new())
     }
 }
@@ -3172,7 +3175,7 @@ impl yoagent::shared_state::SharedStateBackend for FailingBackend {
 /// than promising a retrieval that cannot happen.
 #[tokio::test]
 async fn a_failed_stash_leaves_an_unkeyed_marker() {
-    let sink = yoagent::shared_state::SharedState::with_backend(FailingBackend);
+    let sink = agent::shared_state::SharedState::with_backend(FailingBackend);
     let text = tool_result_text(&run_with_sink(Some(sink)).await);
 
     assert!(text.contains("lines truncated"), "still truncated");
@@ -3186,7 +3189,7 @@ async fn a_failed_stash_leaves_an_unkeyed_marker() {
 /// truncated results. Each needs its own key, and each key must resolve.
 #[tokio::test]
 async fn parallel_truncated_results_each_get_a_resolvable_key() {
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -3208,7 +3211,7 @@ async fn parallel_truncated_results_each_get_a_resolvable_key() {
         ]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -3257,9 +3260,9 @@ async fn parallel_truncated_results_each_get_a_resolvable_key() {
 /// `config.tool_output_sink` directly, bypassing it entirely.
 #[tokio::test]
 async fn agent_with_shared_state_registers_the_tool_and_wires_the_sink() {
-    use yoagent::provider::ModelConfig;
+    use agent::provider::ModelConfig;
 
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let mut agent = Agent::from_provider(
         MockProvider::new(vec![
             MockResponse::ToolCalls(vec![MockToolCall {
@@ -3273,7 +3276,7 @@ async fn agent_with_shared_state_registers_the_tool_and_wires_the_sink() {
     )
     .with_tools(vec![Box::new(StashBigTool)])
     .with_shared_state(state.clone())
-    .with_context_config(yoagent::context::ContextConfig {
+    .with_context_config(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -3314,9 +3317,9 @@ async fn agent_with_shared_state_registers_the_tool_and_wires_the_sink() {
 /// tool names with a 400, which would brick the agent at the first request.
 #[tokio::test]
 async fn with_shared_state_is_idempotent() {
-    use yoagent::provider::ModelConfig;
+    use agent::provider::ModelConfig;
 
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let mut agent = Agent::from_provider(MockProvider::text("hi"), ModelConfig::mock())
         .with_shared_state(state.clone())
         .with_shared_state(state);
@@ -3368,7 +3371,7 @@ fn repeat_call(n: usize, args: serde_json::Value) -> Vec<MockResponse> {
 /// every provider rejects, while the event stream looked perfect.
 async fn run_with_limits_msgs(
     responses: Vec<MockResponse>,
-    limits: yoagent::context::ExecutionLimits,
+    limits: agent::context::ExecutionLimits,
 ) -> (Vec<AgentEvent>, Vec<AgentMessage>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
@@ -3441,7 +3444,7 @@ fn assert_tool_calls_are_answered(messages: &[AgentMessage], context: &str) {
 
 async fn run_with_limits(
     responses: Vec<MockResponse>,
-    limits: yoagent::context::ExecutionLimits,
+    limits: agent::context::ExecutionLimits,
 ) -> Vec<AgentEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
@@ -3472,7 +3475,7 @@ async fn run_with_limits(
 async fn a_steer_nudge_does_not_orphan_the_tool_calls_it_interrupts() {
     let (_events, messages) = run_with_limits_msgs(
         repeat_call(6, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3487,7 +3490,7 @@ async fn a_steer_nudge_does_not_orphan_the_tool_calls_it_interrupts() {
 async fn an_abort_answers_its_outstanding_tool_calls_before_stopping() {
     let (events, messages) = run_with_limits_msgs(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3504,7 +3507,7 @@ async fn an_abort_answers_its_outstanding_tool_calls_before_stopping() {
 async fn an_abort_actually_halts_the_run() {
     let (events, _messages) = run_with_limits_msgs(
         repeat_call(40, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3523,7 +3526,7 @@ async fn an_abort_actually_halts_the_run() {
 #[test]
 fn loop_detection_is_enabled_by_default() {
     assert_eq!(
-        yoagent::context::ExecutionLimits::default().max_consecutive_identical_tool_calls,
+        agent::context::ExecutionLimits::default().max_consecutive_identical_tool_calls,
         Some(3),
         "loop detection must ship on; a change here turns it off for everyone who \
          never sets the field"
@@ -3539,7 +3542,7 @@ fn loop_detection_is_enabled_by_default() {
 async fn loop_detection_messages_are_clean_prose() {
     let (_events, messages) = run_with_limits_msgs(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3575,7 +3578,7 @@ async fn loop_detection_messages_are_clean_prose() {
 /// extra wasted call before intervention.
 #[test]
 fn the_threshold_trips_on_the_nth_consecutive_call() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
     );
@@ -3600,7 +3603,7 @@ fn the_threshold_trips_on_the_nth_consecutive_call() {
 /// per response, so only the across-turns path was ever walked.
 #[test]
 fn identical_calls_within_one_batch_trip_the_detector() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
     );
@@ -3625,7 +3628,7 @@ fn identical_calls_within_one_batch_trip_the_detector() {
 /// never reached `steered`, giving it a free pass on the next turn too.
 #[test]
 fn a_batch_reports_its_most_severe_verdict() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
     );
@@ -3650,7 +3653,7 @@ fn a_batch_reports_its_most_severe_verdict() {
 /// in key order are the same call.
 #[test]
 fn key_order_does_not_disguise_a_repeat() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(2)),
     );
@@ -3666,7 +3669,7 @@ fn key_order_does_not_disguise_a_repeat() {
 /// `Some(0)` disables the check rather than tripping on every call.
 #[test]
 fn a_zero_threshold_disables_the_check() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(0)),
     );
@@ -3684,7 +3687,7 @@ fn a_zero_threshold_disables_the_check() {
 /// through a list calls one tool repeatedly and legitimately.
 #[test]
 fn alternating_calls_are_not_detected_by_design() {
-    use yoagent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
     let mut tracker = ExecutionTracker::new(
         ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(3)),
     );
@@ -3705,7 +3708,7 @@ fn alternating_calls_are_not_detected_by_design() {
 async fn repeated_identical_calls_steer_then_abort() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3746,7 +3749,7 @@ async fn distinct_arguments_never_trip() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3775,7 +3778,7 @@ async fn an_interleaved_different_call_resets_the_counter() {
 
     let events = run_with_limits(
         responses,
-        yoagent::context::ExecutionLimits::default()
+        agent::context::ExecutionLimits::default()
             .with_max_consecutive_identical_tool_calls(Some(3)),
     )
     .await;
@@ -3790,8 +3793,7 @@ async fn an_interleaved_different_call_resets_the_counter() {
 async fn detection_can_be_switched_off() {
     let events = run_with_limits(
         repeat_call(12, serde_json::json!({"q": "same"})),
-        yoagent::context::ExecutionLimits::default()
-            .with_max_consecutive_identical_tool_calls(None),
+        agent::context::ExecutionLimits::default().with_max_consecutive_identical_tool_calls(None),
     )
     .await;
     assert!(
@@ -3874,7 +3876,7 @@ fn markers_in(messages: &[AgentMessage]) -> Vec<String> {
 /// marker it followed.
 #[tokio::test]
 async fn each_text_block_gets_its_own_key_and_resolves_to_itself() {
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -3889,7 +3891,7 @@ async fn each_text_block_gets_its_own_key_and_resolves_to_itself() {
         }]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -3984,7 +3986,7 @@ async fn a_partially_truncated_result_keys_the_right_block() {
         }
     }
 
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -3999,7 +4001,7 @@ async fn a_partially_truncated_result_keys_the_right_block() {
         }]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -4064,7 +4066,7 @@ async fn an_image_only_result_stashes_nothing() {
         }
     }
 
-    let state = yoagent::shared_state::SharedState::new();
+    let state = agent::shared_state::SharedState::new();
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut context = AgentContext {
         messages: vec![],
@@ -4079,7 +4081,7 @@ async fn an_image_only_result_stashes_nothing() {
         }]),
         MockResponse::Text("done".into()),
     ]));
-    config.context_config = Some(yoagent::context::ContextConfig {
+    config.context_config = Some(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });

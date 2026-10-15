@@ -39,7 +39,7 @@ the two are not comparable on `input` alone. The figures below supersede that.
 | output share of the bill | 73% | 61% |
 | turns | 14–15 | 19–20 |
 
-- **Session rates are close** despite yoagent placing explicit `cache_control`
+- **Session rates are close** despite agent placing explicit `cache_control`
   breakpoints for Anthropic and sending nothing to DeepSeek.
 - **DeepSeek's cost is almost entirely compaction** (91.9%): populating its cache
   is free, so between rewrites it pays only for genuinely new content.
@@ -114,7 +114,7 @@ this work claimed a cache win that measurement did not support.
 ## Reproducing
 
 ```bash
-git clone https://github.com/yologdev/yoagent && cd yoagent
+git clone https://github.com/yologdev/yoagent && cd agent
 git checkout feat/llm-compaction
 
 # prefix-cache measurements (no API key needed)

@@ -203,7 +203,7 @@ Pluggable key-value store for sub-agent communication. Backed by a `SharedStateB
 ### Construction
 
 ```rust
-use yoagent::shared_state::{SharedState, FileBackend};
+use agent::shared_state::{SharedState, FileBackend};
 
 let state = SharedState::new();                              // MemoryBackend, 10MB cap
 let state = SharedState::with_max_bytes(50 * 1024 * 1024);  // MemoryBackend, 50MB cap

@@ -7,12 +7,12 @@
 //! never terminates the chunked body. `wiremock` cannot express that: it always
 //! writes a complete body and closes.
 
+use ::agent::mcp::transport::McpTransport;
+use ::agent::mcp::types::JsonRpcRequest;
+use ::agent::mcp::HttpTransport;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use yoagent::mcp::transport::McpTransport;
-use yoagent::mcp::types::JsonRpcRequest;
-use yoagent::mcp::HttpTransport;
 
 /// Serves one request: headers, then a chunk carrying `frames`, then holds the
 /// connection open without the terminating zero-length chunk.

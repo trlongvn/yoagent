@@ -7,9 +7,9 @@ Auto-generate `AgentTool` implementations from OpenAPI 3.0 specs. Point an agent
 ## Quick Start
 
 ```rust
-use yoagent::Agent;
-use yoagent::openapi::{OpenApiToolAdapter, OpenApiConfig, OperationFilter};
-use yoagent::provider::ModelConfig;
+use agent::Agent;
+use agent::openapi::{OpenApiToolAdapter, OpenApiConfig, OperationFilter};
+use agent::provider::ModelConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -123,7 +123,7 @@ Non-2xx responses are **not** treated as errors — they're returned as text so 
 OpenAPI tools work alongside built-in tools and MCP tools:
 
 ```rust
-use yoagent::tools::default_tools;
+use agent::tools::default_tools;
 
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"))
     .with_tools(default_tools())

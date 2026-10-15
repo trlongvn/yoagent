@@ -6,9 +6,9 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use yoagent::openapi::{OpenApiToolAdapter, OpenApiConfig, OperationFilter};
+//! use agent::openapi::{OpenApiToolAdapter, OpenApiConfig, OperationFilter};
 //!
-//! # fn example() -> Result<(), yoagent::openapi::OpenApiError> {
+//! # fn example() -> Result<(), agent::openapi::OpenApiError> {
 //! let spec = std::fs::read_to_string("openapi.yaml")?;
 //! let config = OpenApiConfig::new()
 //!     .with_bearer_token("sk-...");

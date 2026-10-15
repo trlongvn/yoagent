@@ -2,11 +2,11 @@
 //! behavior, goal reuse, and interrupted-run recovery.
 #![cfg(feature = "gasp")]
 
+use ::agent::gasp::{GaspRecorder, GoalRef};
+use ::agent::provider::mock::*;
+use ::agent::provider::{MockProvider, ModelConfig};
+use ::agent::*;
 use std::process::Command;
-use yoagent::gasp::{GaspRecorder, GoalRef};
-use yoagent::provider::mock::*;
-use yoagent::provider::{MockProvider, ModelConfig};
-use yoagent::*;
 
 struct NoopTool;
 
@@ -557,7 +557,7 @@ async fn dangling_existing_goal_errors_at_open() {
     .unwrap();
     drop(r);
 
-    let bogus = yoagent::gasp::GoalId::generate();
+    let bogus = agent::gasp::GoalId::generate();
     let err = GaspRecorder::open(
         dir.path().to_path_buf(),
         "test-agent",
@@ -679,12 +679,12 @@ async fn tool_fingerprint_and_usage_reach_the_log() {
 // ---------------------------------------------------------------------------
 // The documented extension path must actually be reachable (#111): recording
 // the goal/task/verdict tier alongside the recorder's run/tool tier, using
-// only `yoagent::gasp` — no direct `yoagent-state` dependency.
+// only `agent::gasp` — no direct `yoagent-state` dependency.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn extension_path_records_the_task_tier_without_a_direct_state_dependency() {
-    use yoagent::gasp::{ActorRef, NodeId, Task, TaskId, TaskStatus, YoAgentState};
+    use agent::gasp::{ActorRef, NodeId, Task, TaskId, TaskStatus, YoAgentState};
 
     ensure_git_identity();
     let dir = tempfile::tempdir().unwrap();
@@ -699,8 +699,8 @@ async fn extension_path_records_the_task_tier_without_a_direct_state_dependency(
     .await
     .unwrap();
 
-    // Every type the extension path needs must be nameable from `yoagent::gasp`.
-    let state: &YoAgentState<yoagent::gasp::GitEventStore> = recorder.state();
+    // Every type the extension path needs must be nameable from `agent::gasp`.
+    let state: &YoAgentState<agent::gasp::GitEventStore> = recorder.state();
     let actor: &ActorRef = recorder.actor();
     let goal = recorder.goal().clone();
 
@@ -733,7 +733,7 @@ async fn extension_path_records_the_task_tier_without_a_direct_state_dependency(
 
 #[tokio::test]
 async fn recorder_store_accessor_shares_the_lease_rather_than_colliding() {
-    use yoagent::gasp::EventStore;
+    use agent::gasp::EventStore;
 
     ensure_git_identity();
     let dir = tempfile::tempdir().unwrap();
@@ -757,8 +757,8 @@ async fn recorder_store_accessor_shares_the_lease_rather_than_colliding() {
     );
 }
 
-/// Every struct re-exported from `yoagent::gasp` must be *constructible* using
-/// only `yoagent::gasp` — no direct `yoagent-state` dependency.
+/// Every struct re-exported from `agent::gasp` must be *constructible* using
+/// only `agent::gasp` — no direct `yoagent-state` dependency.
 ///
 /// This is the invariant behind #111 and #115: a struct whose id or field
 /// types are missing is nameable but unbuildable, and the re-export list looks
@@ -770,7 +770,7 @@ async fn recorder_store_accessor_shares_the_lease_rather_than_colliding() {
 /// This test exists to *compile*. The assertions are incidental.
 #[test]
 fn every_reexported_struct_is_constructible_from_gasp_alone() {
-    use yoagent::gasp::{
+    use agent::gasp::{
         ActorRef, ArtifactRef, Decision, DecisionId, DecisionStatus, EvalId, EvalResult,
         EvalStatus, GaspGoal, GoalId, GoalStatus, Hypothesis, HypothesisId, NodeId, Observation,
         ObservationId, PatchId, RunId, StatePatch, Task, TaskId, TaskStatus,
@@ -854,7 +854,7 @@ fn every_reexported_struct_is_constructible_from_gasp_alone() {
 /// This test exists to *compile*.
 #[test]
 fn every_field_and_argument_type_is_nameable_from_gasp_alone() {
-    use yoagent::gasp::{
+    use agent::gasp::{
         ActorRef, ArtifactRef, DecisionStatus, EvalStatus, Event, EventId, ExpectedEffect, Frame,
         FrameId, GoalId, GoalStatus, ModelCall, NodeId, PatchId, PatchStatus, Precondition,
         ProjectRef, ProjectSnapshot, RunId, StateOp, StatePatch, TaskStatus,

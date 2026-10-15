@@ -1,6 +1,6 @@
 # Model Presets
 
-yoagent's first-class model presets are the `ModelConfig::*` constructors. A preset sets provider routing, base URL, context metadata, default output limits, and provider compatibility flags.
+agent's first-class model presets are the `ModelConfig::*` constructors. A preset sets provider routing, base URL, context metadata, default output limits, and provider compatibility flags.
 
 Use a preset when the provider is listed here. Use a custom `ModelConfig` when you need a compatible provider or endpoint that does not have a constructor yet.
 
@@ -31,7 +31,7 @@ Use a preset when the provider is listed here. Use a custom `ModelConfig` when y
 | `ModelConfig::openai_compat(base_url, model_id, provider, compat)` | Custom compatible server | `OpenAiCompletions` | caller provided | 128K | 4,096 |
 | `ModelConfig::local(base_url, model_id)` | Local compatible server | `OpenAiCompletions` | caller provided | 128K | 4,096 |
 
-The constructors do not validate model IDs. They send the `id` you pass through to the provider, which lets you use newly released model IDs before yoagent updates its examples.
+The constructors do not validate model IDs. They send the `id` you pass through to the provider, which lets you use newly released model IDs before agent updates its examples.
 
 The named presets (`claude_fable_5`, `claude_opus_5`, `claude_opus_4_8`, `claude_sonnet_5`, `claude_haiku_4_5`, `gpt_5_5`) also fill in real `CostConfig` pricing. The OpenCode presets select the API protocol from the model id — see [OpenCode Zen & Go](opencode.md).
 
@@ -40,7 +40,7 @@ The named presets (`claude_fable_5`, `claude_opus_5`, `claude_opus_4_8`, `claude
 These constructors all use `OpenAiCompatProvider`:
 
 ```rust
-use yoagent::provider::ModelConfig;
+use agent::provider::ModelConfig;
 
 let agent = Agent::from_config(ModelConfig::deepseek(
     "deepseek-v4-flash",
@@ -124,7 +124,7 @@ let reasoner = ModelConfig::deepseek("deepseek-reasoner", "DeepSeek Reasoner");
 
 DeepSeek documents `deepseek-chat` and `deepseek-reasoner` as compatibility aliases scheduled for deprecation on 2026-07-24. In DeepSeek's current API, `deepseek-chat` maps to the non-thinking mode of `deepseek-v4-flash`, while `deepseek-reasoner` maps to the thinking mode of `deepseek-v4-flash`.
 
-yoagent also sends DeepSeek's current request shape:
+agent also sends DeepSeek's current request shape:
 
 - `max_tokens`, not `max_completion_tokens`
 - `thinking: { "type": "enabled" | "disabled" }`

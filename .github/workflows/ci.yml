@@ -43,7 +43,7 @@ jobs:
         run: cargo build --all-features
 
   # Every job above builds `--all-features`, but `openapi` and `gasp` are both
-  # off by default — so the feature set a `cargo add yoagent` user actually gets
+  # off by default — so the feature set a `cargo add agent` user actually gets
   # was never compiled here. A `#[cfg(feature = ...)]` mistake that leaves an
   # import or a type reachable only with a feature on would pass all-features CI
   # and break on crates.io. One OS is enough: feature gating is not OS-specific.
@@ -92,7 +92,7 @@ jobs:
       - name: Check
         run: cargo check --all-features
 
-  # yoagent claims to be a tested GASP-conformant runtime — this job is the
+  # agent claims to be a tested GASP-conformant runtime — this job is the
   # test: emit an agent repo with the gasp bridge (mock provider, no network)
   # and run the protocol's conformance checker against it.
   gasp-conformance:
@@ -111,7 +111,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: yologdev/gasp
-          # Pinned so a checker change cannot break yoagent CI silently — bump
+          # Pinned so a checker change cannot break agent CI silently — bump
           # deliberately, after running the job's sequence locally against the
           # new SHA. This one folds leniently (gasp#3): a dangling op is a note
           # on the certificate, not an abort, so check 2 now reports what it

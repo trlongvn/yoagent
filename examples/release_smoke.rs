@@ -25,14 +25,14 @@
 //!
 //! Exit code is non-zero if any check fails, so this can gate a release.
 
-use yoagent::agent::Agent;
-use yoagent::context::ContextConfig;
-use yoagent::provider::ModelConfig;
-use yoagent::shared_state::SharedState;
-use yoagent::types::{
+use ::agent::context::ContextConfig;
+use ::agent::core::Agent;
+use ::agent::provider::ModelConfig;
+use ::agent::shared_state::SharedState;
+use ::agent::types::{
     AgentMessage, AgentTool, Content, Message, ToolContext, ToolError, ToolResult,
 };
-use yoagent::*;
+use ::agent::*;
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -221,7 +221,7 @@ fn model() -> ModelConfig {
 #[tokio::main]
 async fn main() {
     let cfg = model();
-    println!("\nyoagent release smoke — live provider: {}\n", cfg.name);
+    println!("\nagent release smoke — live provider: {}\n", cfg.name);
 
     let mut report = Report { checks: Vec::new() };
 

@@ -20,9 +20,9 @@ Each sub-agent invocation starts a fresh conversation — no state leaks between
 
 ```rust
 use std::sync::Arc;
-use yoagent::sub_agent::SubAgentTool;
-use yoagent::provider::ModelConfig;
-use yoagent::tools;
+use agent::sub_agent::SubAgentTool;
+use agent::provider::ModelConfig;
+use agent::tools;
 
 let researcher = SubAgentTool::from_config(
     "researcher",
@@ -40,7 +40,7 @@ let researcher = SubAgentTool::from_config(
 ## Registering on a Parent Agent
 
 ```rust
-use yoagent::agent::Agent;
+use agent::agent::Agent;
 
 let mut agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"))
     .with_system_prompt("You coordinate between sub-agents.")
@@ -85,7 +85,7 @@ By default, each sub-agent invocation is isolated — to pass data between sub-a
 `SharedState` solves this: store an artifact once, and any number of sub-agents read/write it by reference.
 
 ```rust
-use yoagent::shared_state::SharedState;
+use agent::shared_state::SharedState;
 
 let state = SharedState::new();
 state.set("ci_log", large_log_text).await.unwrap();
@@ -154,7 +154,7 @@ A `set` call that would exceed capacity returns `Err(CapacityError)`.
 **FileBackend** — one file per key, persistent across process restarts:
 
 ```rust
-use yoagent::shared_state::FileBackend;
+use agent::shared_state::FileBackend;
 
 let state = SharedState::with_backend(FileBackend::new(".agent-state"));
 ```
@@ -164,7 +164,7 @@ Keys are percent-encoded to filenames (reversible, no collisions). Useful for de
 **Custom backends** implement the `SharedStateBackend` trait:
 
 ```rust
-use yoagent::shared_state::{SharedStateBackend, SharedStateError};
+use agent::shared_state::{SharedStateBackend, SharedStateError};
 
 #[async_trait::async_trait]
 impl SharedStateBackend for MyRedisBackend {
@@ -182,10 +182,10 @@ See [`examples/shared_state.rs`](../../examples/shared_state.rs) for a complete 
 
 ## Multi-Provider Support
 
-Sub-agents can use any provider supported by yoagent — not just Anthropic. Pass a `ModelConfig` to configure the base URL, compat flags, and other provider-specific settings:
+Sub-agents can use any provider supported by agent — not just Anthropic. Pass a `ModelConfig` to configure the base URL, compat flags, and other provider-specific settings:
 
 ```rust
-use yoagent::provider::ModelConfig;
+use agent::provider::ModelConfig;
 
 let model_config = ModelConfig::xai("grok-4-1-fast-reasoning", "Grok 3 Mini Fast");
 

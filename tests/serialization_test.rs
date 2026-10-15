@@ -1,6 +1,6 @@
 //! Serde round-trip tests for core types.
 
-use yoagent::*;
+use ::agent::*;
 
 fn roundtrip<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
     value: &T,
@@ -164,7 +164,7 @@ fn test_full_conversation_roundtrip() {
 
 #[test]
 fn test_execution_limits_roundtrip() {
-    use yoagent::context::ExecutionLimits;
+    use agent::context::ExecutionLimits;
     let limits = ExecutionLimits::default()
         .with_max_turns(25)
         .with_max_total_tokens(500_000)
@@ -185,7 +185,7 @@ fn test_tool_execution_strategy_roundtrip() {
 
 #[test]
 fn test_refusal_stop_reason_round_trip() {
-    use yoagent::types::*;
+    use agent::types::*;
 
     let message = Message::assistant(
         vec![],
@@ -588,7 +588,7 @@ fn test_message_end_full_payload_shape_is_frozen() {
     assert_eq!(actual, expected, "nested payload wire shape drifted");
 }
 
-/// Session files and `save_messages` blobs written by yoagent < 0.13 used
+/// Session files and `save_messages` blobs written by agent < 0.13 used
 /// snake_case for `cache_read`/`cache_write`/`total_tokens`/`error_message`/
 /// `provider_metadata`. The `alias` attributes must keep them loadable.
 #[test]
@@ -716,7 +716,7 @@ fn test_agent_event_deserializes_from_raw_json() {
 
 #[test]
 fn stream_config_debug_redacts_the_api_key() {
-    let mut config = yoagent::provider::StreamConfig::new("m", "sk-super-secret-key");
+    let mut config = agent::provider::StreamConfig::new("m", "sk-super-secret-key");
     config.system_prompt = "be brief".into();
     let rendered = format!("{:?}", config);
 
@@ -734,7 +734,7 @@ fn stream_config_debug_redacts_the_api_key() {
 
 #[test]
 fn stream_config_debug_distinguishes_an_empty_key() {
-    let config = yoagent::provider::StreamConfig::new("m", "");
+    let config = agent::provider::StreamConfig::new("m", "");
     let rendered = format!("{:?}", config);
     assert!(
         !rendered.contains("[redacted]"),
@@ -744,7 +744,7 @@ fn stream_config_debug_distinguishes_an_empty_key() {
 
 #[test]
 fn model_config_debug_redacts_header_values_but_keeps_names() {
-    let mut config = yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
+    let mut config = agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
     config
         .headers
         .insert("Authorization".into(), "Bearer sk-leaked-token".into());
@@ -763,11 +763,11 @@ fn model_config_debug_redacts_header_values_but_keeps_names() {
 #[test]
 fn model_config_serialization_stays_lossless() {
     // Debug redacts; Serialize must not, or saved configs lose their headers.
-    let mut config = yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
+    let mut config = agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet");
     config.headers.insert("x-api-key".into(), "keep-me".into());
 
     let json = serde_json::to_string(&config).unwrap();
-    let back: yoagent::provider::ModelConfig = serde_json::from_str(&json).unwrap();
+    let back: agent::provider::ModelConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(
         back.headers.get("x-api-key").map(String::as_str),
         Some("keep-me")

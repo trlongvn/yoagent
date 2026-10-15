@@ -28,8 +28,8 @@
 //! shared prefix between consecutive turns. The resulting ratio is the direct
 //! analogue of DeepSeek's `cache_hit_tokens / input_tokens`.
 
-use yoagent::context::{compact_messages, ContextConfig};
-use yoagent::types::{AgentMessage, Content, Message, StopReason, Usage};
+use ::agent::context::{compact_messages, ContextConfig};
+use ::agent::types::{AgentMessage, Content, Message, StopReason, Usage};
 
 // ---------------------------------------------------------------------------
 // Wire rendering — what the provider actually receives
@@ -110,7 +110,7 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// The tool mix a real coding agent produces, measured from 808 archived runs
-/// of an agent built on yoagent: bash 41%, edit/write 36%, read 19%, search 4%.
+/// of an agent built on agent: bash 41%, edit/write 36%, read 19%, search 4%.
 /// Output shape differs sharply per tool, which is the whole reason the line
 /// budget is per-tool.
 fn tool_for_turn(turn: usize) -> &'static str {
@@ -124,14 +124,14 @@ fn tool_for_turn(turn: usize) -> &'static str {
 
 thread_local! {
     static READ_CAP: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(yoagent::tools::DEFAULT_READ_MAX_LINES) };
+        const { std::cell::Cell::new(agent::tools::DEFAULT_READ_MAX_LINES) };
 }
 
 /// Replay with the read tool's page size overridden.
 fn replay_with_read_cap(turns: usize, config: &ContextConfig, read_cap: usize) -> Replay {
     READ_CAP.with(|c| c.set(read_cap));
     let r = replay(turns, config);
-    READ_CAP.with(|c| c.set(yoagent::tools::DEFAULT_READ_MAX_LINES));
+    READ_CAP.with(|c| c.set(agent::tools::DEFAULT_READ_MAX_LINES));
     r
 }
 
@@ -280,11 +280,11 @@ fn replay(turns: usize, config: &ContextConfig) -> Replay {
         history.push(assistant_with_tool_call(turn));
         let mut result = tool_result(turn);
         if config.truncate_tool_output_on_append {
-            result = yoagent::context::truncate_tool_output(result, config);
+            result = agent::context::truncate_tool_output(result, config);
         }
         history.push(result);
 
-        let live = yoagent::context::total_tokens(&history);
+        let live = agent::context::total_tokens(&history);
         if let Some(previous_total) = last_total {
             growth_samples += 1;
             growth_total += live.saturating_sub(previous_total);
@@ -302,7 +302,7 @@ fn replay(turns: usize, config: &ContextConfig) -> Replay {
             ..config.clone()
         };
         history = compact_messages(std::mem::take(&mut history), &effective);
-        last_total = Some(yoagent::context::total_tokens(&history));
+        last_total = Some(agent::context::total_tokens(&history));
 
         let parts: Vec<String> = history
             .iter()
@@ -419,7 +419,7 @@ fn read_output_is_exempt_from_head_tail_truncation() {
         is_error: false,
         timestamp: 1,
     });
-    let out = yoagent::context::truncate_tool_output(msg, &config);
+    let out = agent::context::truncate_tool_output(msg, &config);
     let AgentMessage::Llm(Message::ToolResult { content, .. }) = &out else {
         panic!("expected a tool result")
     };
@@ -439,7 +439,7 @@ fn read_output_is_exempt_from_head_tail_truncation() {
         is_error: false,
         timestamp: 1,
     });
-    let out = yoagent::context::truncate_tool_output(msg, &config);
+    let out = agent::context::truncate_tool_output(msg, &config);
     let AgentMessage::Llm(Message::ToolResult { content, .. }) = &out else {
         panic!("expected a tool result")
     };
@@ -547,7 +547,7 @@ fn unbounded_read_pages_cost_cache() {
         p300 * 100.0,
         p500 * 100.0
     );
-    assert_eq!(yoagent::tools::DEFAULT_READ_MAX_LINES, 500);
+    assert_eq!(agent::tools::DEFAULT_READ_MAX_LINES, 500);
 }
 
 /// and reports the mean turns between compactions.
@@ -567,11 +567,11 @@ fn mean_compaction_interval(turns: usize, base: &ContextConfig) -> (f64, usize) 
         history.push(assistant_with_tool_call(turn));
         let mut result = tool_result(turn);
         if base.truncate_tool_output_on_append {
-            result = yoagent::context::truncate_tool_output(result, base);
+            result = agent::context::truncate_tool_output(result, base);
         }
         history.push(result);
 
-        let live = yoagent::context::total_tokens(&history);
+        let live = agent::context::total_tokens(&history);
         if let Some(previous) = last_total {
             growth_samples += 1;
             growth_total += live.saturating_sub(previous);
@@ -594,7 +594,7 @@ fn mean_compaction_interval(turns: usize, base: &ContextConfig) -> (f64, usize) 
             }
             history = candidate;
         }
-        last_total = Some(yoagent::context::total_tokens(&history));
+        last_total = Some(agent::context::total_tokens(&history));
     }
 
     let n = intervals.len();

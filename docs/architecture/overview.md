@@ -2,7 +2,7 @@
 
 ## Layered Design
 
-yoagent is organized as three conceptual layers within a single crate. Dependencies flow strictly downward — upper layers use lower layers, never the reverse.
+agent is organized as three conceptual layers within a single crate. Dependencies flow strictly downward — upper layers use lower layers, never the reverse.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -75,7 +75,7 @@ Multi-agent coordination. Not yet implemented — the architecture is designed t
 ## Module Layout
 
 ```
-yoagent/
+agent/
 ├── src/
 │   ├── lib.rs                  # Public re-exports
 │   │
@@ -150,7 +150,7 @@ Events flow back via mpsc::UnboundedSender<AgentEvent>
 3. Set `ModelConfig.api` to match that protocol
 4. The registry dispatches `stream()` calls to the right provider
 
-Each provider translates between yoagent's `Message`/`Content` types and the provider's native API format. All providers emit `StreamEvent`s through the channel for real-time updates.
+Each provider translates between agent's `Message`/`Content` types and the provider's native API format. All providers emit `StreamEvent`s through the channel for real-time updates.
 
 ## How Tools Plug In
 

@@ -15,6 +15,9 @@ pub enum ApiProtocol {
     GoogleGenerativeAi,
     GoogleVertex,
     BedrockConverseStream,
+    /// Needle 3 on-device tool-calling model. Not a chat protocol — see
+    /// [`crate::provider::needle3`].
+    Needle3,
 }
 
 impl std::fmt::Display for ApiProtocol {
@@ -27,6 +30,7 @@ impl std::fmt::Display for ApiProtocol {
             Self::GoogleGenerativeAi => write!(f, "google_generative_ai"),
             Self::GoogleVertex => write!(f, "google_vertex"),
             Self::BedrockConverseStream => write!(f, "bedrock_converse_stream"),
+            Self::Needle3 => write!(f, "needle3"),
         }
     }
 }
@@ -37,7 +41,7 @@ impl std::fmt::Display for ApiProtocol {
 ///
 /// The built-in presets carry rates verified against the vendor's published
 /// pricing on the date noted at each constructor. Vendors reprice, and a
-/// compiled-in number cannot notice — `claude_sonnet_5` shipped Sonnet 4.6's
+/// compiled-in number cannot notice â€” `claude_sonnet_5` shipped Sonnet 4.6's
 /// rates across 18 releases, v0.9.0 through v0.16.5, overstating every
 /// `cost_usd` for that model by 50%, and nothing detected it.
 ///
@@ -50,7 +54,7 @@ impl std::fmt::Display for ApiProtocol {
 /// **No preset here sets one** (checked 2026-08-20). Anthropic states that 4.6+
 /// models bill the full 1M window at standard rates, and Meta's page says there
 /// is no long-context premium; Haiku 4.5 is flat because its window is 200K.
-/// `gpt_5_5` is the one contested case — see its docs for why it stays flat.
+/// `gpt_5_5` is the one contested case â€” see its docs for why it stays flat.
 ///
 /// Note the derivation: prompt size is `input + cache_read + cache_write`, which
 /// holds only where the provider subtracts cached tokens out of `input`.
@@ -66,11 +70,11 @@ impl std::fmt::Display for ApiProtocol {
 /// ```
 ///
 /// `ModelConfig::cost` is a public field and `CostConfig` is `Deserialize`, so
-/// a caller never has to wait for a release — override it for a negotiated
+/// a caller never has to wait for a release â€” override it for a negotiated
 /// rate, or load rates from configuration:
 ///
 /// ```
-/// # use yoagent::provider::ModelConfig;
+/// # use agent::provider::ModelConfig;
 /// let mut config = ModelConfig::claude_sonnet_5();
 /// config.cost.input_per_million = 1.80; // your negotiated rate
 /// ```
@@ -88,7 +92,7 @@ pub struct CostConfig {
     /// size.
     ///
     /// A `Vec` rather than a single tier because vendors publish multi-step
-    /// schedules and models.dev already represents this as an array — making
+    /// schedules and models.dev already represents this as an array â€” making
     /// it one tier would buy a second breaking release the first time a
     /// three-tier model appears, and it would break the serde key as well as
     /// the field type, invalidating every persisted config.
@@ -99,13 +103,13 @@ pub struct CostConfig {
 /// Higher rates charged above a context threshold.
 ///
 /// OpenAI prices gpt-5.5 at $5/$30 below ~272K prompt tokens and $10/$45 above
-/// it — published as *columns* on the same pricing row, which is easy to miss
+/// it â€” published as *columns* on the same pricing row, which is easy to miss
 /// if you go looking for a second row. A flat `CostConfig` under-bills those
 /// requests by 2x on input, and this crate's whole compaction subsystem exists
 /// to run agents at high context, so the case is central rather than exotic.
 ///
-/// The threshold is compared against the request's **prompt** tokens —
-/// `input + cache_read + cache_write` — not the total including output.
+/// The threshold is compared against the request's **prompt** tokens â€”
+/// `input + cache_read + cache_write` â€” not the total including output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ContextTier {
@@ -235,7 +239,7 @@ impl CostConfig {
     /// Consumed by [`crate::Agent::session_cost_usd`]; also usable directly
     /// in `after_turn` callbacks for per-turn cost tracking.
     pub fn cost_usd(&self, usage: &crate::types::Usage) -> f64 {
-        // Prompt size, which is what a context tier is priced against — every
+        // Prompt size, which is what a context tier is priced against â€” every
         // caller passes one request's usage, so no extra parameter is needed.
         let prompt = usage.input + usage.cache_read + usage.cache_write;
         // The last tier the prompt clears. `with_context_tier` keeps the vec
@@ -301,9 +305,9 @@ pub enum ThinkingFormat {
 /// Different providers have different quirks even though they share the same base API.
 ///
 /// Marked `#[non_exhaustive]`: this is the crate's most literal instance of a
-/// growing quirk list — every new provider difference adds a flag, and without
+/// growing quirk list â€” every new provider difference adds a flag, and without
 /// the attribute each one is a downstream break. Construct from a preset
-/// ([`OpenAiCompat::openai`], [`OpenAiCompat::deepseek`], …) or
+/// ([`OpenAiCompat::openai`], [`OpenAiCompat::deepseek`], â€¦) or
 /// [`Default::default`] and adjust fields. New flags carry `#[serde(default)]`
 /// so persisted configs keep deserializing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,7 +338,7 @@ pub struct OpenAiCompat {
     /// Off by default: the field is OpenAI's, and a strict compat server that
     /// validates unknown keys would reject the whole request rather than
     /// ignore it. Providers that cache automatically (DeepSeek, Groq) lose
-    /// nothing by leaving this off — they were never reading it.
+    /// nothing by leaving this off â€” they were never reading it.
     #[serde(default)]
     pub supports_prompt_cache_key: bool,
 }
@@ -537,8 +541,8 @@ impl OpenCodeGateway {
 ///
 /// Marked `#[non_exhaustive]`: fields may be added in minor releases (e.g.
 /// the `anthropic` compat flags, slated for 0.9.0). Construct via the
-/// `ModelConfig::*` preset constructors — or [`ModelConfig::custom`] for
-/// protocols without a preset — and mutate fields to customize. Note that
+/// `ModelConfig::*` preset constructors â€” or [`ModelConfig::custom`] for
+/// protocols without a preset â€” and mutate fields to customize. Note that
 /// downstream struct literals and functional-record-update
 /// (`ModelConfig { .. }`) no longer compile; field mutation is the supported
 /// pattern. New fields must carry `#[serde(default)]` so previously
@@ -559,7 +563,7 @@ pub struct ModelConfig {
     /// Whether this model supports reasoning/thinking. When `false` and a
     /// `thinking_level` is requested, the [`Agent`](crate::Agent) wrapper
     /// logs a warning; sub-agents and direct `agent_loop` calls do not. The
-    /// request is still sent either way — gate behavior stays with the
+    /// request is still sent either way â€” gate behavior stays with the
     /// caller.
     pub reasoning: bool,
     /// Context window size in tokens.
@@ -573,7 +577,7 @@ pub struct ModelConfig {
     ///
     /// May carry credentials (`Authorization`, `x-api-key`). `Debug` prints
     /// header *names* with redacted values, but `Serialize` is intentionally
-    /// lossless so configs round-trip — do not serialize a `ModelConfig` into
+    /// lossless so configs round-trip â€” do not serialize a `ModelConfig` into
     /// logs or telemetry.
     #[serde(default)]
     pub headers: HashMap<String, String>,
@@ -616,7 +620,7 @@ impl ModelConfig {
     /// explicitly, so the config's protocol is never consulted.
     ///
     /// **Do not** pass it to
-    /// [`Agent::from_config`](crate::Agent::from_config) — that dispatches on
+    /// [`Agent::from_config`](crate::Agent::from_config) â€” that dispatches on
     /// the protocol (here `AnthropicMessages`) and would build the **real**
     /// Anthropic provider pointed at the non-routable `base_url`, so the first
     /// prompt fails with a network error instead of returning a mock response.
@@ -635,7 +639,7 @@ impl ModelConfig {
     ///
     /// Since `ModelConfig` is `#[non_exhaustive]`, this is the construction
     /// path when no `ModelConfig::*` preset fits. Defaults: 128K context,
-    /// 16K max output, no compat flags — mutate fields to adjust.
+    /// 16K max output, no compat flags â€” mutate fields to adjust.
     pub fn custom(
         api: ApiProtocol,
         provider: impl Into<String>,
@@ -677,11 +681,11 @@ impl ModelConfig {
         }
     }
 
-    /// Claude Fable 5 — Anthropic's most capable model.
+    /// Claude Fable 5 â€” Anthropic's most capable model.
     /// 1M context; defaults to 64K of the model's 128K max output.
     ///
     /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     pub fn claude_fable_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -700,13 +704,13 @@ impl ModelConfig {
     /// Claude Opus 5. 1M context; defaults to 64K of the model's 128K max output.
     ///
     /// Opus 5 thinks whenever a request omits `thinking`, so `ThinkingLevel::Off`
-    /// does not disable thinking here — the provider omits the field rather than
+    /// does not disable thinking here â€” the provider omits the field rather than
     /// sending `{"type": "disabled"}`, and those tokens still count against
     /// `max_tokens`. Any other level takes the adaptive path that
     /// `AnthropicCompat::default()` selects, which Opus 5 accepts unchanged.
     ///
     /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     pub fn claude_opus_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -725,7 +729,7 @@ impl ModelConfig {
     /// Claude Opus 4.8. 1M context; defaults to 64K of the model's 128K max output.
     ///
     /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     pub fn claude_opus_4_8() -> Self {
         Self {
             context_window: 1_000_000,
@@ -744,7 +748,7 @@ impl ModelConfig {
     /// Claude Sonnet 5. 1M context; defaults to 64K of the model's 128K max output.
     ///
     /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     pub fn claude_sonnet_5() -> Self {
         Self {
             context_window: 1_000_000,
@@ -763,7 +767,7 @@ impl ModelConfig {
     /// Claude Haiku 4.5. 200K context; defaults to 32K of the model's 64K max output.
     ///
     /// Rates verified against <https://platform.claude.com/docs/en/about-claude/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     pub fn claude_haiku_4_5() -> Self {
         Self {
             context_window: 200_000,
@@ -783,7 +787,7 @@ impl ModelConfig {
     /// Uses the Chat Completions API.
     ///
     /// Rates verified against <https://developers.openai.com/api/docs/pricing>
-    /// on 2026-08-19. See [`CostConfig`] — they are a snapshot, not an authority.
+    /// on 2026-08-19. See [`CostConfig`] â€” they are a snapshot, not an authority.
     ///
     ///
     /// **Deliberately flat, over a contested tier claim.** models.dev records a
@@ -791,14 +795,14 @@ impl ModelConfig {
     /// does not, because the evidence does not survive checking:
     ///
     /// - OpenAI's pricing page does publish a `>272K input tokens` schedule,
-    ///   as a second column group beside `≤272K`. But gpt-5.5 has no row in
+    ///   as a second column group beside `â‰¤272K`. But gpt-5.5 has no row in
     ///   that table. Across all four Flagship tiers it appears only as
-    ///   `gpt-5.5 (<272K context length)` — Standard $5/$0.50/$30, Batch and
-    ///   Flex $2.50/$15, Fast $12.50/$75 — with no long-context cell.
+    ///   `gpt-5.5 (<272K context length)` â€” Standard $5/$0.50/$30, Batch and
+    ///   Flex $2.50/$15, Fast $12.50/$75 â€” with no long-context cell.
     /// - The one gpt-5.5 row that *is* in a long-context table,
     ///   `gpt-5.5-cyber`, has all four long-context cells set to `-`, and the
     ///   page hides that row by default.
-    /// - $10/$1/$45 does appear on the page verbatim — as `gpt-5.6-sol`'s
+    /// - $10/$1/$45 does appear on the page verbatim â€” as `gpt-5.6-sol`'s
     ///   long-context rates. Its short-context rates are identical to
     ///   gpt-5.5's, which is a plausible route for the number to have been
     ///   copied onto the wrong model.
@@ -808,7 +812,7 @@ impl ModelConfig {
     ///
     /// Tiering this preset on that would have doubled the input rate every
     /// caller is charged above 272K prompt tokens. If OpenAI publishes a
-    /// gpt-5.5 long-context row, the machinery is ready —
+    /// gpt-5.5 long-context row, the machinery is ready â€”
     /// [`CostConfig::with_context_tier`]. Until then, flat.
     ///
     /// Rates verified against <https://developers.openai.com/api/docs/pricing>
@@ -848,7 +852,7 @@ impl ModelConfig {
     }
 
     /// Create a config for a local OpenAI-compatible server (LM Studio, Ollama, etc.).
-    /// No API key required — sends an empty Bearer token.
+    /// No API key required â€” sends an empty Bearer token.
     pub fn local(base_url: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self {
             id: model_id.into(),
@@ -871,13 +875,13 @@ impl ModelConfig {
     ///
     /// Zen serves each model family over a different protocol; the protocol is
     /// selected from the model id:
-    /// - `gpt-*` → OpenAI Responses API (pair with `OpenAiResponsesProvider`)
-    /// - `claude-*`, `qwen*` → Anthropic Messages API (pair with `AnthropicProvider`)
-    /// - everything else (DeepSeek, MiniMax, GLM, Kimi, ...) → Chat Completions
+    /// - `gpt-*` â†’ OpenAI Responses API (pair with `OpenAiResponsesProvider`)
+    /// - `claude-*`, `qwen*` â†’ Anthropic Messages API (pair with `AnthropicProvider`)
+    /// - everything else (DeepSeek, MiniMax, GLM, Kimi, ...) â†’ Chat Completions
     ///   (pair with `OpenAiCompatProvider`)
     ///
-    /// Gemini models are not supported — Zen serves them over a Google-native
-    /// endpoint shape yoagent does not target. A `gemini-*` id falls through to
+    /// Gemini models are not supported â€” Zen serves them over a Google-native
+    /// endpoint shape agent does not target. A `gemini-*` id falls through to
     /// Chat Completions (with a warning) and will likely fail at request time.
     ///
     /// The routing mirrors the Zen endpoint tables as of mid-2026; if a model
@@ -894,8 +898,8 @@ impl ModelConfig {
     /// open models.
     ///
     /// Protocol is selected from the model id:
-    /// - `qwen*`, `minimax-*` → Anthropic Messages API (pair with `AnthropicProvider`)
-    /// - everything else (GLM, Kimi, DeepSeek, MiMo, ...) → Chat Completions
+    /// - `qwen*`, `minimax-*` â†’ Anthropic Messages API (pair with `AnthropicProvider`)
+    /// - everything else (GLM, Kimi, DeepSeek, MiMo, ...) â†’ Chat Completions
     ///   (pair with `OpenAiCompatProvider`)
     pub fn opencode_go(model_id: impl Into<String>) -> Self {
         Self::opencode(model_id.into(), OpenCodeGateway::Go)
@@ -905,7 +909,7 @@ impl ModelConfig {
         let lower = id.to_ascii_lowercase();
         if lower.starts_with("gemini-") {
             tracing::warn!(
-                "OpenCode serves Gemini models over a Google-native endpoint yoagent \
+                "OpenCode serves Gemini models over a Google-native endpoint agent \
                  does not target; '{}' is routed to /chat/completions and will likely \
                  fail at request time",
                 id
@@ -1019,7 +1023,7 @@ impl ModelConfig {
 
     /// Create a new Meta Model API config (Muse Spark).
     ///
-    /// Models: `muse-spark-1.1` — 1,048,576-token context; 128K max output
+    /// Models: `muse-spark-1.1` â€” 1,048,576-token context; 128K max output
     /// per Meta's integration examples (no official model card yet).
     /// US-only public preview as of July 2026. OpenAI-compatible endpoint at
     /// `https://api.meta.ai/v1`. Key resolves from `META_API_KEY`, then
@@ -1028,7 +1032,7 @@ impl ModelConfig {
     /// Reasoning: Meta's endpoint defaults to `reasoning_effort: medium`
     /// server-side. Set a [`ThinkingLevel`](crate::types::ThinkingLevel) to
     /// tune it; `Off` omits the field, which means Meta's default (medium)
-    /// applies — not "no reasoning".
+    /// applies â€” not "no reasoning".
     ///
     /// Rates are Muse Spark 1.1/1.2, verified 2026-08-19. This constructor is
     /// generic over the model id, so a different tier needs `config.cost`
@@ -1303,13 +1307,13 @@ mod tests {
 
     #[test]
     fn test_opencode_zen_protocol_selection() {
-        // GPT models → Responses API
+        // GPT models â†’ Responses API
         let gpt = ModelConfig::opencode_zen("gpt-5.5");
         assert_eq!(gpt.api, ApiProtocol::OpenAiResponses);
         assert_eq!(gpt.provider, "opencode-zen");
         assert_eq!(gpt.base_url, "https://opencode.ai/zen/v1");
 
-        // Claude and Qwen models → Anthropic Messages with Bearer auth
+        // Claude and Qwen models â†’ Anthropic Messages with Bearer auth
         for id in ["claude-sonnet-5", "qwen3.7-max"] {
             let config = ModelConfig::opencode_zen(id);
             assert_eq!(config.api, ApiProtocol::AnthropicMessages, "{id}");
@@ -1317,7 +1321,7 @@ mod tests {
             assert!(compat.bearer_auth);
         }
 
-        // Everything else → Chat Completions
+        // Everything else â†’ Chat Completions
         for id in ["deepseek-v4-pro", "minimax-m3", "glm-5.2", "kimi-k2.7-code"] {
             let config = ModelConfig::opencode_zen(id);
             assert_eq!(config.api, ApiProtocol::OpenAiCompletions, "{id}");
@@ -1327,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_opencode_go_protocol_selection() {
-        // Qwen and MiniMax models → Anthropic Messages with Bearer auth
+        // Qwen and MiniMax models â†’ Anthropic Messages with Bearer auth
         for id in ["qwen3.7-max", "minimax-m3"] {
             let config = ModelConfig::opencode_go(id);
             assert_eq!(config.api, ApiProtocol::AnthropicMessages, "{id}");
@@ -1335,7 +1339,7 @@ mod tests {
             assert!(config.anthropic.expect("anthropic compat set").bearer_auth);
         }
 
-        // Everything else → Chat Completions (Go has no GPT models)
+        // Everything else â†’ Chat Completions (Go has no GPT models)
         for id in [
             "glm-5.2",
             "kimi-k2.7-code",

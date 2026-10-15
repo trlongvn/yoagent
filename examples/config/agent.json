@@ -1,0 +1,21 @@
+{
+  "model_id": "qwen3-0.6b",
+  "name": "Qwen Local 0.6B",
+  "provider": "local",
+  "api": "openai_completions",
+  "base_url": "http://localhost:1234/v1",
+  "reasoning": false,
+  "context_window": 4096,
+  "max_tokens": 1024,
+  "compat": "qwen",
+  "headers": {},
+  "memory": {
+    "backend": "onnx",
+    "model": "",
+    "base_url": "",
+    "api_key": "",
+    "dims": 0,
+    "endpoint_path": "",
+    "db_path": "memory/onnx"
+  }
+}

@@ -7,12 +7,12 @@
 //! close is a completed response and must finish cleanly; before any
 //! `finish_reason` it is genuine truncation and must stay an error.
 
+use ::agent::provider::{ModelConfig, OpenAiCompatProvider, StreamConfig, StreamProvider};
+use ::agent::types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use yoagent::provider::{ModelConfig, OpenAiCompatProvider, StreamConfig, StreamProvider};
-use yoagent::types::*;
 
 fn chunk(json: &str) -> String {
     format!("data: {json}\n\n")
@@ -29,7 +29,7 @@ fn stream_config(base_url: &str) -> StreamConfig {
     config
 }
 
-async fn run_stream(config: StreamConfig) -> Result<Message, yoagent::provider::ProviderError> {
+async fn run_stream(config: StreamConfig) -> Result<Message, agent::provider::ProviderError> {
     let (tx, _rx) = mpsc::unbounded_channel();
     OpenAiCompatProvider
         .stream(config, tx, CancellationToken::new())

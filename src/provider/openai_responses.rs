@@ -61,8 +61,10 @@ impl StreamProvider for OpenAiResponsesProvider {
         let mut content: Vec<Content> = Vec::new();
         let mut usage = Usage::default();
         let mut stop_reason = StopReason::Stop;
-        let mut tool_call_buffers: std::collections::HashMap<usize, ToolCallBuffer> =
-            std::collections::HashMap::new();
+        let mut tool_call_buffers: Vec<ToolCallBuffer> = Vec::new();
+        // Buffer index currently receiving argument deltas; moved forward by
+        // each `function_call_arguments.start`.
+        let mut active_tool_call: usize = 0;
 
         let _ = tx.send(StreamEvent::Start);
 
@@ -118,13 +120,16 @@ impl StreamProvider for OpenAiResponsesProvider {
                                 }
                                 "response.function_call_arguments.start" => {
                                     if let Ok(data) = serde_json::from_str::<FunctionCallStartEvent>(&msg.data) {
-                                        let idx = content.len() + tool_call_buffers.len();
-                                        tool_call_buffers.insert(idx, ToolCallBuffer {
+                                        // Buffers are routed by position, never by "last seen" — concurrent tool
+                // calls must land in their own buffer.
+                let idx = tool_call_buffers.len();
+                tool_call_buffers.push(ToolCallBuffer {
                                             id: data.call_id.unwrap_or_default(),
                                             name: data.name.unwrap_or_default(),
                                             arguments: String::new(),
                                         });
-                                        let buf = &tool_call_buffers[&idx];
+                                        let buf = &tool_call_buffers[idx];
+                                        active_tool_call = idx;
                                         let _ = tx.send(StreamEvent::ToolCallStart {
                                             content_index: idx,
                                             id: buf.id.clone(),
@@ -133,12 +138,20 @@ impl StreamProvider for OpenAiResponsesProvider {
                                     }
                                 }
                                 "response.function_call_arguments.delta" => {
-                                    if let Ok(data) = serde_json::from_str::<TextDeltaEvent>(&msg.data) {
-                                        // Find last buffer
-                                        if let Some((&idx, buf)) = tool_call_buffers.iter_mut().last() {
+                                    if let Ok(data) = serde_json::from_str::<FunctionCallDeltaEvent>(&msg.data) {
+                                        // Route to the buffer the event names
+                                        // (output_index), else the one currently
+                                        // open. Never iterate the container —
+                                        // ordering is not a routing signal.
+                                        let target = data
+                                            .output_index
+                                            .filter(|oi| (*oi as usize) < tool_call_buffers.len())
+                                            .map(|oi| oi as usize)
+                                            .unwrap_or_else(|| active_tool_call);
+                                        if let Some(buf) = tool_call_buffers.get_mut(target) {
                                             buf.arguments.push_str(&data.delta);
                                             let _ = tx.send(StreamEvent::ToolCallDelta {
-                                                content_index: idx,
+                                                content_index: target,
                                                 delta: data.delta,
                                             });
                                         }
@@ -203,7 +216,7 @@ impl StreamProvider for OpenAiResponsesProvider {
         }
 
         // Finalize tool calls
-        for (_, buf) in tool_call_buffers {
+        for buf in tool_call_buffers {
             let args = serde_json::from_str(&buf.arguments)
                 .unwrap_or(serde_json::Value::Object(Default::default()));
             content.push(Content::ToolCall {
@@ -410,6 +423,15 @@ struct FunctionCallStartEvent {
     call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FunctionCallDeltaEvent {
+    delta: String,
+    /// Index of the output item this delta belongs to. Present on the
+    /// Responses API; without it concurrent calls cannot be told apart.
+    #[serde(default)]
+    output_index: Option<u32>,
 }
 
 #[derive(Deserialize)]

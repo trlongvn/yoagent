@@ -9,7 +9,7 @@ For the first-class `ModelConfig::*` constructors and default model metadata, se
 Requires a `ModelConfig` with `compat` flags set in `StreamConfig.model_config`:
 
 ```rust
-use yoagent::provider::ModelConfig;
+use agent::provider::ModelConfig;
 
 let agent = Agent::from_config(ModelConfig::openai("gpt-5.5", "GPT-5.5"));
 ```
@@ -50,7 +50,7 @@ pub struct OpenAiCompat {
 
 `OpenAiCompat` presets are lower-level quirk flags. A provider is first-class when it also has a `ModelConfig::*` constructor; see [Model Presets](model-presets.md).
 
-DeepSeek context caching is automatic on DeepSeek's side. yoagent does not send
+DeepSeek context caching is automatic on DeepSeek's side. agent does not send
 `cache_control` markers for DeepSeek, but it does parse DeepSeek's
 `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` usage fields into
 `Usage.cache_read` and `Usage.input`.
@@ -95,8 +95,8 @@ The `ThinkingFormat` enum controls how reasoning content is parsed from streams:
 Use `ModelConfig::ollama()` for Ollama, or `ModelConfig::local()` for any other local OpenAI-compatible server. No API key required:
 
 ```rust
-use yoagent::agent::Agent;
-use yoagent::provider::ModelConfig;
+use agent::agent::Agent;
+use agent::provider::ModelConfig;
 
 // The `local` provider resolves to an empty API key automatically — none needed.
 let agent = Agent::from_config(ModelConfig::local("http://localhost:1234/v1", "my-model"));
@@ -144,7 +144,7 @@ let qwen_on_ollama = ModelConfig::openai_compat(
 > **Terms of service.** `api.githubcopilot.com` is intended for use through official
 > GitHub Copilot editor integrations. Accessing it from a third-party agent is against
 > GitHub's Copilot terms of service and may result in token revocation or account
-> suspension. yoagent does **not** ship a first-class Copilot preset for this reason.
+> suspension. agent does **not** ship a first-class Copilot preset for this reason.
 > The configuration below is documented only for users who understand and accept that
 > risk. Use at your own discretion.
 
@@ -153,8 +153,8 @@ Copilot's chat endpoint is OpenAI Chat Completions–shaped, so it works with
 Copilot token as the API key:
 
 ```rust
-use yoagent::agent::Agent;
-use yoagent::provider::{ModelConfig, OpenAiCompat};
+use agent::agent::Agent;
+use agent::provider::{ModelConfig, OpenAiCompat};
 
 let mut config = ModelConfig::openai_compat(
     "https://api.githubcopilot.com",
@@ -176,7 +176,7 @@ config under `~/.config/github-copilot/`) at
 `https://api.github.com/copilot_internal/v2/token`. That token **expires after ~25–30
 minutes**.
 
-yoagent has no built-in credential refresh — `api_key` is static for the life of the
+agent has no built-in credential refresh — `api_key` is static for the life of the
 provider (`Authorization: Bearer {api_key}`). For anything longer than a single short
 turn, **you** must exchange and refresh the token yourself and rebuild the agent's config
 with a fresh token before it expires; otherwise long runs will fail with `401`.

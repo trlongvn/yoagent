@@ -3,12 +3,15 @@
 
 use crate::agent_loop::{
     agent_loop, agent_loop_continue, AfterTurnFn, AgentLoopConfig, BeforeTurnFn, OnErrorFn,
+    PrepareContextFn,
 };
 use crate::context::{CompactionStrategy, ContextConfig, ExecutionLimits};
 use crate::mcp::{McpClient, McpError, McpToolAdapter};
 use crate::provider::{ModelConfig, StreamProvider};
 use crate::types::*;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -66,6 +69,10 @@ pub struct Agent {
     before_turn: Option<BeforeTurnFn>,
     after_turn: Option<AfterTurnFn>,
     on_error: Option<OnErrorFn>,
+
+    /// Async request-preparation stage (see [`PrepareContextFn`]). Produces
+    /// reference material appended to the outgoing request only.
+    prepare_context: Option<PrepareContextFn>,
 
     // Input filters
     input_filters: Vec<Arc<dyn InputFilter>>,
@@ -153,7 +160,7 @@ impl Agent {
     /// always overrides the environment.
     ///
     /// ```no_run
-    /// use yoagent::{Agent, provider::ModelConfig};
+    /// use agent::{Agent, provider::ModelConfig};
     /// // provider auto-selected from config.api; key from ANTHROPIC_API_KEY
     /// let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"));
     /// ```
@@ -273,6 +280,7 @@ impl Agent {
             before_turn: None,
             after_turn: None,
             on_error: None,
+            prepare_context: None,
             input_filters: Vec::new(),
             tool_middleware: Vec::new(),
             compaction_strategy: None,
@@ -441,6 +449,35 @@ impl Agent {
 
     pub fn on_error(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_error = Some(Arc::new(f));
+        self
+    }
+
+    /// Install an async request-preparation stage (see [`PrepareContextFn`]).
+    ///
+    /// The closure receives the current messages and returns reference
+    /// material (typically a provenance-marked recalled-memories block) that
+    /// is appended to each outgoing request as a trailing user message. It runs
+    /// once per new user request, before compaction is budgeted, and never
+    /// writes into the stored transcript — so the same block cannot accumulate
+    /// across internal tool iterations.
+    ///
+    /// Pass an already-`Arc`ed closure via [`Agent::with_prepare_context_fn`]
+    /// when the stage needs its own shared state (e.g. a memory service).
+    pub fn with_prepare_context<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Vec<AgentMessage>) -> Pin<Box<dyn Future<Output = String> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.prepare_context = Some(Arc::new(f));
+        self
+    }
+
+    /// Like [`Agent::with_prepare_context`] but takes a pre-built `Arc`ed
+    /// closure, so callers can share captured state without cloning per call.
+    pub fn with_prepare_context_fn(mut self, f: PrepareContextFn) -> Self {
+        self.prepare_context = Some(f);
         self
     }
 
@@ -884,8 +921,8 @@ impl Agent {
     /// the loop concurrently and returns immediately.
     ///
     /// ```rust,no_run
-    /// # use yoagent::Agent;
-    /// # use yoagent::provider::{MockProvider, ModelConfig};
+    /// # use agent::Agent;
+    /// # use agent::provider::{MockProvider, ModelConfig};
     /// # async fn example() {
     /// let mut agent = Agent::from_provider(MockProvider::text("hi"), ModelConfig::mock());
     /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1130,6 +1167,7 @@ impl Agent {
             model_config: self.model_config.clone(),
             convert_to_llm: None,
             transform_context: None,
+            prepare_context: self.prepare_context.clone(),
             get_steering_messages: Some(Box::new(move || {
                 let mut queue = steering_queue.lock().unwrap();
                 match steering_mode {

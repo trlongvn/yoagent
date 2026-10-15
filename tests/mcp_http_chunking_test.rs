@@ -9,12 +9,12 @@
 //! slower runner makes the pieces *more* separated, not less. Every timeout here
 //! is a failure deadline, never a synchronisation point.
 
+use ::agent::mcp::transport::McpTransport;
+use ::agent::mcp::types::JsonRpcRequest;
+use ::agent::mcp::HttpTransport;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use yoagent::mcp::transport::McpTransport;
-use yoagent::mcp::types::JsonRpcRequest;
-use yoagent::mcp::HttpTransport;
 
 /// Writes each piece as its own HTTP chunk. `terminate` controls whether the
 /// body ever ends; when it does not, only an early return can complete the call.

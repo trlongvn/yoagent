@@ -1,6 +1,6 @@
 # Providers Overview
 
-yoagent supports multiple LLM providers through the `StreamProvider` trait and `ApiProtocol` dispatch.
+agent supports multiple LLM providers through the `StreamProvider` trait and `ApiProtocol` dispatch.
 
 ## Supported Protocols
 
@@ -101,6 +101,6 @@ All providers receive a `StreamConfig`, emit `StreamEvent`s through the channel,
 
 ## OpenAPI Tool Adapter
 
-In addition to LLM providers, yoagent can auto-generate tools from any OpenAPI 3.0 spec. This is a tool integration (not a provider), but it complements the provider system by letting agents call external APIs.
+In addition to LLM providers, agent can auto-generate tools from any OpenAPI 3.0 spec. This is a tool integration (not a provider), but it complements the provider system by letting agents call external APIs.
 
 Enable with `features = ["openapi"]`. See the [OpenAPI Tools guide](../guides/openapi.md) for details.

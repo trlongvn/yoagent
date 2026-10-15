@@ -4,14 +4,14 @@
 //! `build_request_body` can't reach: stop-reason mapping from SSE events and
 //! the request headers actually sent on the wire.
 
+use ::agent::provider::{
+    AnthropicCompat, AnthropicProvider, ModelConfig, StreamConfig, StreamProvider,
+};
+use ::agent::types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use yoagent::provider::{
-    AnthropicCompat, AnthropicProvider, ModelConfig, StreamConfig, StreamProvider,
-};
-use yoagent::types::*;
 
 /// Matcher: the request must NOT carry the given header.
 struct HeaderAbsent(&'static str);
@@ -47,7 +47,7 @@ fn stream_config(base_url: &str, anthropic: Option<AnthropicCompat>) -> StreamCo
     config
 }
 
-async fn run_stream(config: StreamConfig) -> Result<Message, yoagent::provider::ProviderError> {
+async fn run_stream(config: StreamConfig) -> Result<Message, agent::provider::ProviderError> {
     let (tx, _rx) = mpsc::unbounded_channel();
     AnthropicProvider
         .stream(config, tx, CancellationToken::new())
@@ -196,7 +196,7 @@ async fn rate_limit_carries_retry_after_from_header() {
         .expect_err("429 must surface as an error");
 
     match err {
-        yoagent::provider::ProviderError::RateLimited { retry_after_ms } => {
+        agent::provider::ProviderError::RateLimited { retry_after_ms } => {
             assert_eq!(retry_after_ms, Some(7000));
         }
         other => panic!("expected RateLimited, got: {:?}", other),
@@ -206,7 +206,7 @@ async fn rate_limit_carries_retry_after_from_header() {
 /// Issue #81: the returned message must carry the `ModelConfig.provider`, not a
 /// hardcoded "anthropic". Gateways that speak the Anthropic Messages protocol
 /// (OpenCode Zen, Copilot) set their own provider name for cost and session
-/// attribution — yoagent's own `ModelConfig::opencode_zen()` preset routes
+/// attribution — agent's own `ModelConfig::opencode_zen()` preset routes
 /// Claude model ids over this provider, so the hardcoded value mis-attributed
 /// a first-class preset.
 #[tokio::test]
@@ -262,7 +262,7 @@ async fn stream_ended_without_stop_reason_is_retryable_network_error() {
         .expect_err("truncation before stop_reason must be an error");
 
     assert!(
-        matches!(err, yoagent::provider::ProviderError::Network(_)),
+        matches!(err, agent::provider::ProviderError::Network(_)),
         "expected retryable Network, got: {err:?}"
     );
     assert!(err.is_retryable(), "truncation must be retryable");

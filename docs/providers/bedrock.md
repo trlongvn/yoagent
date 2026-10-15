@@ -5,7 +5,7 @@
 ## Usage
 
 ```rust
-use yoagent::provider::{ApiProtocol, ModelConfig};
+use agent::provider::{ApiProtocol, ModelConfig};
 
 // Bedrock has no dedicated ModelConfig preset — build one with `custom`.
 let agent = Agent::from_config(ModelConfig::custom(
@@ -39,7 +39,7 @@ Alternatively, provide pre-computed auth headers via `ModelConfig.headers` or us
 
 Bedrock uses its own content block format:
 
-| yoagent | Bedrock API |
+| agent | Bedrock API |
 |----------|-------------|
 | `Content::Text` | `{"text": "..."}` |
 | `Content::Image` | `{"image": {"format": "...", "source": {"bytes": "..."}}}` |

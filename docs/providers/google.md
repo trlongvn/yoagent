@@ -8,7 +8,7 @@ Two providers for Google's Gemini models:
 ## Google AI Studio
 
 ```rust
-use yoagent::provider::ModelConfig;
+use agent::provider::ModelConfig;
 
 let agent = Agent::from_config(ModelConfig::google("gemini-2.5-flash", "Gemini 2.5 Flash"));
 ```
@@ -24,7 +24,7 @@ let agent = Agent::from_config(ModelConfig::google("gemini-2.5-flash", "Gemini 2
 
 Google uses a different message format than OpenAI/Anthropic:
 
-| yoagent | Google API |
+| agent | Google API |
 |----------|-----------|
 | `user` role | `user` role |
 | `assistant` role | `model` role |

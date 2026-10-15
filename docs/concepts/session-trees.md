@@ -11,7 +11,7 @@ overwritten. This is the primitive behind:
   branch stays intact
 
 ```rust
-use yoagent::{Agent, Session, provider::ModelConfig};
+use agent::{Agent, Session, provider::ModelConfig};
 
 let mut session = Session::new();
 

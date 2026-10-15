@@ -10,11 +10,11 @@
 //! a provider-level test cannot see a retry because the retry lives in
 //! `agent_loop`.
 
+use ::agent::core::Agent;
+use ::agent::provider::{ModelConfig, OpenAiResponsesProvider};
+use ::agent::retry::RetryConfig;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use yoagent::agent::Agent;
-use yoagent::provider::{ModelConfig, OpenAiResponsesProvider};
-use yoagent::retry::RetryConfig;
 
 /// Fast retries so a regression fails in milliseconds rather than seconds.
 fn quick_retry() -> RetryConfig {

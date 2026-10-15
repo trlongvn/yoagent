@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `yoagent` are documented here. The format loosely
+All notable changes to `agent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
@@ -832,7 +832,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   `ObservationId`, `ArtifactRef`, `ExpectedEffect`, `Precondition`,
   `ProjectRef`, `StateOp` — found by auditing every re-exported struct's
   fields rather than only the three in the report. A test now constructs every
-  re-exported struct from `yoagent::gasp` alone, so a struct that is nameable
+  re-exported struct from `agent::gasp` alone, so a struct that is nameable
   but unbuildable fails to compile.
 
 ### Changed
@@ -872,7 +872,7 @@ adheres to [Semantic Versioning](https://semver.org/).
 - **Breaking: `AgentEvent`, `StreamEvent`, `StreamDelta`, `StopReason` and
   `ApiProtocol` are now `#[non_exhaustive]`.** These five grow with provider
   and protocol features, so every addition was previously a breaking change —
-  the reason yoagent#104 routed around adding a compaction event rather than
+  the reason agent#104 routed around adding a compaction event rather than
   adding one. Downstream `match` arms need a `_ =>` wildcard; new variants are
   additive from here.
 
@@ -999,7 +999,7 @@ actually hurts an agent, rather than only what it costs.
 ### Changed
 
 - **Breaking:** `yoagent-state` 0.4 → 0.5. Its types are re-exported from
-  `yoagent::gasp`, so this changes public type identity for code that also
+  `agent::gasp`, so this changes public type identity for code that also
   depends on `yoagent-state` directly. Sidecar processes with their own
   `yoagent-state` (separate binaries) are unaffected; 0.5 events are
   wire-compatible both ways with 0.4 logs.
@@ -1084,7 +1084,7 @@ actually hurts an agent, rather than only what it costs.
   the direct analogue of DeepSeek's `cache_hit_tokens / input_tokens`. The tool
   mix (bash 41%, edit/write 36%, read 19%, search 4%) and the file-size
   distribution are taken from 808 archived runs of a production agent built on
-  yoagent. Over 300 turns on a 128K window:
+  agent. Over 300 turns on a 128K window:
 
   | session | 0.14.2 hit | 0.15.0 hit | 0.14.2 rewrites | 0.15.0 rewrites |
   |---|---|---|---|---|
@@ -1137,7 +1137,7 @@ actually hurts an agent, rather than only what it costs.
 - **README rewritten for first-time readers.** It now leads with the one
   command that runs a real coding agent against a local model with no API key,
   a Quick Start that actually calls a tool (every snippet compile-checked), a
-  diagram of the loop, and a section stating plainly what yoagent does *not* do
+  diagram of the loop, and a section stating plainly what agent does *not* do
   and which crates to use instead. Capabilities moved from a ~40-bullet wall
   into six collapsible groups.
 - Surfaced what the README previously omitted: `SharedState`, `InputFilter`,
@@ -1163,7 +1163,7 @@ actually hurts an agent, rather than only what it costs.
   and a pull request template — the repository previously had none.
 - Loop and sub-agent/shared-state diagrams in `docs/images/`, with light and
   dark variants.
-- A **Built with yoagent** section listing the projects that depend on the
+- A **Built with agent** section listing the projects that depend on the
   crate, headed by [yoyo-evolve](https://github.com/yologdev/yoyo-evolve), plus
   an invitation to add your own.
 
@@ -1275,7 +1275,7 @@ actually hurts an agent, rather than only what it costs.
 - **Anthropic messages carry the configured provider** (#81). `AnthropicProvider`
   hardcoded `provider: "anthropic"`, the sole outlier among providers — every
   other one propagates `ModelConfig.provider`. This mis-attributed gateways
-  speaking the Anthropic Messages protocol, including yoagent's own
+  speaking the Anthropic Messages protocol, including agent's own
   `ModelConfig::opencode_zen()` preset, which routes Claude model ids over this
   provider under the name `"opencode-zen"`. Falls back to `"anthropic"` when no
   `ModelConfig` is supplied.
@@ -1364,7 +1364,7 @@ Thanks to @markokocic for reporting #81, #83, and #84.
   but the renamed fields are silently dropped there: cache/total token
   counts read as 0, and `errorMessage`/`providerMetadata` — including
   Gemini thought signatures — are lost. Don't round-trip session files
-  through yoagent < 0.13. The full nested payload shape (message, content
+  through agent < 0.13. The full nested payload shape (message, content
   blocks, usage) is frozen by an exact-JSON snapshot test.
 - `serde` minimum version is now `1.0.177` (the release that added
   `rename_all_fields`, July 2023); no practical impact.
@@ -1389,7 +1389,7 @@ Thanks to @markokocic for reporting #81, #83, and #84.
   events teed to your UI **before** recording (a recording failure never
   blinds the UI; the error surfaces via the returned handle). Redaction hook
   via `with_summarizer` — summaries of tool inputs/outputs are persisted to
-  a shareable repo. yoagent is now a **tested** GASP-conformant runtime: CI
+  a shareable repo. agent is now a **tested** GASP-conformant runtime: CI
   emits a repo and runs the protocol's 7-check suite against a **fresh
   clone** (the actual restore operation). New `gasp_emit` example and docs
   page.

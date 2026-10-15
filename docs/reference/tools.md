@@ -1,9 +1,9 @@
 # Built-in Tools
 
-yoagent ships with six coding-oriented tools. Get them all with `default_tools()`:
+agent ships with six coding-oriented tools. Get them all with `default_tools()`:
 
 ```rust
-use yoagent::tools::default_tools;
+use agent::tools::default_tools;
 let tools = default_tools();
 ```
 

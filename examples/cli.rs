@@ -24,12 +24,12 @@
 //!   /clear          Clear conversation history
 //!   /model <name>   Switch model mid-session
 
+use ::agent::core::Agent;
+use ::agent::provider::ModelConfig;
+use ::agent::skills::SkillSet;
+use ::agent::tools::default_tools;
+use ::agent::*;
 use std::io::{self, BufRead, Write};
-use yoagent::agent::Agent;
-use yoagent::provider::ModelConfig;
-use yoagent::skills::SkillSet;
-use yoagent::tools::default_tools;
-use yoagent::*;
 
 // ANSI color helpers
 const RESET: &str = "\x1b[0m";
@@ -47,7 +47,7 @@ Use tools proactively: read files to understand context, run commands to verify 
 After making changes, run tests or verify the result when appropriate."#;
 
 fn print_banner() {
-    println!("\n{BOLD}{CYAN}  yoagent cli{RESET} {DIM}— mini coding agent{RESET}");
+    println!("\n{BOLD}{CYAN}  agent cli{RESET} {DIM}— mini coding agent{RESET}");
     println!("{DIM}  Type /quit to exit, /clear to reset{RESET}\n");
 }
 

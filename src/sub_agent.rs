@@ -1,4 +1,4 @@
-//! Sub-agent tool — delegates tasks to a child agent loop.
+//! Sub-agent tool â€” delegates tasks to a child agent loop.
 //!
 //! The `SubAgentTool` implements `AgentTool` and internally runs `agent_loop()`
 //! with its own system prompt, tools, and provider. The parent LLM invokes it
@@ -14,8 +14,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use yoagent::sub_agent::SubAgentTool;
-//! use yoagent::provider::ModelConfig;
+//! use agent::sub_agent::SubAgentTool;
+//! use agent::provider::ModelConfig;
 //!
 //! // Provider selected from the config's protocol; key from ANTHROPIC_API_KEY.
 //! let researcher = SubAgentTool::from_config(
@@ -26,8 +26,8 @@
 //! .with_system_prompt("You are a research assistant.");
 //! ```
 
-use crate::agent_loop::{agent_loop, AgentLoopConfig};
-use crate::context::ExecutionLimits;
+use crate::agent_loop::{agent_loop, AgentLoopConfig, PrepareContextFn};
+use crate::context::{CompactionStrategy, ExecutionLimits};
 use crate::provider::model::ModelConfig;
 use crate::provider::StreamProvider;
 use crate::shared_state::SharedState;
@@ -65,14 +65,17 @@ pub struct SubAgentTool {
     turn_delay: Option<std::time::Duration>,
     model_config: Option<ModelConfig>,
     tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
+    prepare_context: Option<PrepareContextFn>,
+    compaction_strategy: Option<Arc<dyn CompactionStrategy>>,
+    input_filters: Vec<Arc<dyn InputFilter>>,
 }
 
 impl SubAgentTool {
     /// Create a new sub-agent tool with a name and provider.
     #[deprecated(
         since = "0.10.0",
-        note = "use SubAgentTool::from_config(name, config) — provider + env key \
-                resolved automatically — or SubAgentTool::from_provider(name, provider, config) \
+        note = "use SubAgentTool::from_config(name, config) â€” provider + env key \
+                resolved automatically â€” or SubAgentTool::from_provider(name, provider, config) \
                 for a custom provider; will be removed in 1.0"
     )]
     pub fn new(name: impl Into<String>, provider: Arc<dyn StreamProvider>) -> Self {
@@ -104,6 +107,9 @@ impl SubAgentTool {
             turn_delay: None,
             model_config: None,
             tool_middleware: Vec::new(),
+            prepare_context: None,
+            compaction_strategy: None,
+            input_filters: Vec::new(),
         }
     }
 
@@ -117,7 +123,7 @@ impl SubAgentTool {
     ///
     /// # Panics
     ///
-    /// Never panics — the default registry covers every [`ApiProtocol`]
+    /// Never panics â€” the default registry covers every [`ApiProtocol`]
     /// variant. Use [`from_config_with`](Self::from_config_with) with a custom
     /// registry when a protocol may be unregistered and you want a `Result`.
     ///
@@ -175,7 +181,7 @@ impl SubAgentTool {
 
     /// Attach a skill set so the sub-agent sees the skills index.
     ///
-    /// Mirrors [`Agent::with_skills`](crate::agent::Agent::with_skills): the skills
+    /// Mirrors [`Agent::with_skills`](crate::core::Agent::with_skills): the skills
     /// index is formatted as XML per the [AgentSkills standard](https://agentskills.io)
     /// and appended to the sub-agent's system prompt at dispatch time. The sub-agent
     /// can then read individual SKILL.md files via the `read_file` tool when it
@@ -212,6 +218,49 @@ impl SubAgentTool {
         self
     }
 
+    /// Forward an input filter to the sub-agent. The filter rewrites user
+    /// input before it reaches the sub-agent's loop; a parent that sanitizes
+    /// user content with a filter gets the same treatment for its delegates.
+    /// Mirrors [`Agent::with_input_filter`](crate::Agent::with_input_filter).
+    pub fn with_input_filter(mut self, filter: impl InputFilter + 'static) -> Self {
+        self.input_filters.push(Arc::new(filter));
+        self
+    }
+
+    /// Forward a context-preparation hook to the sub-agent. The sub-agent runs
+    /// its own loop, so without this the hook is silently absent from every
+    /// delegated turn. Mirrors
+    /// [`Agent::with_prepare_context`](crate::Agent::with_prepare_context).
+    pub fn with_prepare_context<F>(mut self, f: F) -> Self
+    where
+        F: Fn(
+                Vec<AgentMessage>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.prepare_context = Some(Arc::new(f));
+        self
+    }
+
+    /// Same as [`Self::with_prepare_context`] but accepts the
+    /// [`PrepareContextFn`] form directly, so a hook built elsewhere (and
+    /// perhaps already shared with the parent) can be passed through.
+    pub fn with_prepare_context_fn(mut self, f: PrepareContextFn) -> Self {
+        self.prepare_context = Some(f);
+        self
+    }
+
+    /// Forward a compaction strategy to the sub-agent. Without this a
+    /// long-running delegate silently falls back to the default tiered
+    /// compaction instead of the parent's policy. Mirrors
+    /// [`Agent::with_compaction_strategy`](crate::Agent::with_compaction_strategy).
+    pub fn with_compaction_strategy(mut self, strategy: impl CompactionStrategy + 'static) -> Self {
+        self.compaction_strategy = Some(Arc::new(strategy));
+        self
+    }
+
     pub fn with_thinking(mut self, level: ThinkingLevel) -> Self {
         self.thinking_level = level;
         self
@@ -224,7 +273,7 @@ impl SubAgentTool {
 
     /// Set the sampling temperature for the sub-agent. Note: the newest
     /// reasoning models (e.g. Claude Fable 5 / Opus 4.7+) reject sampling
-    /// parameters — leave unset for those.
+    /// parameters â€” leave unset for those.
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
@@ -249,7 +298,7 @@ impl SubAgentTool {
     ///
     /// Sub-agents ran without one, so `truncate_tool_output_on_append` never
     /// fired for them and a sub-agent's oversized tool output entered its
-    /// context whole — and, once #133 wired a stash sink here, that sink was
+    /// context whole â€” and, once #133 wired a stash sink here, that sink was
     /// unreachable because the loop gates truncation and stashing together on
     /// this being `Some`.
     ///
@@ -260,7 +309,7 @@ impl SubAgentTool {
     /// total history.
     ///
     /// The gate is this being `Some` **and** `truncate_tool_output_on_append`,
-    /// which defaults to true — passing a config with it false still yields no
+    /// which defaults to true â€” passing a config with it false still yields no
     /// truncation and no stash. Note also that the budget is line-based, so a
     /// single-line result (minified JSON, base64) passes through whole.
     ///
@@ -443,13 +492,14 @@ impl AgentTool for SubAgentTool {
             model_config: self.model_config.clone(),
             convert_to_llm: None,
             transform_context: None,
+            prepare_context: self.prepare_context.clone(),
             get_steering_messages: None,
             get_follow_up_messages: None,
             context_config: self.context_config.clone(),
-            compaction_strategy: None,
+            compaction_strategy: self.compaction_strategy.clone(),
             execution_limits: Some(ExecutionLimits {
                 max_turns: self.max_turns,
-                // Generous token/duration limits — turn limit is the primary guard
+                // Generous token/duration limits â€” turn limit is the primary guard
                 max_total_tokens: 1_000_000,
                 max_duration: std::time::Duration::from_secs(300),
                 ..Default::default()
@@ -461,7 +511,7 @@ impl AgentTool for SubAgentTool {
             before_turn: None,
             after_turn: None,
             on_error: None,
-            input_filters: vec![],
+            input_filters: self.input_filters.clone(),
             tool_middleware: self.tool_middleware.clone(),
             output_schema: None,
             turn_delay: self.turn_delay,
@@ -549,7 +599,7 @@ fn extract_error(messages: &[AgentMessage]) -> Option<String> {
     // text output)". A sub-agent that burned its entire budget looping looked
     // like one that simply had nothing to say.
     //
-    // Only loop aborts. Hitting `max_turns` is a bound, not a failure — the
+    // Only loop aborts. Hitting `max_turns` is a bound, not a failure â€” the
     // work was cut short but what it produced is real, so it is returned, with
     // the stop notice appended by `extract_final_text` so the parent's model
     // knows the answer is partial.

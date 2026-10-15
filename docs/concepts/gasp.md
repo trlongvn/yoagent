@@ -7,18 +7,18 @@ goal/run/model/tool graph, alongside identity, skills, and memory tiers.
 Restore = `git clone` + replay. Clone your agent onto a new machine and it
 remembers everything, with lineage.
 
-yoagent bridges to GASP through the `gasp` feature (backed by
+agent bridges to GASP through the `gasp` feature (backed by
 [`yoagent-state`](https://crates.io/crates/yoagent-state), the reference
 runtime). The bridge is a consumer of the [`AgentEvent`] stream — **zero
 agent-loop changes**:
 
 ```toml
-yoagent = { version = "0.15", features = ["gasp"] }
+agent = { version = "0.15", features = ["gasp"] }
 ```
 
 
 ```rust
-use yoagent::gasp::{GaspRecorder, GoalRef};
+use agent::gasp::{GaspRecorder, GoalRef};
 
 let recorder = GaspRecorder::init(
     "./my-agent-repo", "my-agent", "worker-1",
@@ -60,7 +60,7 @@ live workers, and record one run at a time.
 
 ## Tested conformance
 
-yoagent's CI emits an agent repo with a mock provider and runs the GASP
+agent's CI emits an agent repo with a mock provider and runs the GASP
 conformance checker against it — all seven mechanical checks (envelope
 round-trip, replay, vocabulary, append-only git history, causation integrity,
 restore, domain↔ops consistency) must pass on every commit. Try it yourself:

@@ -4,14 +4,14 @@
 //! and drives `agent_loop` directly in the current task — spans created in
 //! separately-spawned tasks would not reach this scoped subscriber.
 
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::*;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::layer::SubscriberExt;
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::*;
 
 /// Layer that records every new span's name.
 struct SpanCollector(Arc<Mutex<Vec<String>>>);
@@ -61,8 +61,8 @@ impl AgentTool for EchoTool {
     }
 }
 
-fn loop_config(provider: MockProvider) -> yoagent::agent_loop::AgentLoopConfig {
-    yoagent::agent_loop::AgentLoopConfig {
+fn loop_config(provider: MockProvider) -> agent::agent_loop::AgentLoopConfig {
+    agent::agent_loop::AgentLoopConfig {
         provider: std::sync::Arc::new(provider),
         model: "mock".into(),
         api_key: "test".into(),
@@ -72,6 +72,7 @@ fn loop_config(provider: MockProvider) -> yoagent::agent_loop::AgentLoopConfig {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -82,7 +83,7 @@ fn loop_config(provider: MockProvider) -> yoagent::agent_loop::AgentLoopConfig {
         tool_execution: ToolExecutionStrategy::default(),
         tool_middleware: vec![],
         output_schema: None,
-        retry_config: yoagent::RetryConfig::none(),
+        retry_config: agent::RetryConfig::none(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -209,13 +210,13 @@ where
 struct UsageProvider;
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for UsageProvider {
+impl agent::provider::StreamProvider for UsageProvider {
     async fn stream(
         &self,
-        _config: yoagent::provider::StreamConfig,
-        tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        _config: agent::provider::StreamConfig,
+        tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         let msg = Message::assistant(
             vec![Content::Text { text: "ok".into() }],
             StopReason::Stop,
@@ -229,7 +230,7 @@ impl yoagent::provider::StreamProvider for UsageProvider {
                 total_tokens: 1_500_007,
             },
         );
-        let _ = tx.send(yoagent::provider::StreamEvent::Done {
+        let _ = tx.send(agent::provider::StreamEvent::Done {
             message: msg.clone(),
         });
         Ok(msg)
@@ -247,7 +248,7 @@ async fn llm_stream_records_tokens_and_cost() {
 
     let mut config = loop_config(MockProvider::text("unused"));
     config.provider = std::sync::Arc::new(UsageProvider);
-    let mut mc = yoagent::provider::ModelConfig::mock();
+    let mut mc = agent::provider::ModelConfig::mock();
     mc.cost.input_per_million = 3.0;
     mc.cost.output_per_million = 15.0;
     config.model_config = Some(mc);

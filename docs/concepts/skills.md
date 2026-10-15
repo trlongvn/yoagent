@@ -44,10 +44,10 @@ For complex diffs: `bash {baseDir}/scripts/diff_summary.sh`
 ## Loading skills
 
 ```rust
-use yoagent::SkillSet;
+use agent::SkillSet;
 
 // Load from multiple directories (later dirs override earlier on name conflict)
-let skills = SkillSet::load(&["./skills", "~/.yoagent/skills"])?;
+let skills = SkillSet::load(&["./skills", "~/.agent/skills"])?;
 
 // Or load from a single directory with a label
 let workspace_skills = SkillSet::load_dir("./skills", "workspace")?;
@@ -57,7 +57,7 @@ If skills may be updated independently at runtime, use resilient loading so one
 malformed `SKILL.md` does not discard the rest of the set:
 
 ```rust
-let (skills, errors) = SkillSet::load_resilient(&["./skills", "~/.yoagent/skills"]);
+let (skills, errors) = SkillSet::load_resilient(&["./skills", "~/.agent/skills"]);
 
 for error in errors {
     tracing::warn!(%error, "skipping malformed skill");
@@ -71,7 +71,7 @@ and return the first error they encounter.
 ## Using with Agent
 
 ```rust
-use yoagent::{Agent, SkillSet};
+use agent::{Agent, SkillSet};
 
 let skills = SkillSet::load(&["./skills"])?;
 
@@ -97,13 +97,13 @@ When the agent encounters a task matching a skill, it reads the SKILL.md using t
 
 ## Precedence
 
-When loading from multiple directories, later directories take precedence. A skill in `./skills/` overrides the same-named skill in `~/.yoagent/skills/`.
+When loading from multiple directories, later directories take precedence. A skill in `./skills/` overrides the same-named skill in `~/.agent/skills/`.
 
 You can also merge skill sets explicitly:
 
 ```rust
-let mut base = SkillSet::load_dir("/usr/share/yoagent/skills", "bundled")?;
-let user = SkillSet::load_dir("~/.yoagent/skills", "user")?;
+let mut base = SkillSet::load_dir("/usr/share/agent/skills", "bundled")?;
+let user = SkillSet::load_dir("~/.agent/skills", "user")?;
 let workspace = SkillSet::load_dir("./skills", "workspace")?;
 
 base.merge(user);
@@ -112,7 +112,7 @@ base.merge(workspace); // workspace wins on conflict
 
 ## Compatibility
 
-By following the AgentSkills standard, skills written for yoagent work with Claude Code, Codex CLI, Gemini CLI, Cursor, OpenCode, Goose, and any other compatible agent. Write once, use everywhere.
+By following the AgentSkills standard, skills written for agent work with Claude Code, Codex CLI, Gemini CLI, Cursor, OpenCode, Goose, and any other compatible agent. Write once, use everywhere.
 
 ## Design philosophy
 

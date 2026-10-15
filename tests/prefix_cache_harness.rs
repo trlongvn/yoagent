@@ -36,14 +36,14 @@
 //! cargo test --test prefix_cache_harness -- --ignored --nocapture
 //! ```
 //!
-//! [`agent_loop`]: yoagent::agent_loop
+//! [`agent_loop`]: agent::agent_loop
 
+use ::agent::context::{total_tokens, CompactionStrategy, ContextConfig, DefaultCompaction};
+use ::agent::llm_compaction::{LlmCompaction, SUMMARY_MARKER};
+use ::agent::provider::{ModelConfig, ProviderError, StreamConfig, StreamEvent, StreamProvider};
+use ::agent::types::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use yoagent::context::{total_tokens, CompactionStrategy, ContextConfig, DefaultCompaction};
-use yoagent::llm_compaction::{LlmCompaction, SUMMARY_MARKER};
-use yoagent::provider::{ModelConfig, ProviderError, StreamConfig, StreamEvent, StreamProvider};
-use yoagent::types::*;
 
 // ---------------------------------------------------------------------------
 // Harness

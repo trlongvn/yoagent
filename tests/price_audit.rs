@@ -55,7 +55,7 @@
 //! - **HTTP status is checked**, and a non-JSON body reports the status,
 //!   content type and first bytes rather than a bare parse error.
 
-use yoagent::provider::{CostConfig, ModelConfig};
+use ::agent::provider::{CostConfig, ModelConfig};
 
 const DB_URL: &str = "https://models.dev/api.json";
 
@@ -252,7 +252,7 @@ async fn hardcoded_prices_have_not_drifted() {
 
     println!(
         "\n{:<30} {:<14} {:>10} {:>12}",
-        "model", "field", "yoagent", "models.dev"
+        "model", "field", "agent", "models.dev"
     );
     println!("{}", "-".repeat(72));
 
@@ -503,8 +503,8 @@ fn is_configured_means_any_rate_set() {
 /// long reply to a short prompt stays on the base rate.
 #[test]
 fn cost_usd_applies_the_context_tier_by_prompt_size() {
-    use yoagent::provider::{ContextTier, CostConfig};
-    use yoagent::types::Usage;
+    use agent::provider::{ContextTier, CostConfig};
+    use agent::types::Usage;
 
     let cfg = CostConfig::new(5.0, 30.0)
         .with_cache_read(0.5)

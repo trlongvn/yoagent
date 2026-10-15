@@ -1,0 +1,21 @@
+{
+  "model_id": "qwen/qwen3.8-flash",
+  "name": "OpenRouter Qwen Flash",
+  "provider": "openrouter",
+  "api": "openai_completions",
+  "base_url": "https://openrouter.ai/api/v1",
+  "reasoning": false,
+  "context_window": 262144,
+  "max_tokens": 4096,
+  "compat": "openrouter",
+  "headers": {},
+  "memory": {
+    "backend": "openai",
+    "model": "text-embedding-3-small",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "$OPENAI_API_KEY",
+    "dims": 1536,
+    "endpoint_path": "/embeddings",
+    "db_path": "memory/openrouter-embed"
+  }
+}

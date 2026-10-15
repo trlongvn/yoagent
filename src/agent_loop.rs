@@ -1,6 +1,6 @@
-//! The core agent loop: prompt → LLM stream → tool execution → repeat.
+//! The core agent loop: prompt â†’ LLM stream â†’ tool execution â†’ repeat.
 //!
-//! This is the heart of yoagent:
+//! This is the heart of agent:
 //!
 //! - `agent_loop()` starts with new prompt messages
 //! - `agent_loop_continue()` resumes from existing context
@@ -13,12 +13,29 @@ use crate::context::{
 };
 use crate::provider::{ModelConfig, StreamConfig, StreamEvent, StreamProvider, ToolDefinition};
 use crate::types::*;
+use std::future::Future;
 use std::sync::Arc;
 
 /// Type alias for convert_to_llm callback.
 pub type ConvertToLlmFn = Box<dyn Fn(&[AgentMessage]) -> Vec<Message> + Send + Sync>;
 /// Type alias for transform_context callback.
 pub type TransformContextFn = Box<dyn Fn(Vec<AgentMessage>) -> Vec<AgentMessage> + Send + Sync>;
+/// Async request-preparation stage.
+///
+/// Invoked once per new user request, *before* the compaction budget is
+/// enforced, and returns reference material (e.g. a provenance-marked
+/// recalled-memories block) that is appended to the outgoing request only —
+/// never into the stored transcript. That separation is what keeps internal
+/// tool iterations from growing the context by the block's size on every turn,
+/// and keeps tool-call/tool-result pairing intact.
+///
+/// Async because the stage is expected to consult a blocking-backed service
+/// (e.g. semantic memory recall) which must not run on the loop's task.
+pub type PrepareContextFn = Arc<
+    dyn Fn(Vec<AgentMessage>) -> std::pin::Pin<Box<dyn Future<Output = String> + Send>>
+        + Send
+        + Sync,
+>;
 /// Type alias for steering/follow-up message callbacks.
 pub type GetMessagesFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
 /// Called before each LLM turn. Return `false` to abort the loop.
@@ -44,12 +61,18 @@ pub struct AgentLoopConfig {
     /// base_url, headers, compat flags, etc.
     pub model_config: Option<ModelConfig>,
 
-    /// Convert AgentMessage[] → Message[] before each LLM call.
+    /// Convert AgentMessage[] â†’ Message[] before each LLM call.
     /// Default: keep only LLM-compatible messages.
     pub convert_to_llm: Option<ConvertToLlmFn>,
 
     /// Transform context before convert_to_llm (for pruning, compaction).
     pub transform_context: Option<TransformContextFn>,
+
+    /// Async preparation of extra reference material for the outgoing request
+    /// (see [`PrepareContextFn`]). Runs once per new user request, before the
+    /// compaction budget is computed, so its size counts against that budget.
+    /// The returned text is appended to the request copy only.
+    pub prepare_context: Option<PrepareContextFn>,
 
     /// Get steering messages (user interruptions mid-run).
     pub get_steering_messages: Option<GetMessagesFn>,
@@ -77,14 +100,14 @@ pub struct AgentLoopConfig {
     /// has it. Set it and the marker names a `shared_state` key instead.
     ///
     /// The pointer lives in the transcript, so it is lost when lossy compaction
-    /// drops that turn — the stash entry outlives it and keeps consuming the
+    /// drops that turn â€” the stash entry outlives it and keeps consuming the
     /// backend's cap. Retrieval is best-effort by construction.
     pub tool_output_sink: Option<crate::shared_state::SharedState>,
 
     /// Tool execution strategy (sequential, parallel, or batched).
     pub tool_execution: ToolExecutionStrategy,
 
-    /// Tool middleware chain — approve/deny/modify every tool call before it
+    /// Tool middleware chain â€” approve/deny/modify every tool call before it
     /// executes (see [`ToolMiddleware`]). Empty = allow all.
     pub tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
 
@@ -127,7 +150,7 @@ fn default_convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
 ///
 /// A run stopped by a limit or by loop detection ends with a `Message::User`
 /// carrying this prefix. The last *assistant* message still reports whatever
-/// stop reason it had — `ToolUse` for a loop abort — so a consumer inspecting
+/// stop reason it had â€” `ToolUse` for a loop abort â€” so a consumer inspecting
 /// only assistant messages cannot tell a stopped run from a finished one.
 /// `SubAgentTool` uses this to avoid reporting an aborted delegation as a
 /// bland success.
@@ -139,7 +162,7 @@ pub const AGENT_STOPPED_PREFIX: &str = "[Agent stopped:";
 /// caller. Hitting `max_turns` is a bound: the work was cut short but what it
 /// produced is real, and `SubAgentTool` returns it. A loop abort is a failure:
 /// the model was emitting the same call forever and there is nothing to keep.
-pub const LOOP_ABORT_PREFIX: &str = "[Agent stopped: repeated tool call —";
+pub const LOOP_ABORT_PREFIX: &str = "[Agent stopped: repeated tool call â€”";
 
 pub async fn agent_loop(
     prompts: Vec<AgentMessage>,
@@ -315,6 +338,13 @@ async fn run_loop(
     let mut growth_samples: usize = 0;
     // Blends real provider usage with estimation for compaction sizing.
     let mut context_tracker = ContextTracker::new();
+    // Reference material from `prepare_context`, snapshotted across internal
+    // tool iterations. Re-prepared only when a NEW user message lands (see the
+    // `prepare_context` block below), so a long tool-calling run does not
+    // re-inject — and re-pay for — the same block on every turn.
+    let mut prepared_block = String::new();
+    // `context.messages.len()` as of the last prep; `None` = never prepared.
+    let mut prepared_at_len: Option<usize> = None;
     let mut tracker = config
         .execution_limits
         .as_ref()
@@ -383,18 +413,66 @@ async fn run_loop(
                     .ok();
                     context.messages.push(limit_msg.clone());
                     new_messages.push(limit_msg);
+                    // Match every other abort path in this function: callers
+                    // tracking usage must not miss this turn, and a UI pairing
+                    // TurnStart/TurnEnd must not be left with an unmatched
+                    // TurnStart. The limit check runs at the top of the turn
+                    // (after TurnStart, before any LLM call), so no Assistant
+                    // message exists yet -- emit an empty one.
+                    if let Some(ref after_turn) = config.after_turn {
+                        after_turn(&context.messages, &Usage::default());
+                    }
+                    tx.send(AgentEvent::TurnEnd {
+                        message: AgentMessage::Llm(Message::Assistant {
+                            content: Vec::new(),
+                            stop_reason: StopReason::Aborted,
+                            model: config.model.clone(),
+                            provider: config
+                                .model_config
+                                .as_ref()
+                                .map(|mc| mc.provider.clone())
+                                .unwrap_or_default(),
+                            usage: Usage::default(),
+                            timestamp: now_ms(),
+                            error_message: Some(format!("Execution limit: {reason}")),
+                        }),
+                        tool_results: Vec::new(),
+                    })
+                    .ok();
                     return stats;
                 }
             }
 
-            // before_turn callback — abort if it returns false
+            // before_turn callback â€” abort if it returns false
             if let Some(ref before_turn) = config.before_turn {
                 if !before_turn(&context.messages, turn_number) {
+                    // Same pairing rule as the execution-limit path above:
+                    // TurnStart was already emitted for this iteration.
+                    if let Some(ref after_turn) = config.after_turn {
+                        after_turn(&context.messages, &Usage::default());
+                    }
+                    tx.send(AgentEvent::TurnEnd {
+                        message: AgentMessage::Llm(Message::Assistant {
+                            content: Vec::new(),
+                            stop_reason: StopReason::Aborted,
+                            model: config.model.clone(),
+                            provider: config
+                                .model_config
+                                .as_ref()
+                                .map(|mc| mc.provider.clone())
+                                .unwrap_or_default(),
+                            usage: Usage::default(),
+                            timestamp: now_ms(),
+                            error_message: Some("Aborted by before_turn".into()),
+                        }),
+                        tool_results: Vec::new(),
+                    })
+                    .ok();
                     return stats;
                 }
             }
 
-            // Inter-turn delay — throttle API calls to stay under rate limits.
+            // Inter-turn delay â€” throttle API calls to stay under rate limits.
             // Skipped on the first turn so the agent starts immediately.
             if turn_number > 0 {
                 if let Some(delay) = config.turn_delay {
@@ -404,7 +482,33 @@ async fn run_loop(
 
             turn_number += 1;
 
-            // Compact context if configured (tiered: tool outputs → summarize → drop).
+            // Prepare reference material for this request (e.g. recalled
+            // memories). Runs at most once per new user message: the first turn
+            // is always a fresh request, and a later turn re-preps only when a
+            // steering/follow-up user message was injected (the last message in
+            // context is a `User`). Tool-result turns leave the last message as
+            // a `ToolResult`, so they reuse the existing snapshot instead of
+            // re-injecting — and re-paying for — the same block every turn.
+            if let Some(ref prep) = config.prepare_context {
+                let is_new_request = match prepared_at_len {
+                    None => true,
+                    Some(prev_len) => {
+                        context.messages.len() > prev_len
+                            && matches!(
+                                context.messages.last(),
+                                Some(AgentMessage::Llm(Message::User { .. }))
+                            )
+                    }
+                };
+                if is_new_request {
+                    let snapshot = context.messages.clone();
+                    prepared_block = prep(snapshot).await;
+                    prepared_at_len = Some(context.messages.len());
+                }
+            }
+            let prepared_tokens = context::estimate_tokens(&prepared_block);
+
+            // Compact context if configured (tiered: tool outputs â†’ summarize â†’ drop).
             //
             // Calibration: the tracker's hybrid figure is anchored on provider
             // usage, which counts the FULL request (system prompt + tool
@@ -482,6 +586,32 @@ async fn run_loop(
                     }
                 };
 
+                // Reserve room for the reference material prepared for this
+                // request. It is appended to every outgoing request but never
+                // enters `context.messages`, so without this the compaction
+                // strategy would size history against a budget the prepared
+                // block then overshoots.
+                let with_reserved;
+                let effective_config = if prepared_tokens > 0 {
+                    let floor = effective_config.max_context_tokens / 10;
+                    with_reserved = ContextConfig {
+                        max_context_tokens: effective_config
+                            .max_context_tokens
+                            .saturating_sub(prepared_tokens)
+                            .max(floor),
+                        ..effective_config.clone()
+                    };
+                    tracing::debug!(
+                        "compaction budget reserved {} tokens for prepared context ({} -> {})",
+                        prepared_tokens,
+                        effective_config.max_context_tokens,
+                        with_reserved.max_context_tokens,
+                    );
+                    &with_reserved
+                } else {
+                    effective_config
+                };
+
                 let strategy: &dyn CompactionStrategy = config
                     .compaction_strategy
                     .as_deref()
@@ -493,7 +623,7 @@ async fn run_loop(
                     strategy.compact(std::mem::take(&mut context.messages), effective_config);
                 let after_tokens = context::total_tokens(&context.messages);
                 // Length alone would miss level-1 truncation, which rewrites
-                // tool outputs in place and leaves the count unchanged — and
+                // tool outputs in place and leaves the count unchanged â€” and
                 // that is exactly the case where the tracker's baseline goes
                 // stale, so both the reset and the counter key off the same
                 // test rather than the reset keying off length alone.
@@ -519,7 +649,7 @@ async fn run_loop(
             );
             let message = {
                 use tracing::Instrument;
-                stream_assistant_response(context, config, tx, cancel)
+                stream_assistant_response(context, config, tx, cancel, &prepared_block)
                     .instrument(llm_span.clone())
                     .await
             };
@@ -538,7 +668,7 @@ async fn run_loop(
                 }
             }
             // Tool-forcing providers (Anthropic) deliver structured output as
-            // a forced tool call — unwrap it into plain text BEFORE tool-call
+            // a forced tool call â€” unwrap it into plain text BEFORE tool-call
             // extraction, so the loop never tries to execute the synthetic tool.
             let message = unwrap_structured_tool_call(message, config.output_schema.as_ref());
 
@@ -630,7 +760,7 @@ async fn run_loop(
                             let nudge = AgentMessage::Llm(Message::User {
                                 content: vec![Content::Text {
                                     text: format!(
-                                        "[You have called {tool_name} {repetitions} times with identical arguments. The result will not change — change approach, or say why the repetition is needed.]"
+                                        "[You have called {tool_name} {repetitions} times with identical arguments. The result will not change â€” change approach, or say why the repetition is needed.]"
                                     ),
                                 }],
                                 timestamp: now_ms(),
@@ -662,7 +792,7 @@ async fn run_loop(
                                 }],
                                 timestamp: now_ms(),
                             });
-                            // The tools are deliberately not run — a stuck
+                            // The tools are deliberately not run â€” a stuck
                             // model should not also pay for a call it was
                             // never going to learn from. But the assistant's
                             // `tool_use` blocks must still be answered, or the
@@ -739,7 +869,7 @@ async fn run_loop(
                 // compaction never has to rewrite a tool result the provider
                 // has already cached. Per-tool budgets apply, so a tool that
                 // tolerates head+tail badly can opt out. The events emitted
-                // above still carry the untruncated output — this is a context
+                // above still carry the untruncated output â€” this is a context
                 // concern only.
                 let append_cap = config
                     .context_config
@@ -757,7 +887,7 @@ async fn run_loop(
                         am = plain;
 
                         // Stash here and nowhere else. This is the one place
-                        // the full text still exists — by the time compaction
+                        // the full text still exists â€” by the time compaction
                         // runs, the append-path truncation has already
                         // discarded the middle, so there would be nothing left
                         // to store.
@@ -786,7 +916,7 @@ async fn run_loop(
                                 for idx in &marked {
                                     let Some((_, text)) = blocks.iter().find(|(i, _)| i == idx)
                                     else {
-                                        // Unreachable — `marked` and `blocks`
+                                        // Unreachable â€” `marked` and `blocks`
                                         // both enumerate the same `original`.
                                         // Fail closed regardless: continuing
                                         // leaves `all_stored` true and emits a
@@ -820,7 +950,7 @@ async fn run_loop(
                                 // `Ok(())` per write is not proof the set
                                 // survived. `FileBackend` evicts to fit and
                                 // exempts only the key it just wrote, so a
-                                // later sibling can evict an earlier one —
+                                // later sibling can evict an earlier one â€”
                                 // and its (mtime, filename) ordering makes
                                 // `-b0` lose to `-b2` deterministically. Naming
                                 // a key that was deleted microseconds ago is
@@ -835,7 +965,7 @@ async fn run_loop(
                                                 key = %key,
                                                 stored = written.len(),
                                                 "a stashed block did not survive storing its \
-                                                 siblings — the backend cap cannot hold this \
+                                                 siblings â€” the backend cap cannot hold this \
                                                  result; no marker will offer retrieval"
                                             );
                                             break;
@@ -959,11 +1089,18 @@ async fn run_loop(
 }
 
 /// Stream an assistant response from the LLM.
+///
+/// `prepared_block` is extra reference material produced by
+/// [`AgentLoopConfig::prepare_context`]. It is appended to the outbound copy
+/// only — `context.messages` is left untouched — so it costs tokens on every
+/// request but never enters the transcript, never perturbs tool-call/tool-result
+/// pairing, and cannot accumulate across turns.
 async fn stream_assistant_response(
     context: &AgentContext,
     config: &AgentLoopConfig,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &tokio_util::sync::CancellationToken,
+    prepared_block: &str,
 ) -> Message {
     // Apply context transform
     let messages = if let Some(transform) = &config.transform_context {
@@ -974,10 +1111,23 @@ async fn stream_assistant_response(
 
     // Convert to LLM messages
     let convert = config.convert_to_llm.as_ref();
-    let llm_messages = match convert {
+    let mut llm_messages = match convert {
         Some(f) => f(&messages),
         None => default_convert_to_llm(&messages),
     };
+
+    // Attach the prepared reference block as a trailing user message. Appending
+    // (rather than prepending) keeps it closest to the point of use and keeps it
+    // out of the assistant-message region, so a provider that validates
+    // tool-result adjacency still sees a well-formed transcript.
+    if !prepared_block.is_empty() {
+        llm_messages.push(Message::User {
+            content: vec![Content::Text {
+                text: prepared_block.to_string(),
+            }],
+            timestamp: now_ms(),
+        });
+    }
 
     // Build tool definitions
     let tool_defs: Vec<ToolDefinition> = context
@@ -1093,7 +1243,7 @@ async fn stream_assistant_response(
             }
         });
 
-        // Provider streams concurrently — events are forwarded in real-time
+        // Provider streams concurrently â€” events are forwarded in real-time
         // When provider returns, stream_tx is dropped, ending the forwarder
         let result = config
             .provider
@@ -1116,7 +1266,7 @@ async fn stream_assistant_response(
                 continue;
             }
             _ => {
-                // Final attempt — wait for forwarder to finish processing remaining events
+                // Final attempt â€” wait for forwarder to finish processing remaining events
                 let _ = forward_handle.await;
                 break result;
             }
@@ -1184,7 +1334,7 @@ fn unwrap_structured_tool_call(
 
     // Remove ONLY the synthetic call; any real tool calls (shouldn't occur
     // under forced tool_choice, but defensively) stay and execute normally.
-    // The payload is appended AFTER any preamble text — consumers take the
+    // The payload is appended AFTER any preamble text â€” consumers take the
     // last text block.
     let mut new_content: Vec<Content> = content
         .iter()
@@ -1236,10 +1386,14 @@ async fn execute_tool_calls(
             execute_batch(tools, tool_calls, tx, cancel, get_steering, middleware).await
         }
         ToolExecutionStrategy::Batched { size } => {
+            // `slice::chunks(0)` panics, and this runs inside the spawned loop
+            // task — the panic kills the task before AgentEnd and leaves the
+            // agent's tool list stranded in the dropped context. Clamp instead.
+            let size = (*size).max(1);
             let mut results: Vec<Message> = Vec::new();
             let mut steering_messages: Option<Vec<AgentMessage>> = None;
 
-            for (batch_idx, batch) in tool_calls.chunks(*size).enumerate() {
+            for (batch_idx, batch) in tool_calls.chunks(size).enumerate() {
                 let batch_result = execute_batch(tools, batch, tx, cancel, None, middleware).await;
                 results.extend(batch_result.tool_results);
 
@@ -1249,7 +1403,7 @@ async fn execute_tool_calls(
                     if !steering.is_empty() {
                         steering_messages = Some(steering);
                         // Skip remaining batches
-                        let executed = (batch_idx + 1) * *size;
+                        let executed = (batch_idx + 1) * size;
                         if executed < tool_calls.len() {
                             for (skip_id, skip_name, _) in &tool_calls[executed..] {
                                 results.push(skip_tool_call(skip_id, skip_name, tx));
@@ -1285,7 +1439,7 @@ async fn execute_sequential(
             execute_single_tool(tools, id, name, args, tx, cancel, middleware).await;
         results.push(result_msg);
 
-        // Check for steering — skip remaining tools if user interrupted
+        // Check for steering â€” skip remaining tools if user interrupted
         if let Some(get_steering_fn) = get_steering {
             let steering = get_steering_fn();
             if !steering.is_empty() {
@@ -1354,7 +1508,7 @@ async fn execute_single_tool(
 ) -> (Message, bool) {
     // Middleware chain runs first: each hook may rewrite the args seen by
     // later hooks; the first Deny short-circuits into an error tool result
-    // (the LLM sees the reason and can adapt — the loop continues).
+    // (the LLM sees the reason and can adapt â€” the loop continues).
     let mut effective_args = args.clone();
     for mw in middleware {
         let call = ToolCallRequest {
@@ -1363,7 +1517,7 @@ async fn execute_single_tool(
             args: &effective_args,
         };
         // A panicking middleware must not kill the loop task (which would
-        // strip the agent of its tools) — contain it and fail closed.
+        // strip the agent of its tools) â€” contain it and fail closed.
         let decision = {
             use futures::FutureExt;
             std::panic::AssertUnwindSafe(mw.before_tool(&call))
@@ -1386,7 +1540,7 @@ async fn execute_single_tool(
 
     let tool = tools.iter().find(|t| t.name() == name);
 
-    // The Start event carries the effective (post-middleware) args — what
+    // The Start event carries the effective (post-middleware) args â€” what
     // actually runs.
     tx.send(AgentEvent::ToolExecutionStart {
         tool_call_id: id.to_string(),
@@ -1440,10 +1594,22 @@ async fn execute_single_tool(
     use tracing::Instrument;
     let (result, is_error) = match tool {
         Some(tool) => {
-            let execution = tool
-                .execute(args.clone(), ctx)
-                .instrument(tool_span.clone())
-                .await;
+            // A tool that panics (a buggy `AgentTool` impl, an unwrap on
+            // hostile input) must not take down this task — and with it the
+            // `ToolExecutionEnd`/`MessageStart`/`MessageEnd` events below and
+            // the rest of the turn. Catch it and turn it into an ordinary
+            // error tool result, exactly like middleware panics above.
+            use futures::FutureExt;
+            let execution = std::panic::AssertUnwindSafe(
+                tool.execute(args.clone(), ctx)
+                    .instrument(tool_span.clone()),
+            )
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(tool = name, "tool panicked; returning error result");
+                Err(ToolError::Failed(format!("Tool {name} panicked")))
+            });
             match execution {
                 Ok(r) => (r, false),
                 Err(e) => (

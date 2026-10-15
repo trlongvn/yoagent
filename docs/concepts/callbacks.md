@@ -1,6 +1,6 @@
 # Lifecycle Callbacks
 
-yoagent provides three lifecycle callbacks that let you observe and control the agent loop without modifying its internals.
+agent provides three lifecycle callbacks that let you observe and control the agent loop without modifying its internals.
 
 ## Callbacks
 
@@ -65,7 +65,7 @@ For direct loop usage without the `Agent` wrapper:
 
 ```rust
 use std::sync::Arc;
-use yoagent::agent_loop::AgentLoopConfig;
+use agent::agent_loop::AgentLoopConfig;
 
 let config = AgentLoopConfig {
     before_turn: Some(Arc::new(|_msgs, turn| turn < 5)),

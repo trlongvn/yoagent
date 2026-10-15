@@ -1,12 +1,12 @@
 //! Tests for SharedState and its integration with SubAgentTool.
 
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::provider::ModelConfig;
+use ::agent::shared_state::SharedState;
+use ::agent::sub_agent::SubAgentTool;
+use ::agent::*;
 use std::sync::Arc;
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::provider::ModelConfig;
-use yoagent::shared_state::SharedState;
-use yoagent::sub_agent::SubAgentTool;
-use yoagent::*;
 
 // ---------------------------------------------------------------------------
 // Integration: parent stores a value, sub-agent reads it via shared_state tool
@@ -317,7 +317,7 @@ async fn unscoped_behaviour_is_unchanged() {
 // Truncation → retrieval (issue #125)
 // ---------------------------------------------------------------------------
 
-use yoagent::context::{tool_output_key, truncate_tool_output, ContextConfig};
+use ::agent::context::{tool_output_key, truncate_tool_output, ContextConfig};
 
 fn big_tool_result(id: &str, lines: usize) -> AgentMessage {
     AgentMessage::Llm(Message::ToolResult {
@@ -382,7 +382,7 @@ fn a_keyed_marker_survives_re_truncation_byte_for_byte() {
         ..Default::default()
     };
 
-    let keyed = yoagent::context::truncate_tool_output_keyed(
+    let keyed = agent::context::truncate_tool_output_keyed(
         big_tool_result("tc-1", 500),
         &config,
         Some("tool-out-tc-1-deadbeef"),
@@ -415,7 +415,7 @@ fn a_budget_too_small_for_a_marker_reports_no_marker() {
             tool_output_max_lines: max_lines,
             ..Default::default()
         };
-        let (msg, marked) = yoagent::context::truncate_tool_output_keyed(
+        let (msg, marked) = agent::context::truncate_tool_output_keyed(
             big_tool_result("tc-1", 100),
             &config,
             Some("tool-out-tc-1-deadbeef"),
@@ -453,8 +453,7 @@ fn a_marker_inside_the_tools_own_output_is_left_alone() {
     });
 
     let out =
-        yoagent::context::truncate_tool_output_keyed(msg, &config, Some("tool-out-tc-1-deadbeef"))
-            .0;
+        agent::context::truncate_tool_output_keyed(msg, &config, Some("tool-out-tc-1-deadbeef")).0;
     let text = text_of(&out);
     assert_eq!(
         text.matches("tool-out-tc-1-deadbeef").count(),
@@ -470,7 +469,7 @@ fn a_marker_inside_the_tools_own_output_is_left_alone() {
 #[tokio::test]
 async fn file_backend_evicts_the_oldest_stash_entry_to_stay_under_its_cap() {
     let dir = tempfile::tempdir().unwrap();
-    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+    let state = SharedState::with_backend(agent::shared_state::FileBackend::with_max_bytes(
         dir.path(),
         300,
     ));
@@ -511,7 +510,7 @@ async fn file_backend_evicts_the_oldest_stash_entry_to_stay_under_its_cap() {
 #[tokio::test]
 async fn eviction_never_takes_a_caller_owned_key() {
     let dir = tempfile::tempdir().unwrap();
-    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+    let state = SharedState::with_backend(agent::shared_state::FileBackend::with_max_bytes(
         dir.path(),
         300,
     ));
@@ -545,8 +544,7 @@ async fn eviction_never_takes_a_caller_owned_key() {
 /// here exercises it.
 #[tokio::test]
 async fn a_scoped_stash_entry_is_evictable() {
-    let state =
-        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(500));
+    let state = SharedState::with_backend(agent::shared_state::MemoryBackend::with_max_bytes(500));
     let sub = state.scoped("worker-1");
 
     state.set("plan", "q".repeat(80)).await.unwrap();
@@ -564,8 +562,7 @@ async fn a_scoped_stash_entry_is_evictable() {
 /// A store full of caller keys reports capacity rather than destroying them.
 #[tokio::test]
 async fn a_store_of_caller_keys_refuses_rather_than_evicting() {
-    let state =
-        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(300));
+    let state = SharedState::with_backend(agent::shared_state::MemoryBackend::with_max_bytes(300));
     for i in 0..2 {
         state
             .set(&format!("artifact{i}"), "q".repeat(100))
@@ -591,8 +588,7 @@ async fn a_store_of_caller_keys_refuses_rather_than_evicting() {
 /// bytes never reclaimed.
 #[tokio::test]
 async fn the_default_backend_does_not_wedge_once_full() {
-    let state =
-        SharedState::with_backend(yoagent::shared_state::MemoryBackend::with_max_bytes(500));
+    let state = SharedState::with_backend(agent::shared_state::MemoryBackend::with_max_bytes(500));
     for i in 0..40 {
         state
             .set(&format!("tool-out-tc{i}-aaaa-b0"), "q".repeat(100))
@@ -611,7 +607,7 @@ async fn the_default_backend_does_not_wedge_once_full() {
 #[tokio::test]
 async fn an_over_cap_value_is_rejected_and_leaves_the_store_intact() {
     let dir = tempfile::tempdir().unwrap();
-    let state = SharedState::with_backend(yoagent::shared_state::FileBackend::with_max_bytes(
+    let state = SharedState::with_backend(agent::shared_state::FileBackend::with_max_bytes(
         dir.path(),
         300,
     ));
@@ -638,7 +634,7 @@ async fn an_over_cap_value_is_rejected_and_leaves_the_store_intact() {
 /// rather than a surprise.
 #[test]
 fn lossy_compaction_drops_the_marker_while_the_stash_survives() {
-    use yoagent::context::compact_messages;
+    use agent::context::compact_messages;
 
     let config = ContextConfig {
         tool_output_max_lines: 20,
@@ -647,7 +643,7 @@ fn lossy_compaction_drops_the_marker_while_the_stash_survives() {
         ..Default::default()
     };
 
-    let keyed = yoagent::context::truncate_tool_output_keyed(
+    let keyed = agent::context::truncate_tool_output_keyed(
         big_tool_result("tc-1", 500),
         &config,
         Some("tool-out-tc-1-deadbeef"),

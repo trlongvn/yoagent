@@ -148,8 +148,11 @@ impl AgentTool for OpenApiToolAdapter {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         // Reject non-object params — return as content so LLM can self-correct
         let params = match params {
             serde_json::Value::Object(map) => map,
@@ -259,10 +262,16 @@ impl AgentTool for OpenApiToolAdapter {
             }
         }
 
-        // Send — return errors as content so LLM can self-correct
-        let response = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        // Send — return errors as content so LLM can self-correct. The send
+        // races the cancel token so a cancelled run drops the request instead
+        // of blocking the loop on a response it will never use.
+        let response = match tokio::select! {
+            _ = ctx.cancel.cancelled() => None,
+            r = req.send() => Some(r),
+        } {
+            None => return Err(ToolError::Cancelled),
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
                 return Ok(ToolResult {
                     content: vec![Content::Text {
                         text: format!("Error: HTTP request failed: {}", e),

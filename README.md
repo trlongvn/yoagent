@@ -1,7 +1,7 @@
 <div align="center">
 
 <picture>
-  <img alt="yoagent" src="docs/images/banner.png" width="100%" height="auto">
+  <img alt="agent" src="docs/images/banner.png" width="100%" height="auto">
 </picture>
 
 <a href="https://crates.io/crates/yoagent">crates.io</a> · <a href="https://yologdev.github.io/yoagent/">Docs</a> · <a href="https://docs.rs/yoagent">API</a> · <a href="https://github.com/yologdev/yoagent">GitHub</a> · <a href="https://deepwiki.com/yologdev/yoagent">DeepWiki</a> · <a href="CHANGELOG.md">Changelog</a>
@@ -19,7 +19,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/loop.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/images/loop-light.svg">
-  <img alt="The yoagent loop: prompt, LLM stream, tool execution, loop" src="docs/images/loop.svg" width="100%">
+  <img alt="The agent loop: prompt, LLM stream, tool execution, loop" src="docs/images/loop.svg" width="100%">
 </picture>
 
 ---
@@ -27,7 +27,7 @@
 ## Try it in one command — no API key
 
 ```bash
-git clone https://github.com/yologdev/yoagent && cd yoagent
+git clone https://github.com/yologdev/yoagent && cd agent
 ollama serve &                                    # any local model works
 cargo run --example cli -- --provider ollama
 ```
@@ -36,7 +36,7 @@ That's a working coding agent in your terminal — file read/write/edit, shell, 
 streaming output, skills. No signup, no key, nothing to configure.
 
 ```
-  yoagent cli — mini coding agent
+  agent cli — mini coding agent
   Type /quit to exit, /clear to reset
 
   model: llama3.1:8b
@@ -68,7 +68,7 @@ cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model  
 
 ```toml
 [dependencies]
-yoagent = "0.15"
+agent = "0.15"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -77,8 +77,8 @@ tokio = { version = "1", features = ["full"] }
 An agent that actually uses a tool — the thing the crate exists for:
 
 ```rust
-use yoagent::provider::ModelConfig;
-use yoagent::{tools, Agent, AgentEvent, StreamDelta};
+use agent::provider::ModelConfig;
+use agent::{tools, Agent, AgentEvent, StreamDelta};
 
 #[tokio::main]
 async fn main() {
@@ -113,9 +113,9 @@ Agent::from_config(ModelConfig::ollama("http://localhost:11434", "llama3.1:8b"))
 
 ---
 
-## How yoagent differs
+## How agent differs
 
-yoagent is deliberately narrow. It is the loop, tool execution, and the machinery you need to
+agent is deliberately narrow. It is the loop, tool execution, and the machinery you need to
 run that loop in production. It ships **no** vector stores, embedding pipelines, or task-graph
 layer — if your problem is retrieval or orchestration, one of these is the better fit:
 
@@ -123,7 +123,7 @@ layer — if your problem is retrieval or orchestration, one of these is the bet
 |---|---|
 | RAG pipelines, vector stores, embeddings, transcription and image generation | [`rig`](https://github.com/0xPlaygrounds/rig) — *"Build modular and scalable LLM Applications in Rust"* |
 | Typed task graphs and streaming RAG indexing alongside agents | [`swiftide`](https://github.com/bosun-ai/swiftide) — *"Composable LLM agents and harness, typed task graphs, and streaming RAG pipelines in Rust"* |
-| A tool-calling loop you host, gate, steer, branch, and record | yoagent |
+| A tool-calling loop you host, gate, steer, branch, and record | agent |
 
 What that focus bought:
 
@@ -149,13 +149,13 @@ What that focus bought:
 
 ---
 
-## Built with yoagent
+## Built with agent
 
 **[yoyo-evolve](https://github.com/yologdev/yoyo-evolve)** [![][yoyo-stars]][yoyo-link] — a coding
 agent that evolves its own source in public. It began as 200 lines of Rust; every commit since has
 been agent-written and gated on tests. It runs on this loop with the `openapi` feature enabled.
 
-Also built on yoagent:
+Also built on agent:
 
 | Project | What it is |
 |---|---|
@@ -163,7 +163,7 @@ Also built on yoagent:
 | [`greatsage`](https://github.com/rick68/greatsage) | "Rimuru's Unique Skill, you know the one" |
 | [`yoclaw`](https://github.com/yologdev/yoclaw) | OpenClaw reborn in Rust — a single-binary agent that remembers you |
 
-Built something on yoagent? [Open a PR](CONTRIBUTING.md) and add it here — we'd like to see it.
+Built something on agent? [Open a PR](CONTRIBUTING.md) and add it here — we'd like to see it.
 
 ---
 
@@ -295,7 +295,7 @@ it injects the `shared_state` tool and a state summary into the sub-agent's syst
 - **Loop detection** — a model calling one tool with identical arguments forever trips none of the turn/token/duration limits until the whole budget is spent. On by default: steers on the third consecutive repeat, stops on the next, and emits `AgentEvent::LoopDetected` either way
 - **Retrievable tool output** — head-tail truncation discards the middle irrecoverably. Attach a `SharedState` and the full text is stashed, with the marker naming a key the model can fetch
 - **Telemetry** — `tracing` spans per loop / LLM stream / tool, recording tokens and cost. OpenTelemetry is bridged app-side via `tracing-opentelemetry`; the library carries no OTel dependency by design
-- **GASP** (`features = ["gasp"]`) — record runs into a [GASP](https://github.com/yologdev/gasp) agent repo; yoagent is a tested-conformant runtime, with the 7-check suite running in CI
+- **GASP** (`features = ["gasp"]`) — record runs into a [GASP](https://github.com/yologdev/gasp) agent repo; agent is a tested-conformant runtime, with the 7-check suite running in CI
 - **Serde throughout** — every core type is `Serialize` / `Deserialize` / `PartialEq`, so sessions persist and replay
 - **`set_model()`** — hot-swap the model mid-session without rebuilding the agent
 
@@ -329,7 +329,7 @@ Ten runnable examples in [`examples/`](examples/). Five need no API key at all.
 `MockProvider` scripts a whole multi-turn tool-calling conversation with no network:
 
 ```rust
-use yoagent::provider::mock::{MockProvider, MockResponse, MockToolCall};
+use agent::provider::mock::{MockProvider, MockResponse, MockToolCall};
 
 let provider = MockProvider::new(vec![
     MockResponse::ToolCalls(vec![MockToolCall {

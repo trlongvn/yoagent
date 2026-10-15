@@ -9,13 +9,13 @@
 
 ```toml
 [dependencies]
-yoagent = "0.15"
+agent = "0.15"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Dependencies
 
-yoagent brings in these key dependencies automatically:
+agent brings in these key dependencies automatically:
 
 | Crate | Purpose |
 |-------|---------|
@@ -40,5 +40,5 @@ Enable in `Cargo.toml`:
 
 ```toml
 [dependencies]
-yoagent = { version = "0.15", features = ["openapi"] }
+agent = { version = "0.15", features = ["openapi"] }
 ```

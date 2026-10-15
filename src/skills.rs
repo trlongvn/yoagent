@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use yoagent::skills::SkillSet;
+//! use agent::skills::SkillSet;
 //!
 //! let skills = SkillSet::load(&["./skills", "~/.yoagent/skills"]).unwrap();
 //! println!("{}", skills.format_for_prompt());
@@ -522,8 +522,11 @@ mod tests {
         let (_, errors) = SkillSet::load_dir_resilient(tmp.path(), "workspace");
 
         assert_eq!(errors.len(), 2);
-        assert!(errors[0].to_string().contains("a-bad/SKILL.md"));
-        assert!(errors[1].to_string().contains("z-bad/SKILL.md"));
+        // Windows renders PathBuf with `\`; assert on the portable form.
+        let e0 = errors[0].to_string().replace('\\', "/");
+        let e1 = errors[1].to_string().replace('\\', "/");
+        assert!(e0.contains("a-bad/SKILL.md"), "got {e0}");
+        assert!(e1.contains("z-bad/SKILL.md"), "got {e1}");
     }
 
     #[test]

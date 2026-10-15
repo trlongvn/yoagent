@@ -27,17 +27,17 @@
 //! | `YO_MAX_TURNS` | `40` | hard cap, in case the budget is never crossed |
 //! | `YO_KEEP_RECENT` | `4` | messages held verbatim; the default 10 needs a production budget |
 //! | `YO_KEEP_FIRST` | `0` | opening turns held verbatim. **0 on purpose** — at the crate default of 2 the turn that states the constraints never leaves the context, so a retention probe passes without the briefing carrying anything |
-//! | `YO_REPO` | `/tmp/yoagent-compaction-live` | GASP repo path |
+//! | `YO_REPO` | `/tmp/agent-compaction-live` | GASP repo path |
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use yoagent::context::ContextConfig;
-use yoagent::gasp::{GaspRecorder, GoalRef};
-use yoagent::llm_compaction::SUMMARY_MARKER;
-use yoagent::provider::{
+use ::agent::context::ContextConfig;
+use ::agent::gasp::{GaspRecorder, GoalRef};
+use ::agent::llm_compaction::SUMMARY_MARKER;
+use ::agent::provider::{
     CostConfig, ModelConfig, ProviderError, StreamConfig, StreamEvent, StreamProvider,
 };
-use yoagent::*;
+use ::agent::*;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Dry-run double (`YO_DRY_RUN=1`): bulky deterministic text, so the harness's
 /// own plumbing — GASP recording, event collection, briefing extraction, the
@@ -100,7 +100,7 @@ fn priced(id: &str) -> ModelConfig {
         // DeepSeek caches automatically, server-side: this crate sends no
         // `cache_control` on the OpenAI-compat path, and `openai_compat.rs`
         // maps `prompt_cache_hit_tokens` onto `Usage::cache_read`. So a hit
-        // rate here measures *their* caching, not yoagent's placement.
+        // rate here measures *their* caching, not agent's placement.
         //
         // Rates live here rather than in `ModelConfig::deepseek` because
         // DeepSeek prices by time of day — off-peak is exactly half of peak
@@ -339,15 +339,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let dry_run = std::env::var("YO_DRY_RUN").is_ok();
-    if dry_run && std::env::var("YOAGENT_API_KEY").is_err() {
+    if dry_run && std::env::var("AGENT_API_KEY").is_err() {
         // The stub never authenticates; this only silences the resolver warning.
-        std::env::set_var("YOAGENT_API_KEY", "dry-run");
+        std::env::set_var("AGENT_API_KEY", "dry-run");
     }
     let model: String = env_or("YO_MODEL", "claude-sonnet-5".to_string());
     let summarizer: String = env_or("YO_SUMMARIZER", "claude-haiku-4-5".to_string());
     if !dry_run {
         for cfg in [priced(&model), priced(&summarizer)] {
-            if yoagent::provider::resolve_api_key(&cfg.provider).is_none() {
+            if agent::provider::resolve_api_key(&cfg.provider).is_none() {
                 eprintln!(
                     "no API key found for provider '{}' (needed by model '{}').\n\
                      Set YO_DRY_RUN=1 to exercise the harness against a stub instead.",
@@ -363,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let budget: usize = env_or("YO_BUDGET", if dry_run { 4_000 } else { 12_000 });
     let max_turns: usize = env_or("YO_MAX_TURNS", 40);
     let trigger_ratio: f32 = env_or("YO_TRIGGER", 0.6);
-    let repo: String = env_or("YO_REPO", "/tmp/yoagent-compaction-live".to_string());
+    let repo: String = env_or("YO_REPO", "/tmp/agent-compaction-live".to_string());
 
     if dry_run {
         println!("*** DRY RUN — stub provider, no API calls, briefings are placeholders ***\n");
@@ -452,7 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen_briefings: HashSet<String> = HashSet::new();
     let mut ordered_briefings: Vec<String> = Vec::new();
     let mut compactions: Vec<(CompactionMethod, usize, usize, Option<SummaryStats>)> = Vec::new();
-    let mut run_ids: Vec<yoagent::gasp::RunId> = Vec::new();
+    let mut run_ids: Vec<agent::gasp::RunId> = Vec::new();
     let mut tokens = Tokens::default();
     let mut pre_splice = Tokens::default();
     let mut first_splice_turn: Option<usize> = None;
@@ -550,7 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{} msgs, ~{} tokens, {} splice(s)",
             agent.messages().len(),
-            yoagent::context::total_tokens(agent.messages()),
+            agent::context::total_tokens(agent.messages()),
             splices(&compactions)
         );
     }

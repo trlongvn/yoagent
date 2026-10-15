@@ -33,8 +33,8 @@
 //! compactions a session takes and how much history it holds, under each
 //! candidate policy.
 
-use yoagent::context::{compact_messages, total_tokens, ContextConfig, MIN_HEADROOM_RATIO};
-use yoagent::types::{AgentMessage, Content, Message};
+use ::agent::context::{compact_messages, total_tokens, ContextConfig, MIN_HEADROOM_RATIO};
+use ::agent::types::{AgentMessage, Content, Message};
 
 /// One turn of a tool-using agent: an assistant reply plus a bulky tool result.
 fn turn(i: usize, bulk_chars: usize) -> Vec<AgentMessage> {

@@ -1,5 +1,5 @@
 [package]
-name = "yoagent"
+name = "agent"
 version = "0.18.1"
 edition = "2021"
 # MSRV-aware dependency resolution (cargo 1.84+): prefer dependency versions
@@ -21,7 +21,7 @@ categories = [
     "network-programming",
 ]
 authors = ["Yuanhao <yuanhao@yolog.dev>"]
-rust-version = "1.86"
+rust-version = "1.87"
 exclude = ["docs/images/*", "docs/theme/*", ".github/*", "scripts/*"]
 
 # docs.rs builds with default features unless told otherwise, which would hide
@@ -46,6 +46,29 @@ reqwest-eventsource = { package = "kameleoon-reqwest-eventsource", version = "0.
 futures = "0.3"
 rand = "0.10.0"
 base64 = "0.22"
+toml = { version = "0.8", optional = true }
+# TUI (agent-tui) — ratatui + crossterm, stack từ dsh-tui (MIT)
+ratatui = "0.30"
+crossterm = "0.28"
+unicode-width = "0.2"
+# Open-source agent memory (uteke-core) - optional, enabled via the "memory" feature
+# Uteke memory, two flavours:
+#  - `memory`     (vecq only)              → enabled by `memory`
+#  - `memory-onnx` (onnx+vecq, heavy ort)  → enabled by `memory-onnx`
+# One dependency, two feature levels. Two separate renames of the same git
+# source are rejected by cargo ("depends on crate ... multiple times with
+# different names"), which broke `cargo check --all-features`.
+uteke-core = { git = "https://github.com/codecoradev/uteke", tag = "v0.17.0", default-features = false, features = ["vecq"], optional = true }
+# `memory-onnx` (via uteke-core/onnx) declares `ort = "2.0.0-rc.12"`, whose API
+# rc.14 broke (Environment moved, `EnvironmentBuilder::commit` removed), so
+# Cargo picked rc.14 and uteke-core stopped compiling. Pin to the version it was
+# written against. Direct deps win over transitive ones for a shared version.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-18"], optional = true }
+# Needle 3 on-device tool-calling model (MIT; weights Apache-2.0, fetched
+# separately). Pure Rust — `needle-core` depends only on `libm`, so this adds
+# no C toolchain, no GPU, and no runtime dylib. Optional so the default build
+# stays lean; enable with `--features needle3`.
+needle-infer = { version = "0.3.1", optional = true }
 openapiv3 = { version = "2", optional = true }
 serde_yaml_ng = { version = "0.10", optional = true }
 # 0.4.2 floor: 0.4.1 declared MSRV 1.85 but required 1.88 (let-chain)
@@ -53,13 +76,46 @@ yoagent-state = { version = "0.5", optional = true }
 
 [features]
 openapi = ["dep:openapiv3", "dep:serde_yaml_ng", "reqwest/query"]
+config-file = ["dep:toml"]
+# Memory via external embedding API (OpenAI/Ollama) — no local model, small binary.
+memory = ["dep:uteke-core", "config-file"]
+# Memory with bundled ONNX embedding model (offline) — pulls ~200MB model + ort.
+memory-onnx = ["dep:uteke-core", "uteke-core/onnx", "dep:ort", "config-file"]
 gasp = ["dep:yoagent-state"]
+# Needle 3 on-device tool-calling (see `provider::needle3`). Pure Rust.
+needle3 = ["dep:needle-infer"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["registry", "fmt"] }
 tempfile = "3"
 wiremock = "0.6"
+
+[[bin]]
+name = "agent-tui"
+path = "src/bin/agent-tui.rs"
+
+[[bin]]
+name = "keys-probe"
+path = "src/bin/keys_probe.rs"
+
+[[bin]]
+name = "agent-cli"
+path = "src/bin/agent-cli.rs"
+required-features = []
+
+[[bin]]
+name = "decide"
+path = "src/bin/decide.rs"
+required-features = []
+
+[[example]]
+name = "memory_integration"
+required-features = ["memory"]
+
+[[example]]
+name = "memory_builtin"
+required-features = ["memory"]
 
 [[example]]
 name = "gasp_emit"

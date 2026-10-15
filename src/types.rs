@@ -15,7 +15,7 @@ use std::sync::Arc;
 ///   `#[non_exhaustive]`: their fields grow with provider features (PR #32
 ///   added `provider_metadata`), so downstream constructs them via the
 ///   `Content::tool_call*` / `Content::thinking*` constructors and uses `..`
-///   in patterns. `Text` and `Image` stay literally constructible — they are
+///   in patterns. `Text` and `Image` stay literally constructible â€” they are
 ///   user-facing shapes that do not grow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -59,7 +59,7 @@ impl Content {
     /// Construct a tool-call content block.
     ///
     /// The `ToolCall` variant is `#[non_exhaustive]` so provider-specific
-    /// fields can be added without breaking downstream crates — use this
+    /// fields can be added without breaking downstream crates â€” use this
     /// constructor instead of a struct literal.
     pub fn tool_call(
         id: impl Into<String>,
@@ -159,7 +159,7 @@ impl Message {
 
     /// Construct an assistant message.
     ///
-    /// The `Assistant` variant is `#[non_exhaustive]` — its fields grow with
+    /// The `Assistant` variant is `#[non_exhaustive]` â€” its fields grow with
     /// provider features (`error_message` was itself a later addition), so
     /// custom `StreamProvider` implementations construct it here instead of
     /// with a struct literal. `timestamp` is set to now and `error_message`
@@ -227,7 +227,7 @@ impl Message {
 }
 
 // ---------------------------------------------------------------------------
-// AgentMessage — LLM messages + extensible custom types
+// AgentMessage â€” LLM messages + extensible custom types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,7 +311,7 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
     // camelCase on the wire (AgentEvent contract); `alias` keeps session
-    // files written by yoagent < 0.13 loadable.
+    // files written by agent < 0.13 loadable.
     #[serde(default, rename = "cacheRead", alias = "cache_read")]
     pub cache_read: u64,
     #[serde(default, rename = "cacheWrite", alias = "cache_write")]
@@ -321,7 +321,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Fraction of input tokens served from cache (0.0–1.0).
+    /// Fraction of input tokens served from cache (0.0â€“1.0).
     /// Returns 0.0 if no input tokens were processed.
     pub fn cache_hit_rate(&self) -> f64 {
         let total_input = self.input + self.cache_read + self.cache_write;
@@ -339,14 +339,14 @@ impl Usage {
 /// Controls yoagent-managed prompt caching hints.
 ///
 /// By default, caching is enabled with automatic breakpoint placement. What
-/// that produces on the wire depends on the protocol — see [`CacheStrategy`]
-/// for the per-provider table. `enabled: false` suppresses every hint yoagent
+/// that produces on the wire depends on the protocol â€” see [`CacheStrategy`]
+/// for the per-provider table. `enabled: false` suppresses every hint agent
 /// would otherwise send; it cannot switch off a provider's *automatic*
 /// server-side caching, which is not under client control.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CacheConfig {
-    /// Master switch — set to false to disable all caching hints.
+    /// Master switch â€” set to false to disable all caching hints.
     /// Default: true.
     pub enabled: bool,
     /// How cache breakpoints are placed.
@@ -355,15 +355,15 @@ pub struct CacheConfig {
     /// lookups by key rather than by explicit breakpoints (OpenAI's
     /// `prompt_cache_key`).
     ///
-    /// Leave `None` and one is derived from the request's stable head — the
+    /// Leave `None` and one is derived from the request's stable head â€” the
     /// system prompt plus the first user message. That derivation is correct
     /// for the common case and costs nothing, but two sessions opening with
     /// identical text share a key. Set this explicitly when sessions must be
     /// routed apart, or when the head is not distinctive.
     ///
-    /// Ignored everywhere except the key-routed path — by Anthropic, which
+    /// Ignored everywhere except the key-routed path â€” by Anthropic, which
     /// takes explicit breakpoints, and by Google, Vertex, Bedrock, Azure and
-    /// Responses, which yoagent sends no cache hints to at all.
+    /// Responses, which agent sends no cache hints to at all.
     ///
     /// Note for [`crate::SubAgentTool`]: it holds one `CacheConfig` and clones
     /// it into every invocation, so a key set there is shared by every run the
@@ -391,7 +391,7 @@ impl CacheConfig {
 
     /// Set the session key used by key-routed providers.
     ///
-    /// A blank key is treated as unset — sending `prompt_cache_key: ""` would
+    /// A blank key is treated as unset â€” sending `prompt_cache_key: ""` would
     /// route every caller who did that onto one cache, which is worse than
     /// sending nothing. `with_session_key(format!("tenant-{id}"))` with an
     /// empty `id` is the ordinary way to arrive here.
@@ -415,10 +415,10 @@ impl CacheConfig {
         self
     }
 
-    /// Whether yoagent should emit any caching hint at all.
+    /// Whether agent should emit any caching hint at all.
     ///
     /// Three configurations mean "no": `enabled: false`, `Disabled`, and
-    /// `Manual` with every flag off. The third is easy to miss — Anthropic
+    /// `Manual` with every flag off. The third is easy to miss â€” Anthropic
     /// honours it correctly by placing no breakpoints, so a key-routed
     /// provider that still sent a key would be reading the same value as
     /// "yes". One predicate, so every protocol agrees on what off means.
@@ -463,7 +463,7 @@ pub enum ToolExecutionStrategy {
     /// Use for debugging or tools with shared mutable state.
     Sequential,
     /// Run all tool calls concurrently, check steering after all complete.
-    /// Default — most tool calls are independent and this gives the best latency.
+    /// Default â€” most tool calls are independent and this gives the best latency.
     #[default]
     Parallel,
     /// Run in batches of N, check steering between batches.
@@ -490,8 +490,8 @@ pub enum ToolExecutionStrategy {
 ///
 /// **Key-routed** (OpenAI) caches automatically on prefixes of ~1024 tokens or
 /// more; there are no breakpoints to place. `prompt_cache_key` only improves
-/// *routing* — it steers requests from one conversation toward the same cache
-/// — so the `Auto`/`Manual` distinction has nothing to act on and both send the
+/// *routing* â€” it steers requests from one conversation toward the same cache
+/// â€” so the `Auto`/`Manual` distinction has nothing to act on and both send the
 /// key. Only [`Disabled`](Self::Disabled) is meaningful. The key comes from
 /// [`CacheConfig::session_key`], or is derived from the request head. Gated on
 /// [`OpenAiCompat::supports_prompt_cache_key`](crate::provider::OpenAiCompat),
@@ -503,18 +503,18 @@ pub enum ToolExecutionStrategy {
 /// to populate; Gemini reports `cachedContentTokenCount` but its explicit
 /// cached-content API is a separate create-then-reference resource with its own
 /// TTL and billing, deliberately not driven from here. For these, this setting
-/// is inert — including `Disabled`, which cannot switch off caching the client
+/// is inert â€” including `Disabled`, which cannot switch off caching the client
 /// never asked for.
 ///
 /// **Not yet wired** is a separate row on purpose. Azure and the OpenAI
 /// Responses API both accept `prompt_cache_key`, and Bedrock accepts explicit
-/// `cachePoint` blocks; yoagent sends none of them today. That is a gap in this
+/// `cachePoint` blocks; agent sends none of them today. That is a gap in this
 /// crate, not a property of those vendors, and conflating the two would make
 /// the omission read as a deliberate design decision.
 ///
 /// Two practical consequences. A hit rate is not comparable across protocols
 /// without knowing which shape produced it. And only Anthropic, the
-/// OpenAI-compat path and Gemini populate [`Usage::cache_read`] at all — on
+/// OpenAI-compat path and Gemini populate [`Usage::cache_read`] at all â€” on
 /// Azure, Responses and Bedrock there is no hit rate to read. See
 /// `docs/concepts/prompt-caching.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -529,7 +529,7 @@ pub enum CacheStrategy {
     Auto,
     /// Send no caching hints at all.
     ///
-    /// Does **not** disable a provider's automatic server-side caching — that
+    /// Does **not** disable a provider's automatic server-side caching â€” that
     /// is not client-controllable. On Anthropic this means paying full input
     /// price for every prefix, so reach for it only when a rewrite-heavy
     /// workload makes cache writes pure loss.
@@ -572,7 +572,7 @@ pub enum ThinkingLevel {
 ///
 /// Tools call this to emit progress updates (e.g., partial output, status messages)
 /// that are forwarded as `AgentEvent::ToolExecutionUpdate` events for UI consumption.
-/// Partial results are **not** sent to the LLM — only the final `ToolResult` is.
+/// Partial results are **not** sent to the LLM â€” only the final `ToolResult` is.
 pub type ToolUpdateFn = Arc<dyn Fn(ToolResult) + Send + Sync>;
 
 /// Callback for emitting user-facing progress messages during tool execution.
@@ -584,7 +584,7 @@ pub type ProgressFn = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Context passed to tool execution. Bundles all per-invocation state.
 ///
-/// Using a struct instead of individual parameters future-proofs the trait —
+/// Using a struct instead of individual parameters future-proofs the trait â€”
 /// adding fields to `ToolContext` is non-breaking, which `#[non_exhaustive]`
 /// is what actually makes true. Tools receive this rather than build it, so
 /// the attribute costs implementors nothing; it only stops a struct literal in
@@ -595,7 +595,7 @@ pub struct ToolContext {
     pub tool_call_id: String,
     /// The name of the tool being invoked.
     pub tool_name: String,
-    /// Cancellation token — check `is_cancelled()` in long-running tools.
+    /// Cancellation token â€” check `is_cancelled()` in long-running tools.
     pub cancel: tokio_util::sync::CancellationToken,
     /// Optional callback for streaming partial `ToolResult`s (UI/logging only).
     pub on_update: Option<ToolUpdateFn>,
@@ -680,10 +680,10 @@ pub trait AgentTool: Send + Sync {
     /// Execute the tool.
     ///
     /// The `ctx` parameter provides per-invocation context:
-    /// - `ctx.tool_call_id` / `ctx.tool_name` — for correlation and logging
-    /// - `ctx.cancel` — cancellation token; check `is_cancelled()` in long-running tools
-    /// - `ctx.on_update` — optional callback for streaming partial `ToolResult`s (UI/logging only)
-    /// - `ctx.on_progress` — optional callback for user-facing progress text (`ProgressMessage`)
+    /// - `ctx.tool_call_id` / `ctx.tool_name` â€” for correlation and logging
+    /// - `ctx.cancel` â€” cancellation token; check `is_cancelled()` in long-running tools
+    /// - `ctx.on_update` â€” optional callback for streaming partial `ToolResult`s (UI/logging only)
+    /// - `ctx.on_progress` â€” optional callback for user-facing progress text (`ProgressMessage`)
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -719,8 +719,8 @@ pub enum ToolError {
 ///
 /// # Wire format (stability contract)
 ///
-/// `AgentEvent` and [`StreamDelta`] serialize as internally-tagged JSON —
-/// `{"type": "<camelCase variant>", ...camelCase fields}` — so external
+/// `AgentEvent` and [`StreamDelta`] serialize as internally-tagged JSON â€”
+/// `{"type": "<camelCase variant>", ...camelCase fields}` â€” so external
 /// frontends (websocket fanout servers, TypeScript clients, JSONL pipes) can
 /// consume the event stream directly:
 ///
@@ -744,7 +744,7 @@ pub enum AgentEvent {
     /// The run finished. Carries the messages it produced and a
     /// [`SessionStats`] rollup of what they cost.
     ///
-    /// The variant is `#[non_exhaustive]` — the payload is expected to grow.
+    /// The variant is `#[non_exhaustive]` â€” the payload is expected to grow.
     /// Match with `..`.
     #[non_exhaustive]
     AgentEnd {
@@ -808,7 +808,7 @@ pub enum AgentEvent {
     /// History was compacted before a turn.
     ///
     /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
-    /// — the spliced summary and the deterministic fallback — so a consumer can
+    /// â€” the spliced summary and the deterministic fallback â€” so a consumer can
     /// tell which one ran and what it cost. The built-in
     /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
     /// this; it has no event channel and never issues a request.
@@ -832,7 +832,7 @@ pub enum AgentEvent {
 impl AgentEvent {
     /// Construct an [`AgentEvent::AgentEnd`].
     ///
-    /// The variant is `#[non_exhaustive]` — its payload grows — so downstream
+    /// The variant is `#[non_exhaustive]` â€” its payload grows â€” so downstream
     /// crates (and tests) build it here rather than with a struct literal.
     pub fn agent_end(messages: Vec<AgentMessage>, stats: SessionStats) -> Self {
         Self::AgentEnd { messages, stats }
@@ -853,21 +853,21 @@ impl AgentEvent {
 
 /// Session-level rollup carried by [`AgentEvent::AgentEnd`].
 ///
-/// The per-turn numbers already existed — `Usage` on every assistant message,
-/// `tokens_cached` on the `llm_stream` span, `cache_read` in the GASP record —
+/// The per-turn numbers already existed â€” `Usage` on every assistant message,
+/// `tokens_cached` on the `llm_stream` span, `cache_read` in the GASP record â€”
 /// but nothing summed them, so answering "what was this run's cache hit rate"
 /// meant replaying the whole event stream. Any change that moves caching
 /// (breakpoint placement, compaction strategy, model choice) had to be judged
 /// by hand-built harnesses instead of a number the library reports.
 ///
 /// ```
-/// # use yoagent::{SessionStats, Usage};
+/// # use agent::{SessionStats, Usage};
 /// # let stats = SessionStats::default();
 /// // Reading your cache hit rate:
 /// println!("{:.1}% cached over {} turns", stats.cache_hit_rate() * 100.0, stats.turns);
 /// ```
 ///
-/// **Hit rate is `cache_read / (input + cache_read + cache_write)`** — cache
+/// **Hit rate is `cache_read / (input + cache_read + cache_write)`** â€” cache
 /// writes count against you, because they are prompt tokens the provider
 /// processed and billed. Counting only `input` shrinks the denominator and so
 /// **overstates** the rate for a write-charging provider: Anthropic books a
@@ -876,7 +876,7 @@ impl AgentEvent {
 /// `docs/evals/llm-compaction-live.md`, where that error was made and caught.
 ///
 /// Read a rate against its session length, not against 100%: every turn's new
-/// content is necessarily a miss, so the ceiling is about `(n-1)/(n+1)` — ~88%
+/// content is necessarily a miss, so the ceiling is about `(n-1)/(n+1)` â€” ~88%
 /// at 15 turns, ~96% only past 49.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -884,7 +884,7 @@ impl AgentEvent {
 pub struct SessionStats {
     /// Provider usage summed over every LLM turn in this run.
     ///
-    /// `total_tokens` is **not** summed and stays 0 — see [`record_turn`] for
+    /// `total_tokens` is **not** summed and stays 0 â€” see [`record_turn`] for
     /// why. Derive a total from the four components instead.
     ///
     /// [`record_turn`]: SessionStats::record_turn
@@ -898,7 +898,7 @@ pub struct SessionStats {
     /// Dollar cost of [`usage`](Self::usage), when the model's rates are
     /// configured (see [`CostConfig`](crate::provider::CostConfig)).
     ///
-    /// `None` means "cannot price this", never "free" — all-zero rates mean
+    /// `None` means "cannot price this", never "free" â€” all-zero rates mean
     /// pricing is unknown, which is the case for custom and local models.
     ///
     /// Scope: this run's own turns. A [`SubAgentTool`](crate::SubAgentTool)
@@ -917,12 +917,12 @@ pub struct SessionStats {
     /// [`context::total_tokens`]: crate::context::total_tokens
     ///
     /// Deliberately **not** split into spliced-summary vs deterministic
-    /// fallback, and carrying no summarization spend. That detail exists — on
-    /// [`AgentEvent::ContextCompacted`], with its [`SummaryStats`] — but
+    /// fallback, and carrying no summarization spend. That detail exists â€” on
+    /// [`AgentEvent::ContextCompacted`], with its [`SummaryStats`] â€” but
     /// [`CompactionStrategy::compact`](crate::context::CompactionStrategy::compact)
     /// is synchronous and has no event channel, so the loop cannot see it. Wire
     /// `LlmCompaction::with_event_sender` to the same channel and aggregate the
-    /// two together — the events *describe* the same compactions this counts,
+    /// two together â€” the events *describe* the same compactions this counts,
     /// with the breakdown attached, so do not sum the two. Folding a guess in
     /// here would be worse than the gap.
     #[serde(default)]
@@ -945,7 +945,7 @@ impl SessionStats {
     }
 
     /// Fraction of prompt tokens served from cache across the whole session
-    /// (0.0–1.0). Delegates to [`Usage::cache_hit_rate`] so there is one
+    /// (0.0â€“1.0). Delegates to [`Usage::cache_hit_rate`] so there is one
     /// definition of the metric rather than two that can drift.
     pub fn cache_hit_rate(&self) -> f64 {
         self.usage.cache_hit_rate()
@@ -962,7 +962,7 @@ impl SessionStats {
     /// components sum cleanly; derive a total from those.
     ///
     /// Cost accrues per turn rather than once at the end. Today that is
-    /// arithmetically identical — `CostConfig::cost_usd` is linear in every
+    /// arithmetically identical â€” `CostConfig::cost_usd` is linear in every
     /// `Usage` field and `config.model_config` is fixed for the life of a run
     /// (`run_loop` holds `&AgentLoopConfig`, and `set_model` needs `&mut self`).
     /// It is written this way so a per-turn model override stays correct if one
@@ -996,7 +996,7 @@ impl SessionStats {
 pub struct SummaryStats {
     /// Messages the briefing replaced.
     ///
-    /// Zero when a briefing was produced but could not be kept — the request
+    /// Zero when a briefing was produced but could not be kept â€” the request
     /// was still paid for, so the event still reports it, but `method` will be
     /// [`CompactionMethod::Deterministic`].
     pub messages_summarized: usize,
@@ -1026,10 +1026,10 @@ impl SummaryStats {
 pub enum CompactionMethod {
     /// History was replaced by an LLM-written summary.
     Summarized,
-    /// Deterministic tiered compaction ran: truncate → summarize → drop.
+    /// Deterministic tiered compaction ran: truncate â†’ summarize â†’ drop.
     ///
     /// On [`LlmCompaction`](crate::LlmCompaction) this means no briefing made
-    /// it into the result — none was ready, one was discarded as stale, or one
+    /// it into the result â€” none was ready, one was discarded as stale, or one
     /// was produced but could not be kept within the budget. The loop stayed
     /// unblocked; the compaction was lossy. Check `summary` to tell a free
     /// fallback from one that still paid for a request.
@@ -1081,7 +1081,7 @@ pub enum FilterResult {
 /// Synchronous filter applied to user input before the LLM call.
 ///
 /// Implement this for injection detection, content moderation, PII redaction, etc.
-/// Filters run in the hot path and must be fast — use `before_turn` callbacks
+/// Filters run in the hot path and must be fast â€” use `before_turn` callbacks
 /// for async moderation (external API calls).
 pub trait InputFilter: Send + Sync {
     fn filter(&self, text: &str) -> FilterResult;
@@ -1094,7 +1094,7 @@ pub trait InputFilter: Send + Sync {
 /// Decision returned by a [`ToolMiddleware`] before a tool executes.
 ///
 /// Deliberately NOT `#[non_exhaustive]` (same policy as [`StopReason`]):
-/// this is a control-flow enum — a new variant should be a compile error for
+/// this is a control-flow enum â€” a new variant should be a compile error for
 /// matchers, not a silent wildcard fallthrough. Interactive flows like
 /// "ask the user" need no variant: the hook is `async`, so prompt inside the
 /// middleware and return `Allow`/`Deny`.
@@ -1110,19 +1110,19 @@ pub enum ToolDecision {
     Deny(String),
 }
 
-/// Async hook that gates every tool call — the mechanism behind permission
+/// Async hook that gates every tool call â€” the mechanism behind permission
 /// prompts, policy engines, and argument rewriting.
 ///
-/// yoagent ships the mechanism, not a policy: install middleware via
+/// agent ships the mechanism, not a policy: install middleware via
 /// [`Agent::with_tool_middleware`](crate::Agent::with_tool_middleware) (or
 /// [`AgentLoopConfig::tool_middleware`](crate::agent_loop::AgentLoopConfig))
 /// and decide per call. Middleware run in a chain: each may rewrite the
 /// arguments seen by later ones; the first `Deny` wins. With no middleware
-/// installed, every call is allowed — behavior is unchanged.
+/// installed, every call is allowed â€” behavior is unchanged.
 ///
 /// The hook is `async` so an interactive app can prompt a human. Under the
 /// default [`ToolExecutionStrategy::Parallel`], middleware for parallel tool
-/// calls runs concurrently — serialize approval prompts inside your
+/// calls runs concurrently â€” serialize approval prompts inside your
 /// implementation (or use `Sequential`) if you need one-at-a-time UX.
 /// Borrowed view of a pending tool call, passed to
 /// [`ToolMiddleware::before_tool`].
@@ -1186,7 +1186,7 @@ impl fmt::Display for StopReason {
 ///
 /// This lives in the defining crate on purpose. Both enums are
 /// `#[non_exhaustive]`, so an integration test *cannot* match them
-/// exhaustively — its match needs a `_` arm, and a wildcard turns "adding a
+/// exhaustively â€” its match needs a `_` arm, and a wildcard turns "adding a
 /// variant fails to compile" into "adding a variant is silently untested".
 /// Inside this crate exhaustiveness still applies.
 #[cfg(test)]
@@ -1201,7 +1201,7 @@ mod wire_tag_freeze {
     /// hand-written sample list and a hand-written variant count could never
     /// notice a *new* variant, because a new variant appears in neither. Here
     /// the generated match has no wildcard, so adding a variant fails to
-    /// compile — and the only way to fix that is to add a line below, which
+    /// compile â€” and the only way to fix that is to add a line below, which
     /// supplies the sample in the same breath.
     ///
     /// Three mistakes are caught by the compiler rather than by luck: a
@@ -1212,19 +1212,19 @@ mod wire_tag_freeze {
     /// The specifier is `pat_param`, not `pat`, and that is load-bearing: `pat`
     /// would accept an or-pattern, letting someone answer the compile error by
     /// widening an unrelated arm (`TurnStart | NewVariant => "turnStart"`)
-    /// instead of adding a line — leaving the new variant with no sample and no
+    /// instead of adding a line â€” leaving the new variant with no sample and no
     /// coverage, which is exactly the hole this macro exists to close. No arm
     /// can legitimately need one, since two variants cannot share a tag.
     macro_rules! wire_freeze {
         ($ty:ty, $tag_of:ident, $samples:ident, $($pat:pat_param => $tag:literal = $sample:expr),+ $(,)?) => {
             /// The frozen `"type"` tag per variant. Changing one breaks every
-            /// deployed wire client — do not edit casually.
+            /// deployed wire client â€” do not edit casually.
             fn $tag_of(v: &$ty) -> &'static str {
                 match v { $($pat => $tag,)+ }
             }
 
             /// One sample per variant, in declaration order. The tests re-derive
-            /// each tag from its sample rather than trusting that order — see
+            /// each tag from its sample rather than trusting that order â€” see
             /// [`assert_frozen`].
             fn $samples() -> Vec<$ty> { vec![$($sample,)+] }
         };
@@ -1361,7 +1361,7 @@ mod wire_tag_freeze {
     /// Every key in `v`, recursively, as `path -> key` pairs.
     ///
     /// Recursive on purpose. Checking only the top level would pass a
-    /// snake_case key one level down — `message.usage.total_tokens` reaches
+    /// snake_case key one level down â€” `message.usage.total_tokens` reaches
     /// clients just as surely as `turnEnd.toolResults` does, and the nested
     /// payload structs carry their own `rename_all`, which nothing else here
     /// would notice going missing.
@@ -1387,7 +1387,7 @@ mod wire_tag_freeze {
     /// underscore, and the value survives a JSON round-trip.
     ///
     /// `seen` collects tags so a mis-paired sample is caught **when it
-    /// duplicates another variant** — which is the case that costs coverage,
+    /// duplicates another variant** â€” which is the case that costs coverage,
     /// since some variant is then left unsampled. Two samples swapped between
     /// lines is invisible here, and harmless: the set of samples is unchanged
     /// and every tag is still checked against serde.
@@ -1400,7 +1400,7 @@ mod wire_tag_freeze {
         assert_eq!(
             v["type"], declared,
             "wire tag drifted: {sample:?} serializes as {} but wire_freeze! declares {declared}. \
-             Changing a tag breaks every deployed client — if this is intentional it is a \
+             Changing a tag breaks every deployed client â€” if this is intentional it is a \
              breaking change, not a test fix",
             v["type"]
         );
@@ -1424,7 +1424,7 @@ mod wire_tag_freeze {
 
         assert!(
             seen.insert(declared),
-            "two samples serialize as {declared} — a sample in wire_freeze! does not match \
+            "two samples serialize as {declared} â€” a sample in wire_freeze! does not match \
              the pattern on its own line, so some variant has no sample at all"
         );
     }

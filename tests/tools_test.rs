@@ -1,11 +1,11 @@
 //! Tests for built-in tools.
 
+use ::agent::tools::edit::EditFileTool;
+use ::agent::tools::list::ListFilesTool;
+use ::agent::tools::*;
+use ::agent::types::*;
 use base64::Engine;
 use tokio_util::sync::CancellationToken;
-use yoagent::tools::edit::EditFileTool;
-use yoagent::tools::list::ListFilesTool;
-use yoagent::tools::*;
-use yoagent::types::*;
 
 /// Helper to build a ToolContext for tests.
 fn ctx(name: &str) -> ToolContext {
@@ -96,7 +96,7 @@ async fn test_read_write_file() {
     let write_tool = WriteFileTool::new();
     let result = write_tool
         .execute(
-            serde_json::json!({"path": path, "content": "hello from yoagent"}),
+            serde_json::json!({"path": path, "content": "hello from agent"}),
             ctx("write_file"),
         )
         .await
@@ -119,7 +119,7 @@ async fn test_read_write_file() {
         Content::Text { text } => text,
         _ => panic!("expected text"),
     };
-    assert!(text.contains("hello from yoagent"));
+    assert!(text.contains("hello from agent"));
 
     // Cleanup
     let _ = std::fs::remove_file(tmp);
@@ -336,7 +336,7 @@ async fn test_bash_blocked_command() {
 
 #[tokio::test]
 async fn test_default_tools_complete() {
-    let tools = yoagent::tools::default_tools();
+    let tools = agent::tools::default_tools();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     assert_eq!(names.len(), 6);
     assert!(names.contains(&"bash"));
@@ -442,7 +442,7 @@ async fn test_read_file_pages_long_files_by_default() {
     let tmp = std::env::temp_dir().join("yoagent-test-paging.txt");
     let path = tmp.to_str().unwrap();
 
-    let total = yoagent::tools::DEFAULT_READ_MAX_LINES * 2;
+    let total = agent::tools::DEFAULT_READ_MAX_LINES * 2;
     let content = (1..=total)
         .map(|i| format!("line {}", i))
         .collect::<Vec<_>>()
@@ -465,13 +465,13 @@ async fn test_read_file_pages_long_files_by_default() {
     assert!(!text.contains(&format!("| line {}", total)));
     assert_eq!(
         text.lines().count(),
-        yoagent::tools::DEFAULT_READ_MAX_LINES + 1, // + header
+        agent::tools::DEFAULT_READ_MAX_LINES + 1, // + header
     );
 
     // Paging forward reaches the end.
     let result = tool
         .execute(
-            serde_json::json!({"path": path, "offset": yoagent::tools::DEFAULT_READ_MAX_LINES + 1}),
+            serde_json::json!({"path": path, "offset": agent::tools::DEFAULT_READ_MAX_LINES + 1}),
             ctx("read_file"),
         )
         .await
@@ -501,7 +501,7 @@ async fn test_read_file_pages_long_files_by_default() {
 async fn test_read_file_unbounded_when_max_lines_disabled() {
     let tmp = std::env::temp_dir().join("yoagent-test-unbounded.txt");
     let path = tmp.to_str().unwrap();
-    let total = yoagent::tools::DEFAULT_READ_MAX_LINES + 50;
+    let total = agent::tools::DEFAULT_READ_MAX_LINES + 50;
     let content = (1..=total)
         .map(|i| format!("line {}", i))
         .collect::<Vec<_>>()
@@ -674,14 +674,14 @@ async fn bash_env_allowlist_hides_other_variables() {
     // Model-authored commands inherit the agent's environment by default,
     // including credentials. The allowlist is the mitigation.
     unsafe {
-        std::env::set_var("YOAGENT_TEST_SECRET", "leaked-value");
-        std::env::set_var("YOAGENT_TEST_KEEP", "kept-value");
+        std::env::set_var("AGENT_TEST_SECRET", "leaked-value");
+        std::env::set_var("AGENT_TEST_KEEP", "kept-value");
     }
 
-    let guarded = BashTool::default().with_env_allowlist(vec!["YOAGENT_TEST_KEEP".to_string()]);
+    let guarded = BashTool::default().with_env_allowlist(vec!["AGENT_TEST_KEEP".to_string()]);
     let result = guarded
         .execute(
-            serde_json::json!({"command": "echo \"$YOAGENT_TEST_SECRET|$YOAGENT_TEST_KEEP\""}),
+            serde_json::json!({"command": "echo \"$AGENT_TEST_SECRET|$AGENT_TEST_KEEP\""}),
             ctx("bash"),
         )
         .await
@@ -700,7 +700,7 @@ async fn bash_env_allowlist_hides_other_variables() {
     let plain = BashTool::default();
     let result = plain
         .execute(
-            serde_json::json!({"command": "echo \"$YOAGENT_TEST_SECRET\""}),
+            serde_json::json!({"command": "echo \"$AGENT_TEST_SECRET\""}),
             ctx("bash"),
         )
         .await
@@ -715,7 +715,7 @@ async fn bash_env_allowlist_hides_other_variables() {
     );
 
     unsafe {
-        std::env::remove_var("YOAGENT_TEST_SECRET");
-        std::env::remove_var("YOAGENT_TEST_KEEP");
+        std::env::remove_var("AGENT_TEST_SECRET");
+        std::env::remove_var("AGENT_TEST_KEEP");
     }
 }

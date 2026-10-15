@@ -1,18 +1,18 @@
-# Contributing to yoagent
+# Contributing to agent
 
 Thanks for taking the time. Bug reports, provider quirks, and small focused PRs are all welcome.
 
 ## Getting set up
 
 ```bash
-git clone https://github.com/yologdev/yoagent && cd yoagent
+git clone https://github.com/yologdev/yoagent && cd agent
 cargo build --all-features
 cargo test --all-features
 ```
 
 You need **Rust 1.86 or newer** — that's the MSRV, and CI checks it on every PR.
 
-No API keys are required to develop on yoagent. Of the 463 tests, 456 run with no network and no
+No API keys are required to develop on agent. Of the 463 tests, 456 run with no network and no
 credentials; the 7 that need a live key are `#[ignore]`d by default and live in
 `tests/integration_*.rs`.
 
@@ -94,7 +94,7 @@ If a provider reports context overflow with a new error string, add it to `OVERF
 
 ## Adding your project to the README
 
-If you've built something on yoagent, open a PR adding a row to the **Built with yoagent** table in
+If you've built something on agent, open a PR adding a row to the **Built with agent** table in
 [README.md](README.md) — project link and one line on what it is. It doesn't need to be big or
 finished. Seeing what people build with the loop is genuinely useful for deciding what to work on
 next.

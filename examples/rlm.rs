@@ -16,14 +16,14 @@
 //! Run on a specific directory:
 //!   XAI_API_KEY=xai-... cargo run --example rlm -- path/to/dir
 
-use std::sync::{Arc, Mutex};
-use yoagent::provider::model::ModelConfig;
-use yoagent::provider::{OpenAiCompatProvider, StreamProvider};
+use ::agent::provider::model::ModelConfig;
+use ::agent::provider::{OpenAiCompatProvider, StreamProvider};
 #[allow(unused_imports)]
-use yoagent::shared_state::{FileBackend, SharedState};
-use yoagent::sub_agent::SubAgentTool;
-use yoagent::tools;
-use yoagent::*;
+use ::agent::shared_state::{FileBackend, SharedState};
+use ::agent::sub_agent::SubAgentTool;
+use ::agent::tools;
+use ::agent::*;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {

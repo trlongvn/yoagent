@@ -1,4 +1,4 @@
-//! Conversation session trees — branching history with checkpoints.
+//! Conversation session trees â€” branching history with checkpoints.
 //!
 //! A [`Session`] stores messages as a **tree**, not a list: every entry has an
 //! `id` and a `parent_id`, the *head* points at the current branch tip, and
@@ -6,14 +6,14 @@
 //! overwriting history. This is the primitive behind "edit that earlier
 //! message and re-run", checkpoints, and conversation forking.
 //!
-//! Persistence is JSONL — one entry per line, append-friendly, diff-friendly.
+//! Persistence is JSONL â€” one entry per line, append-friendly, diff-friendly.
 //! (In GASP terms this is the shape of the `transcripts/` tier; the semantic
 //! event log is a separate adapter.)
 //!
 //! # Typical flow
 //!
 //! ```no_run
-//! use yoagent::{Agent, Session, provider::ModelConfig};
+//! use agent::{Agent, Session, provider::ModelConfig};
 //!
 //! # #[tokio::main]
 //! # async fn main() {
@@ -131,7 +131,7 @@ impl Session {
         id
     }
 
-    /// Append every message of `full_history` beyond the current path — the
+    /// Append every message of `full_history` beyond the current path â€” the
     /// typical post-run sync from [`Agent::messages`](crate::Agent::messages).
     /// Returns how many messages were appended.
     ///
@@ -139,7 +139,7 @@ impl Session {
     /// is verified against the path's messages, and any mismatch (or a
     /// shorter history) returns [`SessionError::HistoryDiverged`] instead of
     /// silently corrupting the tree. The common cause is context compaction
-    /// (on by default) rewriting the agent's messages mid-session — disable
+    /// (on by default) rewriting the agent's messages mid-session â€” disable
     /// context management on session-tracked agents, or rebuild the branch
     /// with [`from_messages`](Self::from_messages) after a divergence.
     pub fn append_new(&mut self, full_history: &[AgentMessage]) -> Result<usize, SessionError> {
@@ -205,7 +205,7 @@ impl Session {
         Ok(())
     }
 
-    /// The messages on the root→head path — what an agent should see when
+    /// The messages on the rootâ†’head path â€” what an agent should see when
     /// resuming this branch. Pair with
     /// [`Agent::with_messages`](crate::Agent::with_messages).
     pub fn path_messages(&self) -> Vec<AgentMessage> {
@@ -215,7 +215,7 @@ impl Session {
             .collect()
     }
 
-    /// Entry ids on the root→head path.
+    /// Entry ids on the rootâ†’head path.
     pub fn path_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         let mut cursor = self.head.clone();
@@ -237,7 +237,7 @@ impl Session {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    /// Ids of all leaf entries — one per branch.
+    /// Ids of all leaf entries â€” one per branch.
     pub fn branch_tips(&self) -> Vec<&str> {
         let mut has_child: HashMap<&str, bool> = HashMap::new();
         for e in &self.entries {
@@ -261,7 +261,7 @@ impl Session {
             .collect()
     }
 
-    /// Serialize to JSONL — one entry per line, insertion order. The head is
+    /// Serialize to JSONL â€” one entry per line, insertion order. The head is
     /// restored as the **last line's entry** on load; seek before saving is
     /// not preserved (append after seeking and the new entry becomes both
     /// last line and head).
@@ -279,7 +279,7 @@ impl Session {
         let mut session = Self::new();
         // `to_jsonl` writes insertion order with parents preceding children,
         // so one streaming check enforces every tree invariant: ids unique,
-        // parents already seen (which also rules out cycles — a cycle would
+        // parents already seen (which also rules out cycles â€” a cycle would
         // need a forward reference). This keeps `path_ids` provably
         // terminating and the internal `expect`s sound.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

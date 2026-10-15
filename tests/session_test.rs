@@ -1,9 +1,9 @@
 //! Tests for session trees: branching, checkpoints, JSONL persistence,
 //! and the fork-edit-rerun flow with an Agent.
 
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::*;
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::*;
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage::Llm(Message::user(text))
@@ -139,7 +139,7 @@ async fn fork_edit_rerun_with_agent() {
         MockResponse::Text("answer one".into()),
         MockResponse::Text("answer two".into()),
     ]);
-    let mut agent = Agent::from_provider(provider, yoagent::provider::ModelConfig::mock());
+    let mut agent = Agent::from_provider(provider, agent::provider::ModelConfig::mock());
     let mut rx = agent.prompt("question A").await;
     while rx.recv().await.is_some() {}
     agent.finish().await;
@@ -163,7 +163,7 @@ async fn fork_edit_rerun_with_agent() {
     assert_eq!(branch_history.len(), 2); // the pre-fork history
 
     let provider2 = MockProvider::text("answer C");
-    let mut agent2 = Agent::from_provider(provider2, yoagent::provider::ModelConfig::mock())
+    let mut agent2 = Agent::from_provider(provider2, agent::provider::ModelConfig::mock())
         .with_messages(branch_history);
     let mut rx = agent2.prompt("follow-up C").await;
     while rx.recv().await.is_some() {}

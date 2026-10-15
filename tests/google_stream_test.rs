@@ -5,12 +5,12 @@
 //! exercised only by the key-gated `integration_gemini.rs` live tests
 //! (issue #33).
 
+use ::agent::provider::{GoogleProvider, ModelConfig, StreamConfig, StreamProvider};
+use ::agent::types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use yoagent::provider::{GoogleProvider, ModelConfig, StreamConfig, StreamProvider};
-use yoagent::types::*;
 
 const MODEL: &str = "gemini-2.5-flash";
 
@@ -259,7 +259,7 @@ async fn in_stream_error_payload_fails_the_stream() {
         .await;
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let result = yoagent::provider::GoogleProvider
+    let result = agent::provider::GoogleProvider
         .stream(
             stream_config(&server.uri(), vec![Message::user("hi")]),
             tx,

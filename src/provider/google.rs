@@ -287,7 +287,7 @@ fn next_sse_data(buffer: &mut String) -> Option<String> {
 
 /// Whether an SSE data payload is a Google error envelope
 /// (`{"error": {...}}`) rather than a content chunk.
-fn is_error_payload(data: &str) -> bool {
+pub(crate) fn is_error_payload(data: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(data)
         .map(|v| v.get("error").is_some())
         .unwrap_or(false)

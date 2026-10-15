@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```rust
-//! use yoagent::tools::sandbox::PathSandbox;
+//! use agent::tools::sandbox::PathSandbox;
 //!
 //! let sandbox = PathSandbox::new(vec!["/srv/workspace".to_string()]);
 //! assert!(sandbox.check("/etc/passwd").is_err());

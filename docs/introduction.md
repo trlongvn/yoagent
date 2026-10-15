@@ -1,16 +1,16 @@
-# yoagent
+# agent
 
 **The agent loop for Rust.** Stream from any of 7 LLM protocols, run tools, loop until done.
 
-yoagent is a library for building LLM-powered agents that use tools. It provides the core loop —
+agent is a library for building LLM-powered agents that use tools. It provides the core loop —
 prompt the model, execute tool calls, feed results back — and gets out of your way.
 
-![The yoagent loop](images/loop.svg)
+![The agent loop](images/loop.svg)
 
 ## Philosophy
 
 **The loop is the product.** An agent is just a loop: send messages to an LLM, get back text and
-tool calls, execute the tools, repeat until the model stops. yoagent implements that loop with
+tool calls, execute the tools, repeat until the model stops. agent implements that loop with
 streaming, cancellation, context management, and multi-provider support — and stops there.
 
 `agent_loop()` is a stateless free function that takes everything it needs as arguments. `Agent`
@@ -20,7 +20,7 @@ drive the loop yourself without adopting our state model.
 ## Try it without an API key
 
 ```bash
-git clone https://github.com/yologdev/yoagent && cd yoagent
+git clone https://github.com/yologdev/yoagent && cd agent
 ollama serve &
 cargo run --example cli -- --provider ollama
 ```
@@ -62,7 +62,7 @@ output, and skills.
 
 ## Ecosystem
 
-yoagent is part of the [Yolog](https://github.com/yologdev) ecosystem. It powers the agent backend
+agent is part of the [Yolog](https://github.com/yologdev) ecosystem. It powers the agent backend
 for Yolog applications.
 
 - **Repository:** [github.com/yologdev/yoagent](https://github.com/yologdev/yoagent)

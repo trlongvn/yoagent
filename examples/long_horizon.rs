@@ -6,7 +6,7 @@
 //! # What this is for
 //!
 //! `release_smoke` checks four narrow behaviours over short runs. This checks
-//! the thing yoagent actually claims to be for: **an agent that runs long
+//! the thing agent actually claims to be for: **an agent that runs long
 //! enough to exhaust its context, compacts, and keeps working.** That path had
 //! no live coverage at all — every compaction test uses `MockProvider`, which
 //! cannot tell you whether a compacted transcript is still one a provider
@@ -31,16 +31,16 @@
 //!
 //! Exits non-zero on failure.
 
-use std::sync::Arc;
-use yoagent::agent::Agent;
-use yoagent::context::ContextConfig;
-use yoagent::provider::ModelConfig;
-use yoagent::shared_state::SharedState;
-use yoagent::sub_agent::SubAgentTool;
-use yoagent::types::{
+use ::agent::context::ContextConfig;
+use ::agent::core::Agent;
+use ::agent::provider::ModelConfig;
+use ::agent::shared_state::SharedState;
+use ::agent::sub_agent::SubAgentTool;
+use ::agent::types::{
     AgentMessage, AgentTool, Content, Message, SessionStats, ToolContext, ToolError, ToolResult,
 };
-use yoagent::*;
+use ::agent::*;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // A tool that returns bulky, distinct records — enough to fill a context.
@@ -282,7 +282,7 @@ async fn main() {
 
     let cfg = model();
     println!(
-        "\nyoagent long-horizon validation — live provider: {}\n",
+        "\nagent long-horizon validation — live provider: {}\n",
         cfg.name
     );
     let mut report = Report { checks: Vec::new() };
@@ -328,7 +328,7 @@ async fn main() {
         // than the main loop's". Passing a slow loop model is the obvious call
         // and the worst one — `compact` then finds no briefing ready and takes
         // the deterministic tiers.
-        yoagent::LlmCompaction::from_config(summarizer())
+        agent::LlmCompaction::from_config(summarizer())
             .with_trigger_ratio(0.35)
             .with_event_sender(tx.clone()),
     );

@@ -2,8 +2,8 @@
 authors = ["Yolog Team"]
 language = "en"
 src = "docs"
-title = "yoagent Documentation"
-description = "Documentation for yoagent - simple, effective agent loop in Rust"
+title = "agent Documentation"
+description = "Documentation for agent - simple, effective agent loop in Rust"
 
 [build]
 build-dir = "book"

@@ -3,12 +3,12 @@
 //!
 //! These tests are #[ignore] by default so they don't run in CI without a key.
 
+use ::agent::agent_loop::{agent_loop, AgentLoopConfig};
+use ::agent::provider::AnthropicProvider;
+use ::agent::tools;
+use ::agent::types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yoagent::agent_loop::{agent_loop, AgentLoopConfig};
-use yoagent::provider::AnthropicProvider;
-use yoagent::tools;
-use yoagent::types::*;
 
 fn api_key() -> String {
     std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set")
@@ -25,6 +25,7 @@ fn make_config(provider: AnthropicProvider) -> AgentLoopConfig {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -34,7 +35,7 @@ fn make_config(provider: AnthropicProvider) -> AgentLoopConfig {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(),
+        retry_config: agent::RetryConfig::default(),
         before_turn: None,
         after_turn: None,
         on_error: None,

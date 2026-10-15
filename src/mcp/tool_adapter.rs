@@ -84,13 +84,24 @@ impl AgentTool for McpToolAdapter {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: ToolContext,
+        ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        // Don't swallow the loop's cancel token: an MCP call can hang for the
+        // transport's full lifetime (a paused HTTP stream, a wedged server),
+        // and the parent may be shutting down. Racing the call against the
+        // token drops the in-flight request — which cancels the underlying
+        // HTTP/stdio future — instead of leaving the loop waiting on it.
         let client = self.client.lock().await;
-        let result = client
-            .call_tool(&self.tool.name, params)
-            .await
-            .map_err(|e| ToolError::Failed(format!("MCP call failed: {}", e)))?;
+        let name = self.tool.name.clone();
+        let result = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+            result = client.call_tool(&name, params) => {
+                result.map_err(|e| ToolError::Failed(format!("MCP call failed: {}", e)))?
+            }
+        };
 
         if result.is_error {
             let error_text = result

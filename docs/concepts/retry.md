@@ -1,6 +1,6 @@
 # Retry with Backoff
 
-When an LLM provider returns a transient error — rate limit (HTTP 429) or network failure — yoagent automatically retries with exponential backoff and jitter. No configuration required; it works out of the box.
+When an LLM provider returns a transient error — rate limit (HTTP 429) or network failure — agent automatically retries with exponential backoff and jitter. No configuration required; it works out of the box.
 
 ## How it works
 
@@ -50,8 +50,8 @@ With defaults, the retry delays are approximately:
 ### Using the Agent builder
 
 ```rust
-use yoagent::agent::Agent;
-use yoagent::retry::RetryConfig;
+use agent::agent::Agent;
+use agent::retry::RetryConfig;
 
 // Default — 3 retries, exponential backoff (recommended)
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"));
@@ -73,8 +73,8 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
 ### Using AgentLoopConfig directly
 
 ```rust
-use yoagent::agent_loop::AgentLoopConfig;
-use yoagent::retry::RetryConfig;
+use agent::agent_loop::AgentLoopConfig;
+use agent::retry::RetryConfig;
 
 let config = AgentLoopConfig {
     // ...other fields...
@@ -89,7 +89,7 @@ let config = AgentLoopConfig {
 
 ## Rate limit headers
 
-When a provider returns `ProviderError::RateLimited { retry_after_ms: Some(5000) }`, yoagent uses that exact delay instead of the calculated backoff. This respects the provider's guidance — if Anthropic says "retry after 5 seconds", we wait 5 seconds, not our own estimate.
+When a provider returns `ProviderError::RateLimited { retry_after_ms: Some(5000) }`, agent uses that exact delay instead of the calculated backoff. This respects the provider's guidance — if Anthropic says "retry after 5 seconds", we wait 5 seconds, not our own estimate.
 
 If no `retry_after_ms` is provided, the exponential backoff kicks in.
 
@@ -112,7 +112,7 @@ tracing_subscriber::fmt::init();
 
 // Or filter to just retries
 tracing_subscriber::fmt()
-    .with_env_filter("yoagent::retry=warn")
+    .with_env_filter("agent::retry=warn")
     .init();
 ```
 

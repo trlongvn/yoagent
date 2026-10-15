@@ -74,8 +74,8 @@ pub fn total_tokens(messages: &[AgentMessage]) -> usize {
 /// # Example
 ///
 /// ```rust
-/// use yoagent::context::ContextTracker;
-/// use yoagent::types::Usage;
+/// use agent::context::ContextTracker;
+/// use agent::types::Usage;
 ///
 /// let mut tracker = ContextTracker::new();
 /// // After receiving an assistant response with usage data:

@@ -137,6 +137,9 @@ impl AgentTool for SearchTool {
         cmd.args(&args);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // See bash.rs: dropping the `output()` future on the cancel/timeout arm
+        // must not leave rg/grep running detached.
+        cmd.kill_on_drop(true);
 
         let timeout = self.timeout;
 

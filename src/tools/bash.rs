@@ -182,6 +182,11 @@ impl AgentTool for BashTool {
         // Capture output
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // `Command::output()` spawns eagerly and owns the Child. Dropping that
+        // future (which `select!` does on the cancel/timeout arm) leaves the
+        // process running detached unless kill_on_drop is set — orphan per
+        // cancelled call, still holding a pipe and the full env.
+        cmd.kill_on_drop(true);
 
         let timeout = self.timeout;
         let max_bytes = self.max_output_bytes;

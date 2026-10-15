@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        yoagent is deliberately narrow — the loop, tool execution, and what's needed to run it in
+        agent is deliberately narrow — the loop, tool execution, and what's needed to run it in
         production. Retrieval, vector stores, and task-graph orchestration are intentionally out of
         scope. That doesn't mean don't ask; it just helps to say how the idea fits the loop.
 
@@ -13,7 +13,7 @@ body:
     id: problem
     attributes:
       label: The problem
-      description: What are you trying to do that yoagent makes hard or impossible today?
+      description: What are you trying to do that agent makes hard or impossible today?
     validations:
       required: true
 
@@ -49,7 +49,7 @@ body:
     attributes:
       label: Workarounds you've tried
       description: >-
-        Including "none" is fine. If you solved it outside yoagent, knowing how helps judge whether
+        Including "none" is fine. If you solved it outside agent, knowing how helps judge whether
         this belongs in the crate.
     validations:
       required: false

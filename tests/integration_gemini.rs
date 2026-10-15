@@ -1,12 +1,12 @@
 //! Integration tests against the real Google Gemini API.
 //! Run with: GEMINI_API_KEY=... cargo test --test integration_gemini -- --ignored
 
+use ::agent::agent_loop::{agent_loop, AgentLoopConfig};
+use ::agent::provider::{GoogleProvider, ModelConfig};
+use ::agent::tools;
+use ::agent::types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yoagent::agent_loop::{agent_loop, AgentLoopConfig};
-use yoagent::provider::{GoogleProvider, ModelConfig};
-use yoagent::tools;
-use yoagent::types::*;
 
 fn api_key() -> String {
     std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set")
@@ -24,6 +24,7 @@ fn make_config(model: &str) -> AgentLoopConfig {
         model_config: Some(model_config),
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -33,7 +34,7 @@ fn make_config(model: &str) -> AgentLoopConfig {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(),
+        retry_config: agent::RetryConfig::default(),
         before_turn: None,
         after_turn: None,
         on_error: None,

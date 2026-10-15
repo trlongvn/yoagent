@@ -5,7 +5,7 @@
 ## Usage
 
 ```rust
-use yoagent::provider::ModelConfig;
+use agent::provider::ModelConfig;
 
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"));
 ```

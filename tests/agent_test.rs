@@ -1,13 +1,13 @@
 //! Tests for the Agent struct (stateful wrapper).
 
+use ::agent::core::Agent;
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::provider::ModelConfig;
+use ::agent::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use yoagent::agent::Agent;
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::provider::ModelConfig;
-use yoagent::*;
 
 #[tokio::test]
 async fn test_agent_simple_prompt() {
@@ -447,8 +447,8 @@ fn session_cost_usd_none_without_model_config() {
 fn session_cost_usd_none_when_rates_unconfigured() {
     // ModelConfig::custom has all-zero cost rates: pricing is unknown, so
     // the answer must be None ("can't price"), not Some(0.0) ("free").
-    let mc = yoagent::provider::ModelConfig::custom(
-        yoagent::provider::ApiProtocol::OpenAiCompletions,
+    let mc = agent::provider::ModelConfig::custom(
+        agent::provider::ApiProtocol::OpenAiCompletions,
         "local",
         "http://localhost:8080/v1",
         "m",
@@ -461,8 +461,8 @@ fn session_cost_usd_none_when_rates_unconfigured() {
 
 #[test]
 fn session_cost_usd_sums_assistant_turns_only() {
-    let mut mc = yoagent::provider::ModelConfig::custom(
-        yoagent::provider::ApiProtocol::OpenAiCompletions,
+    let mut mc = agent::provider::ModelConfig::custom(
+        agent::provider::ApiProtocol::OpenAiCompletions,
         "local",
         "http://localhost:8080/v1",
         "m",
@@ -492,13 +492,13 @@ struct KeyCapturingProvider {
 }
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for KeyCapturingProvider {
+impl agent::provider::StreamProvider for KeyCapturingProvider {
     async fn stream(
         &self,
-        config: yoagent::provider::StreamConfig,
-        tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        config: agent::provider::StreamConfig,
+        tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         *self.captured.lock().unwrap() = config.api_key.clone();
         let msg = Message::assistant(
             vec![Content::Text { text: "ok".into() }],
@@ -507,8 +507,8 @@ impl yoagent::provider::StreamProvider for KeyCapturingProvider {
             "mock",
             Usage::default(),
         );
-        let _ = tx.send(yoagent::provider::StreamEvent::Start);
-        let _ = tx.send(yoagent::provider::StreamEvent::Done {
+        let _ = tx.send(agent::provider::StreamEvent::Start);
+        let _ = tx.send(agent::provider::StreamEvent::Done {
             message: msg.clone(),
         });
         Ok(msg)
@@ -532,8 +532,8 @@ async fn test_explicit_api_key_wins_over_env() {
         KeyCapturingProvider {
             captured: captured.clone(),
         },
-        yoagent::provider::ModelConfig::custom(
-            yoagent::provider::ApiProtocol::OpenAiCompletions,
+        agent::provider::ModelConfig::custom(
+            agent::provider::ApiProtocol::OpenAiCompletions,
             "zai",
             "http://localhost:8080/v1",
             "m",
@@ -553,8 +553,8 @@ async fn test_env_var_fallback_resolves_api_key() {
         KeyCapturingProvider {
             captured: captured.clone(),
         },
-        yoagent::provider::ModelConfig::custom(
-            yoagent::provider::ApiProtocol::OpenAiCompletions,
+        agent::provider::ModelConfig::custom(
+            agent::provider::ApiProtocol::OpenAiCompletions,
             "cerebras",
             "http://localhost:8080/v1",
             "m",
@@ -574,7 +574,7 @@ async fn test_from_provider_runs_end_to_end() {
     // from_provider + ModelConfig::mock() is the test-double construction path.
     let mut agent = Agent::from_provider(
         MockProvider::text("Hi from mock"),
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     );
     assert_eq!(agent.model, "mock");
 
@@ -591,7 +591,7 @@ async fn test_from_provider_runs_end_to_end() {
 fn test_from_config_wires_model_and_config() {
     // from_config selects a built-in provider from config.api, sets the id,
     // and stashes pricing so session_cost_usd can price the session.
-    let mut mc = yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5");
+    let mut mc = agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5");
     mc.cost.input_per_million = 3.0;
     let agent = Agent::from_config(mc).with_messages(vec![assistant_with_usage(some_usage())]);
     assert_eq!(agent.model, "claude-sonnet-5");
@@ -611,8 +611,8 @@ async fn test_from_config_resolves_env_key() {
         KeyCapturingProvider {
             captured: captured.clone(),
         },
-        yoagent::provider::ModelConfig::custom(
-            yoagent::provider::ApiProtocol::OpenAiCompletions,
+        agent::provider::ModelConfig::custom(
+            agent::provider::ApiProtocol::OpenAiCompletions,
             "openrouter",
             "http://unused.invalid",
             "m",
@@ -625,31 +625,31 @@ async fn test_from_config_resolves_env_key() {
 
 #[test]
 fn test_from_config_with_errors_on_empty_registry() {
-    let registry = yoagent::provider::ProviderRegistry::new();
+    let registry = agent::provider::ProviderRegistry::new();
     // Agent isn't Debug, so match instead of expect_err.
     let err = match Agent::from_config_with(
         &registry,
-        yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
+        agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
     ) {
         Ok(_) => panic!("empty registry must fail"),
         Err(e) => e,
     };
     assert_eq!(
         err,
-        yoagent::AgentBuildError::NoProviderForProtocol(
-            yoagent::provider::ApiProtocol::AnthropicMessages
+        agent::AgentBuildError::NoProviderForProtocol(
+            agent::provider::ApiProtocol::AnthropicMessages
         )
     );
 }
 
 #[tokio::test]
 async fn test_set_model_switches_model_id() {
-    let mut agent = Agent::from_config(yoagent::provider::ModelConfig::anthropic(
+    let mut agent = Agent::from_config(agent::provider::ModelConfig::anthropic(
         "claude-sonnet-5",
         "Sonnet 5",
     ));
     assert_eq!(agent.model, "claude-sonnet-5");
-    agent.set_model(yoagent::provider::ModelConfig::anthropic(
+    agent.set_model(agent::provider::ModelConfig::anthropic(
         "claude-opus-4-8",
         "Opus 4.8",
     ));
@@ -658,7 +658,7 @@ async fn test_set_model_switches_model_id() {
 
 #[test]
 fn test_model_config_mock_is_unpriced() {
-    let mc = yoagent::provider::ModelConfig::mock();
+    let mc = agent::provider::ModelConfig::mock();
     assert_eq!(mc.provider, "mock");
     assert!(!mc.cost.is_configured());
 }
@@ -674,14 +674,14 @@ async fn test_set_model_preserves_explicit_provider_and_key() {
         KeyCapturingProvider {
             captured: captured.clone(),
         },
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     )
     .with_api_key("explicit-key")
-    .with_retry_config(yoagent::RetryConfig::none());
+    .with_retry_config(agent::RetryConfig::none());
 
     // Switch to a different protocol whose built-in provider would hit the
     // network if it clobbered ours.
-    agent.set_model(yoagent::provider::ModelConfig::anthropic(
+    agent.set_model(agent::provider::ModelConfig::anthropic(
         "claude-sonnet-5",
         "Sonnet 5",
     ));
@@ -771,7 +771,7 @@ async fn run_middleware_agent(mut agent: Agent) -> (Agent, Vec<AgentEvent>) {
 #[tokio::test]
 async fn test_tool_middleware_deny_blocks_tool_and_loop_continues() {
     let ran = Arc::new(std::sync::Mutex::new(None));
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_middleware(FnMiddleware(|name: &str, _args: &serde_json::Value| {
             if name == "recording_tool" {
@@ -824,7 +824,7 @@ async fn test_tool_middleware_deny_blocks_tool_and_loop_continues() {
 #[tokio::test]
 async fn test_tool_middleware_modify_rewrites_args() {
     let ran = Arc::new(std::sync::Mutex::new(None));
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_middleware(FnMiddleware(|_: &str, _: &serde_json::Value| {
             ToolDecision::Modify(serde_json::json!({"path": "/tmp/sandboxed"}))
@@ -853,7 +853,7 @@ async fn test_tool_middleware_chain_first_deny_wins() {
     let ran = Arc::new(std::sync::Mutex::new(None));
     let saw = Arc::new(std::sync::Mutex::new(None));
     let saw2 = saw.clone();
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_middleware(FnMiddleware(|_: &str, _: &serde_json::Value| {
             ToolDecision::Modify(serde_json::json!({"path": "/rewritten"}))
@@ -881,7 +881,7 @@ async fn test_tool_middleware_chain_first_deny_wins() {
 async fn test_tool_middleware_deny_under_sequential_strategy() {
     // The choke point is shared, but pin the Sequential path explicitly too.
     let ran = Arc::new(std::sync::Mutex::new(None));
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_execution(ToolExecutionStrategy::Sequential)
         .with_tool_middleware(FnMiddleware(|_: &str, _: &serde_json::Value| {
@@ -907,7 +907,7 @@ async fn test_prompt_structured_parses_text_json() {
     // Providers with native json_schema/responseSchema return plain JSON text.
     let mut agent = Agent::from_provider(
         MockProvider::text(r#"{"name": "widget", "count": 3}"#),
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     );
     let out: Extracted = agent
         .prompt_structured("extract", serde_json::json!({"type": "object"}))
@@ -932,7 +932,7 @@ async fn test_prompt_structured_unwraps_forced_tool_call() {
         name: "structured_output".into(),
         arguments: serde_json::json!({"name": "gadget", "count": 7}),
     }])]);
-    let mut agent = Agent::from_provider(provider, yoagent::provider::ModelConfig::mock());
+    let mut agent = Agent::from_provider(provider, agent::provider::ModelConfig::mock());
     let out: Extracted = agent
         .prompt_structured("extract", serde_json::json!({"type": "object"}))
         .await
@@ -956,14 +956,14 @@ async fn test_prompt_structured_unwraps_forced_tool_call() {
 async fn test_prompt_structured_parse_error_carries_raw() {
     let mut agent = Agent::from_provider(
         MockProvider::text("not json at all"),
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     );
     let err = agent
         .prompt_structured::<Extracted>("extract", serde_json::json!({"type": "object"}))
         .await
         .expect_err("must fail to parse");
     match err {
-        yoagent::StructuredPromptError::Parse { raw, .. } => {
+        agent::StructuredPromptError::Parse { raw, .. } => {
             assert!(raw.contains("not json at all"));
         }
         other => panic!("expected Parse error, got {other:?}"),
@@ -974,7 +974,7 @@ async fn test_prompt_structured_parse_error_carries_raw() {
 async fn test_prompt_structured_strips_markdown_fences() {
     let mut agent = Agent::from_provider(
         MockProvider::text("```json\n{\"name\": \"x\", \"count\": 1}\n```"),
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     );
     let out: Extracted = agent
         .prompt_structured("extract", serde_json::json!({"type": "object"}))
@@ -990,13 +990,13 @@ struct SchemaCapturingProvider {
 }
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for SchemaCapturingProvider {
+impl agent::provider::StreamProvider for SchemaCapturingProvider {
     async fn stream(
         &self,
-        config: yoagent::provider::StreamConfig,
-        tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        config: agent::provider::StreamConfig,
+        tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         self.schemas
             .lock()
             .unwrap()
@@ -1010,8 +1010,8 @@ impl yoagent::provider::StreamProvider for SchemaCapturingProvider {
             "mock",
             Usage::default(),
         );
-        let _ = tx.send(yoagent::provider::StreamEvent::Start);
-        let _ = tx.send(yoagent::provider::StreamEvent::Done {
+        let _ = tx.send(agent::provider::StreamEvent::Start);
+        let _ = tx.send(agent::provider::StreamEvent::Done {
             message: msg.clone(),
         });
         Ok(msg)
@@ -1029,7 +1029,7 @@ async fn test_prompt_structured_schema_reaches_provider_then_resets() {
             schemas: schemas.clone(),
             reply: r#"{"name": "a", "count": 1}"#.into(),
         },
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     );
     let _: Extracted = agent
         .prompt_structured("extract", serde_json::json!({"type": "object"}))
@@ -1052,14 +1052,14 @@ async fn test_prompt_structured_schema_reaches_provider_then_resets() {
 struct AlwaysFailProvider;
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for AlwaysFailProvider {
+impl agent::provider::StreamProvider for AlwaysFailProvider {
     async fn stream(
         &self,
-        _config: yoagent::provider::StreamConfig,
-        _tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        _config: agent::provider::StreamConfig,
+        _tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
-        Err(yoagent::provider::ProviderError::Api(
+    ) -> Result<Message, agent::provider::ProviderError> {
+        Err(agent::provider::ProviderError::Api(
             "invalid x-api-key".into(),
         ))
     }
@@ -1069,15 +1069,14 @@ impl yoagent::provider::StreamProvider for AlwaysFailProvider {
 async fn test_prompt_structured_surfaces_provider_error() {
     // A dead API key must surface as Provider { message } carrying the real
     // error — never as Parse { raw: "" }.
-    let mut agent =
-        Agent::from_provider(AlwaysFailProvider, yoagent::provider::ModelConfig::mock())
-            .with_retry_config(yoagent::RetryConfig::none());
+    let mut agent = Agent::from_provider(AlwaysFailProvider, agent::provider::ModelConfig::mock())
+        .with_retry_config(agent::RetryConfig::none());
     let err = agent
         .prompt_structured::<Extracted>("extract", serde_json::json!({"type": "object"}))
         .await
         .unwrap_err();
     match err {
-        yoagent::StructuredPromptError::Provider { message } => {
+        agent::StructuredPromptError::Provider { message } => {
             assert!(message.contains("invalid x-api-key"), "got: {message}");
         }
         other => panic!("expected Provider error, got {other:?}"),
@@ -1097,17 +1096,16 @@ async fn test_prompt_structured_never_parses_stale_history() {
         "mock",
         Usage::default(),
     ));
-    let mut agent =
-        Agent::from_provider(AlwaysFailProvider, yoagent::provider::ModelConfig::mock())
-            .with_retry_config(yoagent::RetryConfig::none())
-            .with_messages(vec![stale]);
+    let mut agent = Agent::from_provider(AlwaysFailProvider, agent::provider::ModelConfig::mock())
+        .with_retry_config(agent::RetryConfig::none())
+        .with_messages(vec![stale]);
 
     let err = agent
         .prompt_structured::<Extracted>("extract", serde_json::json!({"type": "object"}))
         .await
         .unwrap_err();
     assert!(
-        matches!(err, yoagent::StructuredPromptError::Provider { .. }),
+        matches!(err, agent::StructuredPromptError::Provider { .. }),
         "must not return the stale turn's JSON, got {err:?}"
     );
 }
@@ -1123,7 +1121,7 @@ async fn test_middleware_never_sees_synthetic_structured_tool() {
         name: "structured_output".into(),
         arguments: serde_json::json!({"name": "g", "count": 7}),
     }])]);
-    let mut agent = Agent::from_provider(provider, yoagent::provider::ModelConfig::mock())
+    let mut agent = Agent::from_provider(provider, agent::provider::ModelConfig::mock())
         .with_tool_middleware(FnMiddleware(move |_: &str, _: &serde_json::Value| {
             *calls2.lock().unwrap() += 1;
             ToolDecision::Deny("should never run".into())
@@ -1145,7 +1143,7 @@ async fn test_tool_middleware_panic_denies_and_loop_survives() {
     // A panicking middleware must not kill the loop task (which would strip
     // the agent of its tools) — it fails closed as a denial.
     let ran = Arc::new(std::sync::Mutex::new(None));
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_middleware(FnMiddleware(|_: &str, _: &serde_json::Value| {
             panic!("middleware bug")
@@ -1170,7 +1168,7 @@ async fn test_tool_middleware_panic_denies_and_loop_survives() {
 #[tokio::test]
 async fn test_tool_middleware_deny_under_batched_strategy() {
     let ran = Arc::new(std::sync::Mutex::new(None));
-    let agent = Agent::from_provider(tool_call_provider(), yoagent::provider::ModelConfig::mock())
+    let agent = Agent::from_provider(tool_call_provider(), agent::provider::ModelConfig::mock())
         .with_tools(vec![Box::new(RecordingTool { ran: ran.clone() })])
         .with_tool_execution(ToolExecutionStrategy::Batched { size: 1 })
         .with_tool_middleware(FnMiddleware(|_: &str, _: &serde_json::Value| {

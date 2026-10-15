@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use yoagent::shared_state::SharedState;
+//! use agent::shared_state::SharedState;
 //!
 //! # async fn example() {
 //! let state = SharedState::new();
@@ -233,7 +233,7 @@ impl SharedStateBackend for MemoryBackend {
 /// (no extension) for easy inspection and debugging.
 ///
 /// ```rust,no_run
-/// use yoagent::shared_state::{SharedState, FileBackend};
+/// use agent::shared_state::{SharedState, FileBackend};
 ///
 /// # async fn example() {
 /// let state = SharedState::with_backend(FileBackend::new("/tmp/agent-state"));
@@ -351,13 +351,20 @@ impl FileBackend {
     }
 
     /// Encode a key into a safe, reversible filename.
-    /// Percent-encodes any character that isn't alphanumeric, `-`, `_`, or `.`.
-    /// This avoids collisions: distinct keys always produce distinct filenames.
+    /// Percent-encodes every character that isn't alphanumeric, `-`, or `_`.
+    /// `.` is deliberately NOT whitelisted — a bare `..` is a `Path` component
+    /// that escapes the store directory on POSIX and (with `..\\`) on Windows.
+    /// Distinct keys always produce distinct filenames (injective mapping).
     fn key_to_path(&self, key: &str) -> PathBuf {
+        // Reserve the empty string; a key of "" would otherwise resolve to
+        // the store directory itself.
+        if key.is_empty() {
+            return self.dir.join("%EMPTY%");
+        }
         let encoded: String = key
             .chars()
             .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
                     c.to_string()
                 } else {
                     format!("%{:02X}", c as u32)
@@ -532,7 +539,7 @@ fn is_stash_key(key: &str) -> bool {
 /// everything, which is what lets the parent collect results.
 ///
 /// ```rust
-/// # use yoagent::shared_state::SharedState;
+/// # use agent::shared_state::SharedState;
 /// # async fn demo() {
 /// let state = SharedState::new();
 /// let researcher = state.scoped("researcher");
@@ -868,8 +875,10 @@ mod tests {
             Some("file analysis".into())
         );
 
-        // The file on disk uses percent-encoded name
-        let encoded = dir.path().join("summary%3Asrc%2Fmain.rs");
+        // The file on disk uses percent-encoded name. `.` is encoded too —
+        // whitelisting it let a key of ".." become a directory component that
+        // escaped the store (see test_file_backend_rejects_traversal_keys).
+        let encoded = dir.path().join("summary%3Asrc%2Fmain%2Ers");
         assert!(encoded.exists());
 
         // keys() returns the original key, not the filename
@@ -890,6 +899,37 @@ mod tests {
             Some("different".into())
         );
         assert_eq!(state.keys().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_file_backend_rejects_traversal_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SharedState::with_backend(FileBackend::new(dir.path()));
+
+        // Keys that a caller (or an LLM-driven `set` action) can supply must
+        // never resolve outside the store. Writing "../escape" used to land in
+        // the parent directory, so a get() of the same key on a fresh backend
+        // would return a file it never wrote — and, worse, a hostile key could
+        // clobber arbitrary files.
+        for key in ["..", ".", "../escape", "..\\escape", "", "a/../.."] {
+            state.set(key, "payload".into()).await.unwrap();
+            // Round-trips as itself...
+            assert_eq!(state.get(key).await, Some("payload".into()), "key {key:?}");
+            // ...without escaping the store directory.
+            let escaped: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flat_map(|e| e.map(|e| e.path()).ok())
+                .filter(|p| p.is_file())
+                .collect();
+            for p in escaped {
+                assert_ne!(
+                    p.parent().map(|d| d.file_name()),
+                    Some(Some("..".as_ref())),
+                    "key {key:?} escaped the store: {}",
+                    p.display()
+                );
+            }
+        }
     }
 
     #[tokio::test]

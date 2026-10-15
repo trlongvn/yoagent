@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-yoagent is pre-1.0. Security fixes land on the latest published minor version; there are no
+agent is pre-1.0. Security fixes land on the latest published minor version; there are no
 long-term support branches. Please upgrade to the newest release before reporting.
 
 ## Reporting a vulnerability
@@ -11,7 +11,7 @@ long-term support branches. Please upgrade to the newest release before reportin
 
 Report privately through GitHub's
 [private vulnerability reporting](https://github.com/yologdev/yoagent/security/advisories/new).
-If that is unavailable, email the maintainer at `yuanhao@yolog.dev` with "yoagent security" in the
+If that is unavailable, email the maintainer at `yuanhao@yolog.dev` with "agent security" in the
 subject.
 
 Please include the affected version, a description of the impact, and a reproduction if you have
@@ -19,10 +19,10 @@ one. You can expect an initial response within a week.
 
 ## Scope
 
-yoagent handles API credentials and executes tools, so the areas most worth scrutiny are:
+agent handles API credentials and executes tools, so the areas most worth scrutiny are:
 
 - **Credential handling** — API keys are resolved from environment variables and held in memory.
-  yoagent does not log them. A path that leaks a key into logs, `tracing` output, error messages,
+  agent does not log them. A path that leaks a key into logs, `tracing` output, error messages,
   or a serialized session is a vulnerability.
 - **Tool execution** — the `bash` tool runs shell commands and the file tools read and write disk.
   These are *designed* to execute what the model asks for; that is the crate's purpose, not a flaw.
@@ -35,7 +35,7 @@ yoagent handles API credentials and executes tools, so the areas most worth scru
 
 ## Out of scope
 
-- An agent taking a destructive action the model chose and no configured policy blocked. yoagent
+- An agent taking a destructive action the model chose and no configured policy blocked. agent
   ships **no** default policy — `ToolMiddleware` is the mechanism, and installing a policy is the
   application's responsibility.
 - Prompt injection causing an LLM to misbehave, absent a bypass of a yoagent-enforced restriction.

@@ -1,4 +1,4 @@
-//! Provider registry — maps ApiProtocol to StreamProvider implementations.
+//! Provider registry â€” maps ApiProtocol to StreamProvider implementations.
 
 use super::model::{ApiProtocol, ModelConfig};
 use super::traits::*;
@@ -49,6 +49,41 @@ impl ProviderRegistry {
     /// List all registered protocols.
     pub fn protocols(&self) -> Vec<ApiProtocol> {
         self.providers.keys().copied().collect()
+    }
+
+    /// Register a Needle 3 provider if the weights can be loaded.
+    ///
+    /// Returns `Ok(())` once registered, or the engine's load error so the
+    /// caller can surface "needle3 is configured but unusable" rather than
+    /// discovering it on the first turn. Unlike `register`, this is fallible
+    /// by nature: Needle 3 has no credentials to check, but it does have a
+    /// 29 MB file that must exist and parse.
+    ///
+    /// Behind the `needle3` feature.
+    #[cfg(feature = "needle3")]
+    pub fn register_needle3(
+        &mut self,
+        weights: Option<&std::path::Path>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<(), crate::provider::needle3::Needle3BuildError> {
+        use crate::provider::needle3::{Needle3BuildError, Needle3Provider};
+        let provider = Needle3Provider::new(weights, tools).map_err(Needle3BuildError::Engine)?;
+        self.providers
+            .insert(ApiProtocol::Needle3, std::sync::Arc::new(provider));
+        Ok(())
+    }
+
+    /// Register a pre-built Needle 3 provider.
+    ///
+    /// For callers that configured the provider themselves (threshold,
+    /// KV precision, reasoning) and want it in the registry's dispatch table.
+    #[cfg(feature = "needle3")]
+    pub fn register_needle3_provider(
+        &mut self,
+        provider: crate::provider::needle3::Needle3Provider,
+    ) {
+        self.providers
+            .insert(ApiProtocol::Needle3, std::sync::Arc::new(provider));
     }
 
     /// Stream using the appropriate provider for the model's API protocol.
@@ -131,7 +166,7 @@ mod tests {
 /// Resolve an API key from the conventional environment variable(s) for a
 /// provider name (the `ModelConfig.provider` string).
 ///
-/// Used as a fallback when no explicit key is set on the agent — an explicit
+/// Used as a fallback when no explicit key is set on the agent â€” an explicit
 /// `with_api_key` always wins. Conventions:
 ///
 /// | provider | env var(s), first match wins |
@@ -145,9 +180,9 @@ mod tests {
 /// | `opencode-zen` / `opencode-go` | `OPENCODE_API_KEY` |
 /// | `azure` | `AZURE_OPENAI_API_KEY` |
 /// | `bedrock` | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`), composed as `access:secret[:token]` |
-/// | `vertex` | none — pass a short-lived OAuth token via `with_api_key` |
+/// | `vertex` | none â€” pass a short-lived OAuth token via `with_api_key` |
 /// | `local` / `ollama` | no key needed (empty) |
-/// | anything else | `YOAGENT_API_KEY`, then `API_KEY` |
+/// | anything else | `AGENT_API_KEY`, then `API_KEY` |
 pub fn resolve_api_key(provider: &str) -> Option<String> {
     use std::env::var;
     let first = |names: &[&str]| {
@@ -185,7 +220,7 @@ pub fn resolve_api_key(provider: &str) -> Option<String> {
         }
         "vertex" => None,
         "local" | "ollama" => Some(String::new()),
-        _ => first(&["YOAGENT_API_KEY", "API_KEY"]),
+        _ => first(&["AGENT_API_KEY", "API_KEY"]),
     }
 }
 
@@ -232,7 +267,7 @@ fn api_key_env_hint(provider: &str) -> &'static str {
              or call .with_api_key(\"access:secret[:token]\")"
         }
         "vertex" => "pass a short-lived OAuth token via .with_api_key(...)",
-        _ => "set YOAGENT_API_KEY (or API_KEY) or call .with_api_key(...)",
+        _ => "set AGENT_API_KEY (or API_KEY) or call .with_api_key(...)",
     }
 }
 
@@ -245,13 +280,13 @@ mod resolve_key_tests {
         // local/ollama need no key
         assert_eq!(resolve_api_key("local").as_deref(), Some(""));
         assert_eq!(resolve_api_key("ollama").as_deref(), Some(""));
-        // vertex expects an explicit OAuth token — never env-resolved
+        // vertex expects an explicit OAuth token â€” never env-resolved
         assert_eq!(resolve_api_key("vertex"), None);
     }
 
     #[test]
     fn test_meta_env_resolution() {
-        // Own vars as of this writing — grep before reusing MODEL_API_KEY in
+        // Own vars as of this writing â€” grep before reusing MODEL_API_KEY in
         // another test. Clear first: a developer shell may export these.
         std::env::remove_var("META_API_KEY");
         std::env::set_var("MODEL_API_KEY", "official-var");
@@ -267,12 +302,12 @@ mod resolve_key_tests {
     fn test_env_resolution() {
         // Use a provider name unique to this test to avoid env races with
         // parallel tests.
-        std::env::set_var("YOAGENT_API_KEY", "from-generic-fallback");
+        std::env::set_var("AGENT_API_KEY", "from-generic-fallback");
         assert_eq!(
             resolve_api_key("some-unknown-gateway").as_deref(),
             Some("from-generic-fallback")
         );
-        std::env::remove_var("YOAGENT_API_KEY");
+        std::env::remove_var("AGENT_API_KEY");
     }
 }
 
@@ -280,11 +315,16 @@ mod resolve_key_tests {
 mod registry_tests {
     use super::*;
 
-    /// Every `ApiProtocol` variant. The wildcard-free `match` is a compile
-    /// forcing-function: adding a variant fails to build here until it's added
-    /// to the list (and, in turn, registered in `default()` below), so the
-    /// "default registry is complete" invariant behind `from_config`'s unwrap
-    /// cannot silently rot.
+    /// Every `ApiProtocol` variant *the default registry covers*.
+    ///
+    /// The wildcard-free `match` is a compile forcing-function: adding a
+    /// variant fails to build here until it's added to the list (and, in turn,
+    /// registered in `default()` below), so the "default registry is complete"
+    /// invariant behind `from_config`'s unwrap cannot silently rot.
+    ///
+    /// [`ApiProtocol::Needle3`] is deliberately absent — it needs a real
+    /// weights file, so it cannot be built for free. Callers opt in with
+    /// [`register_needle3`](ProviderRegistry::register_needle3).
     fn all_protocols() -> Vec<ApiProtocol> {
         fn _assert_exhaustive(p: ApiProtocol) {
             match p {
@@ -295,6 +335,10 @@ mod registry_tests {
                 | ApiProtocol::GoogleGenerativeAi
                 | ApiProtocol::GoogleVertex
                 | ApiProtocol::BedrockConverseStream => {}
+                // Needs real weights on disk, so it cannot have a default the
+                // registry can build for free — registered explicitly by the
+                // caller (see `default_needle3`).
+                ApiProtocol::Needle3 => {}
             }
         }
         vec![
@@ -306,6 +350,22 @@ mod registry_tests {
             ApiProtocol::GoogleVertex,
             ApiProtocol::BedrockConverseStream,
         ]
+    }
+
+    fn all_protocols_including_needle3() -> Vec<ApiProtocol> {
+        let mut all = all_protocols();
+        all.push(ApiProtocol::Needle3);
+        all
+    }
+
+    /// Every protocol, including `Needle3`, must be named in the Display impl —
+    /// an unlisted variant renders as an empty string and silently breaks
+    /// `registry.stream`'s error message.
+    #[test]
+    fn display_names_every_protocol() {
+        for api in all_protocols_including_needle3() {
+            assert!(!api.to_string().is_empty(), "{api} has no Display name");
+        }
     }
 
     /// The default registry must resolve a provider for every protocol, so
@@ -322,7 +382,7 @@ mod registry_tests {
     }
 
     /// Each protocol must resolve to a provider that actually *speaks* that
-    /// protocol — guards against a mis-wired `register()` line (e.g. mapping
+    /// protocol â€” guards against a mis-wired `register()` line (e.g. mapping
     /// `GoogleVertex` to the Anthropic provider) that a mere is-some check
     /// would miss.
     #[test]

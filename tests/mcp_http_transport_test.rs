@@ -8,11 +8,11 @@
 //! prevent. Each test therefore builds its request first and mounts the mock
 //! with that id.
 
+use ::agent::mcp::transport::McpTransport;
+use ::agent::mcp::types::JsonRpcRequest;
+use ::agent::mcp::{HttpTransport, McpClient};
 use wiremock::matchers::{body_string_contains, header, method};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use yoagent::mcp::transport::McpTransport;
-use yoagent::mcp::types::JsonRpcRequest;
-use yoagent::mcp::{HttpTransport, McpClient};
 
 /// Matcher: the request must NOT carry the given header.
 struct HeaderAbsent(&'static str);

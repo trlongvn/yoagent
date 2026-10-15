@@ -5,7 +5,7 @@
 ## Usage
 
 ```rust
-use yoagent::provider::{ApiProtocol, ModelConfig};
+use agent::provider::{ApiProtocol, ModelConfig};
 
 // Azure has no dedicated ModelConfig preset — build one with `custom`.
 // The provider ("azure") resolves the key from AZURE_OPENAI_API_KEY.
@@ -50,7 +50,7 @@ Set this as `ModelConfig.base_url`. The provider appends `/responses?api-version
 
 Uses the Responses API input format:
 
-| yoagent | Azure Responses API |
+| agent | Azure Responses API |
 |----------|-------------------|
 | User message | `{"role": "user", "content": "..."}` |
 | Assistant text | `{"type": "message", "role": "assistant", "content": [{"type": "output_text", ...}]}` |

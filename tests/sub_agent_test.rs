@@ -1,14 +1,14 @@
 //! Tests for SubAgentTool using MockProvider.
 
+use ::agent::agent_loop::{agent_loop, AgentLoopConfig};
+use ::agent::provider::mock::*;
+use ::agent::provider::MockProvider;
+use ::agent::provider::ModelConfig;
+use ::agent::sub_agent::SubAgentTool;
+use ::agent::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yoagent::agent_loop::{agent_loop, AgentLoopConfig};
-use yoagent::provider::mock::*;
-use yoagent::provider::MockProvider;
-use yoagent::provider::ModelConfig;
-use yoagent::sub_agent::SubAgentTool;
-use yoagent::*;
 
 fn make_config(provider: MockProvider) -> AgentLoopConfig {
     AgentLoopConfig {
@@ -21,6 +21,7 @@ fn make_config(provider: MockProvider) -> AgentLoopConfig {
         model_config: None,
         convert_to_llm: None,
         transform_context: None,
+        prepare_context: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
         context_config: None,
@@ -30,7 +31,7 @@ fn make_config(provider: MockProvider) -> AgentLoopConfig {
         tool_output_sink: None,
         output_schema: None,
         tool_execution: ToolExecutionStrategy::default(),
-        retry_config: yoagent::RetryConfig::default(),
+        retry_config: agent::RetryConfig::default(),
         before_turn: None,
         after_turn: None,
         on_error: None,
@@ -247,20 +248,20 @@ async fn test_sub_agent_parallel() {
     }
 
     #[async_trait::async_trait]
-    impl yoagent::provider::StreamProvider for SlowProvider {
+    impl agent::provider::StreamProvider for SlowProvider {
         async fn stream(
             &self,
-            _config: yoagent::provider::StreamConfig,
-            tx: tokio::sync::mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+            _config: agent::provider::StreamConfig,
+            tx: tokio::sync::mpsc::UnboundedSender<agent::provider::StreamEvent>,
             cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<Message, yoagent::provider::ProviderError> {
+        ) -> Result<Message, agent::provider::ProviderError> {
             if cancel.is_cancelled() {
-                return Err(yoagent::provider::ProviderError::Cancelled);
+                return Err(agent::provider::ProviderError::Cancelled);
             }
             tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
 
-            let _ = tx.send(yoagent::provider::StreamEvent::Start);
-            let _ = tx.send(yoagent::provider::StreamEvent::TextDelta {
+            let _ = tx.send(agent::provider::StreamEvent::Start);
+            let _ = tx.send(agent::provider::StreamEvent::TextDelta {
                 content_index: 0,
                 delta: self.text.clone(),
             });
@@ -273,7 +274,7 @@ async fn test_sub_agent_parallel() {
                 "slow",
                 Usage::default(),
             );
-            let _ = tx.send(yoagent::provider::StreamEvent::Done {
+            let _ = tx.send(agent::provider::StreamEvent::Done {
                 message: msg.clone(),
             });
             Ok(msg)
@@ -433,15 +434,15 @@ struct CapturingProvider {
 }
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for CapturingProvider {
+impl agent::provider::StreamProvider for CapturingProvider {
     async fn stream(
         &self,
-        config: yoagent::provider::StreamConfig,
-        tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        config: agent::provider::StreamConfig,
+        tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         *self.captured.lock().unwrap() = config.system_prompt.clone();
-        let _ = tx.send(yoagent::provider::StreamEvent::Start);
+        let _ = tx.send(agent::provider::StreamEvent::Start);
         let msg = Message::assistant(
             vec![Content::Text {
                 text: "done".into(),
@@ -451,7 +452,7 @@ impl yoagent::provider::StreamProvider for CapturingProvider {
             "mock",
             Usage::default(),
         );
-        let _ = tx.send(yoagent::provider::StreamEvent::Done {
+        let _ = tx.send(agent::provider::StreamEvent::Done {
             message: msg.clone(),
         });
         Ok(msg)
@@ -479,8 +480,8 @@ impl SkillsDir {
         Self(dir)
     }
 
-    fn load(&self) -> yoagent::skills::SkillSet {
-        yoagent::skills::SkillSet::load(&[self.0.to_string_lossy().to_string()]).unwrap()
+    fn load(&self) -> agent::skills::SkillSet {
+        agent::skills::SkillSet::load(&[self.0.to_string_lossy().to_string()]).unwrap()
     }
 }
 
@@ -569,7 +570,7 @@ async fn test_sub_agent_with_empty_skillset_is_noop() {
     let prompt = capture_system_prompt(|provider| {
         SubAgentTool::from_provider("researcher", provider, ModelConfig::mock())
             .with_system_prompt("Base prompt.")
-            .with_skills(yoagent::skills::SkillSet::empty())
+            .with_skills(agent::skills::SkillSet::empty())
     })
     .await;
 
@@ -680,13 +681,13 @@ struct StreamConfigCapture {
 }
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for StreamConfigCapture {
+impl agent::provider::StreamProvider for StreamConfigCapture {
     async fn stream(
         &self,
-        config: yoagent::provider::StreamConfig,
-        tx: mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        config: agent::provider::StreamConfig,
+        tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
         _cancel: CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         *self.captured.lock().unwrap() = (config.api_key.clone(), config.temperature);
         let msg = Message::assistant(
             vec![Content::Text {
@@ -697,8 +698,8 @@ impl yoagent::provider::StreamProvider for StreamConfigCapture {
             "mock",
             Usage::default(),
         );
-        let _ = tx.send(yoagent::provider::StreamEvent::Start);
-        let _ = tx.send(yoagent::provider::StreamEvent::Done {
+        let _ = tx.send(agent::provider::StreamEvent::Start);
+        let _ = tx.send(agent::provider::StreamEvent::Done {
             message: msg.clone(),
         });
         Ok(msg)
@@ -741,8 +742,8 @@ async fn test_sub_agent_env_key_fallback() {
         Arc::new(StreamConfigCapture {
             captured: captured.clone(),
         }),
-        yoagent::provider::ModelConfig::custom(
-            yoagent::provider::ApiProtocol::OpenAiCompletions,
+        agent::provider::ModelConfig::custom(
+            agent::provider::ApiProtocol::OpenAiCompletions,
             "minimax",
             "http://localhost:8080/v1",
             "m",
@@ -760,7 +761,7 @@ async fn test_sub_agent_from_provider_construction() {
     let tool = SubAgentTool::from_provider(
         "researcher",
         Arc::new(MockProvider::text("Research result")),
-        yoagent::provider::ModelConfig::mock(),
+        agent::provider::ModelConfig::mock(),
     )
     .with_description("Researches topics");
 
@@ -783,26 +784,26 @@ fn test_sub_agent_from_config_wires_model() {
     // from_config selects a built-in provider from config.api and sets the id.
     let tool = SubAgentTool::from_config(
         "analyst",
-        yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
+        agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
     );
     assert_eq!(tool.name(), "analyst");
 }
 
 #[test]
 fn test_sub_agent_from_config_with_errors_on_empty_registry() {
-    let registry = yoagent::provider::ProviderRegistry::new();
+    let registry = agent::provider::ProviderRegistry::new();
     let err = match SubAgentTool::from_config_with(
         &registry,
         "analyst",
-        yoagent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
+        agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"),
     ) {
         Ok(_) => panic!("empty registry must fail"),
         Err(e) => e,
     };
     assert_eq!(
         err,
-        yoagent::AgentBuildError::NoProviderForProtocol(
-            yoagent::provider::ApiProtocol::AnthropicMessages
+        agent::AgentBuildError::NoProviderForProtocol(
+            agent::provider::ApiProtocol::AnthropicMessages
         )
     );
 }
@@ -814,9 +815,9 @@ fn test_sub_agent_from_config_with_errors_on_empty_registry() {
 struct DenyAll;
 
 #[async_trait::async_trait]
-impl yoagent::ToolMiddleware for DenyAll {
-    async fn before_tool(&self, _call: &yoagent::ToolCallRequest<'_>) -> yoagent::ToolDecision {
-        yoagent::ToolDecision::Deny("sub-agent policy".into())
+impl agent::ToolMiddleware for DenyAll {
+    async fn before_tool(&self, _call: &agent::ToolCallRequest<'_>) -> agent::ToolDecision {
+        agent::ToolDecision::Deny("sub-agent policy".into())
     }
 }
 
@@ -864,10 +865,9 @@ async fn test_sub_agent_tool_middleware_denies() {
         MockResponse::Text("finished".into()),
     ]));
 
-    let tool =
-        SubAgentTool::from_provider("gated", provider, yoagent::provider::ModelConfig::mock())
-            .with_tools(vec![Arc::new(MustNotRun { ran: ran.clone() })])
-            .with_tool_middleware(DenyAll);
+    let tool = SubAgentTool::from_provider("gated", provider, agent::provider::ModelConfig::mock())
+        .with_tools(vec![Arc::new(MustNotRun { ran: ran.clone() })])
+        .with_tool_middleware(DenyAll);
 
     let result = tool
         .execute(
@@ -951,7 +951,7 @@ async fn a_scoped_sub_agent_stash_resolves_through_its_own_scoped_tool() {
     )
     .with_tools(vec![std::sync::Arc::new(BigOutputTool)])
     .with_scoped_shared_state(parent_view.clone(), "worker-1")
-    .with_context_config(yoagent::context::ContextConfig {
+    .with_context_config(agent::context::ContextConfig {
         tool_output_max_lines: 20,
         ..Default::default()
     });
@@ -1003,13 +1003,13 @@ struct PromptRecorder {
 }
 
 #[async_trait::async_trait]
-impl yoagent::provider::StreamProvider for PromptRecorder {
+impl agent::provider::StreamProvider for PromptRecorder {
     async fn stream(
         &self,
-        config: yoagent::provider::StreamConfig,
-        tx: tokio::sync::mpsc::UnboundedSender<yoagent::provider::StreamEvent>,
+        config: agent::provider::StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<agent::provider::StreamEvent>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message, yoagent::provider::ProviderError> {
+    ) -> Result<Message, agent::provider::ProviderError> {
         self.prompts
             .lock()
             .unwrap()
@@ -1056,7 +1056,7 @@ async fn stashed_output_does_not_leak_into_the_sub_agent_system_prompt() {
             .with_tools(vec![std::sync::Arc::new(BigOutputTool)])
             .with_system_prompt("You are a worker.")
             .with_shared_state(store)
-            .with_context_config(yoagent::context::ContextConfig {
+            .with_context_config(agent::context::ContextConfig {
                 tool_output_max_lines: 20,
                 ..Default::default()
             })
@@ -1199,7 +1199,7 @@ async fn a_turn_limited_sub_agent_returns_partial_work_and_says_so() {
         _ => panic!("expected text"),
     };
     assert!(
-        text.contains(yoagent::agent_loop::AGENT_STOPPED_PREFIX),
+        text.contains(agent::agent_loop::AGENT_STOPPED_PREFIX),
         "and the parent must be told the answer is partial: {text:?}"
     );
     assert!(

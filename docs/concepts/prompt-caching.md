@@ -1,6 +1,6 @@
 # Prompt Caching
 
-yoagent automatically optimizes API costs through prompt caching. For providers that support it, stable content (system prompts, tool definitions, conversation history) is cached between turns, giving you up to **90% savings** on input tokens.
+agent automatically optimizes API costs through prompt caching. For providers that support it, stable content (system prompts, tool definitions, conversation history) is cached between turns, giving you up to **90% savings** on input tokens.
 
 ## How It Works
 
@@ -22,7 +22,7 @@ Savings are the cached-read discount off base input in this crate's own price
 presets (`CostConfig`) — e.g. `gpt_5_5` prices input at $5/MTok and cache reads
 at $0.50. They are model-dependent; check `CostConfig` for the model you use.
 
-"Not wired" means the provider supports something and yoagent does not send it
+"Not wired" means the provider supports something and agent does not send it
 yet, as distinct from "None needed", where the provider caches on its own.
 
 Providers cache in two different shapes, and `CacheStrategy` means something
@@ -40,7 +40,7 @@ without knowing which shape produced it.** See the measured comparison below.
 
 ### What Gets Cached (Anthropic)
 
-yoagent places up to 3 cache breakpoints automatically:
+agent places up to 3 cache breakpoints automatically:
 
 1. **System prompt** — stable across all turns
 2. **Tool definitions** — rarely change between turns
@@ -51,7 +51,7 @@ This means on a typical multi-turn conversation, only the latest user message an
 ### OpenAI
 
 OpenAI caches prefixes of roughly 1024 tokens or more on its own, so there is
-nothing to place. What yoagent sends is `prompt_cache_key`, which routes a
+nothing to place. What agent sends is `prompt_cache_key`, which routes a
 request to a machine while the cache itself stays content-addressed.
 
 The key comes from `CacheConfig::session_key` when you set one, and is
@@ -60,7 +60,7 @@ prefix — the thing the provider actually caches — and `StreamConfig` carries
 in its own field, where compaction cannot reach it.
 
 An earlier version mixed in the first user message too, for session
-discrimination. It did not survive yoagent's own compaction: `compact_messages`
+discrimination. It did not survive agent's own compaction: `compact_messages`
 can drop the head and insert a *constant* marker at index 0 (constant on
 purpose, so the cached prefix stays byte-stable). The key drifted mid-session
 **and** every session sharing a system prompt collapsed onto one value —
@@ -88,7 +88,7 @@ never reading it.
 
 ### DeepSeek
 
-DeepSeek's API manages context caching automatically. yoagent does not send
+DeepSeek's API manages context caching automatically. agent does not send
 Anthropic-style `cache_control` markers for DeepSeek; instead, keep stable
 prefixes stable (system prompt, tool definitions, and earlier messages) and
 monitor DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
@@ -96,8 +96,8 @@ usage fields through `Usage.cache_read` and `Usage.input`.
 
 ### Google Gemini — implicit only, deliberately
 
-yoagent sends no cache directives to Gemini and ignores `CacheStrategy` there.
-Gemini caches implicitly, and the `cachedContentTokenCount` yoagent reads back
+agent sends no cache directives to Gemini and ignores `CacheStrategy` there.
+Gemini caches implicitly, and the `cachedContentTokenCount` agent reads back
 into `Usage.cache_read` reports that automatic behaviour — it is telemetry, not
 an acknowledgement of anything the client asked for.
 
@@ -117,13 +117,13 @@ Caching is **enabled by default** with automatic breakpoint placement. No config
 ### Disable Explicit Cache Hints
 
 ```rust
-use yoagent::{CacheConfig, CacheStrategy};
+use agent::{CacheConfig, CacheStrategy};
 
 let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude Sonnet 5"))
     .with_cache_config(CacheConfig::disabled());
 ```
 
-This suppresses every cache hint yoagent would send — Anthropic's
+This suppresses every cache hint agent would send — Anthropic's
 `cache_control` breakpoints and OpenAI's `prompt_cache_key` alike. It does
 **not** turn off a provider's automatic server-side caching, such as DeepSeek's
 or Gemini's, which is not under client control.
@@ -180,7 +180,7 @@ Everything above is about placing cache breakpoints correctly. That only pays of
 
 A cache hit requires the new request to share a **byte-identical prefix** with the previous one. So the moment compaction rewrites a message that has already been sent, every token from that point onward is uncached and billed at full price. Before 0.15, compaction decided purely on a token budget and never counted that cost.
 
-yoagent 0.15 treats this as a first-class design constraint, in three parts.
+agent 0.15 treats this as a first-class design constraint, in three parts.
 
 ### 1. History stops churning
 
@@ -256,7 +256,7 @@ The 4% that is *not* proportional is the genuinely free part, and it comes from 
 
 ### Measured effect
 
-`tests/context_cache_test.rs` replays a session through compaction turn by turn, renders each turn as a provider body would see it, and measures the shared prefix between consecutive requests — the direct analogue of DeepSeek's `prompt_cache_hit_tokens / prompt_tokens`. The tool mix (bash 41%, edit/write 36%, read 19%, search 4%) and file-size distribution come from 808 archived runs of a production agent built on yoagent. Old and new are measured through the identical code path, on a 128K window.
+`tests/context_cache_test.rs` replays a session through compaction turn by turn, renders each turn as a provider body would see it, and measures the shared prefix between consecutive requests — the direct analogue of DeepSeek's `prompt_cache_hit_tokens / prompt_tokens`. The tool mix (bash 41%, edit/write 36%, read 19%, search 4%) and file-size distribution come from 808 archived runs of a production agent built on agent. Old and new are measured through the identical code path, on a 128K window.
 
 | session | 0.14.2 hit rate | 0.15.0 hit rate | 0.14.2 rewrites | 0.15.0 rewrites |
 |---|---|---|---|---|
@@ -339,7 +339,7 @@ that run is an exact multiple of 64 — so a trailing partial block is always
 uncached. That alone caps a single turn a fraction of a point below 100%.
 
 **Session rates are close; the mechanisms are not.** Both providers land near
-80%, even though yoagent places explicit `cache_control` breakpoints for
+80%, even though agent places explicit `cache_control` breakpoints for
 Anthropic and sends nothing at all to DeepSeek. What differs is where the cost
 falls.
 
