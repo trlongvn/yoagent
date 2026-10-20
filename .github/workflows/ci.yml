@@ -14,6 +14,41 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # Which integration crates a change can affect, so their slow jobs (Node and
+  # Python runtimes, wasm tooling) skip PRs that touch neither them nor the
+  # core they build against. A push to main or a release branch runs them all.
+  # None of these jobs is a required check, so a skipped one blocks nothing.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      workers: ${{ steps.paths.outputs.workers }}
+      rutis: ${{ steps.paths.outputs.rutis }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "not a pull request: every integration job runs"
+            for c in workers rutis; do echo "$c=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE"...HEAD)
+          printf '%s\n' "$changed"
+          # The core every integration builds against (by path), and CI itself.
+          core='^(src/|Cargo\.toml$|Cargo\.lock$|\.cargo/|\.github/)'
+          touches() { printf '%s\n' "$changed" | grep -Eq "$1"; }
+          out() { if touches "$2"; then echo "$1=true"; else echo "$1=false"; fi >> "$GITHUB_OUTPUT"; }
+          out workers "$core|^integrations/yoagent-workers/"
+          out rutis "$core|^integrations/yoagent-rutis/"
+          cat "$GITHUB_OUTPUT"
+
   check:
     name: Check & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -33,6 +68,9 @@ jobs:
       - name: Format
         run: cargo fmt -- --check
 
+      - name: Documentation
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features
 
@@ -42,8 +80,21 @@ jobs:
       - name: Build
         run: cargo build --all-features
 
-  # Every job above builds `--all-features`, but `openapi` and `gasp` are both
-  # off by default — so the feature set a `cargo add agent` user actually gets
+      # Compiling an example does not prove it still shows what it claims.
+      # These run offline on a scripted MockProvider and assert their own
+      # outcome, so a behaviour change fails here (each takes well under a
+      # second once built).
+      - name: Run offline examples
+        run: |
+          for example in extension_policy extension_redact extension_verifier \
+                         extension_budget extension_tree extension_audit; do
+            echo "::group::$example"
+            cargo run --all-features --example "$example"
+            echo "::endgroup::"
+          done
+
+  # Every job above builds `--all-features`, but `openapi`, `gasp` and `decision` are all
+  # off by default — so the feature set a `cargo add yoagent` user actually gets
   # was never compiled here. A `#[cfg(feature = ...)]` mistake that leaves an
   # import or a type reachable only with a feature on would pass all-features CI
   # and break on crates.io. One OS is enough: feature gating is not OS-specific.
@@ -60,6 +111,13 @@ jobs:
             flags: "--features openapi"
           - name: gasp
             flags: "--features gasp"
+          - name: decision
+            flags: "--features decision"
+          # Native without the default `native` feature: the library, its
+          # tests and examples must still build (targets that need the
+          # feature declare `required-features = ["native"]`).
+          - name: no-default
+            flags: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +128,93 @@ jobs:
         run: cargo clippy --all-targets ${{ matrix.flags }}
       - name: Test
         run: cargo test ${{ matrix.flags }}
+
+  # The agent loop without the `native` feature, as a Cloudflare Worker builds
+  # it: lints, then runs `tests/wasm32.rs` under Node.
+  wasm32:
+    name: Check (wasm32, no default features)
+    runs-on: ubuntu-latest
+    # A broken timer or spawn shim hangs under Node rather than failing.
+    timeout-minutes: 15
+    env:
+      # Bans calls that compile for wasm32 but panic there (std clocks, Tokio).
+      CLIPPY_CONF_DIR: .github/clippy-wasm32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features
+      - name: Clippy (decision)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features decision
+      # Lint can't see code that compiles for wasm32 but panics or hangs there,
+      # so `tests/wasm32.rs` runs under Node. The runner must match the
+      # wasm-bindgen version this run resolved (Cargo.lock is not committed).
+      - name: Install wasm-bindgen-test-runner
+        run: |
+          version=$(cargo metadata --format-version 1 \
+            | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - name: Test (Node)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --target wasm32-unknown-unknown --no-default-features --test wasm32
+
+  # yoagent-workers (integrations/yoagent-workers): Cloudflare Workers bindings.
+  # It exists only on wasm32, so it is linted for wasm32 and its tests run
+  # under Node against fake bindings, like the core's wasm32 suite.
+  workers-bindings:
+    name: yoagent-workers
+    needs: changes
+    if: needs.changes.outputs.workers == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MANIFEST: integrations/yoagent-workers/Cargo.toml
+      # Absolute: clippy reads it from the nested package's directory.
+      CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/clippy-wasm32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            integrations/yoagent-workers
+            integrations/yoagent-workers/examples/clef-worker
+      - name: Format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --target wasm32-unknown-unknown --all-targets
+      - name: Documentation
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps --target wasm32-unknown-unknown
+      # The example Worker (its own workspace): it must keep compiling against
+      # the code beside it. Type-checked and linted only; it is not built with
+      # worker-build or run (that needs a Cloudflare account).
+      - name: Example Worker (clef-worker)
+        run: |
+          cargo fmt --manifest-path integrations/yoagent-workers/examples/clef-worker/Cargo.toml -- --check
+          cargo clippy --manifest-path integrations/yoagent-workers/examples/clef-worker/Cargo.toml --target wasm32-unknown-unknown
+      # On other targets the crate is empty; keep that true (no stray
+      # un-gated item) and its docs clean.
+      - name: Native build and docs
+        run: |
+          cargo check --manifest-path "$MANIFEST"
+          RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps
+      - name: Install wasm-bindgen-test-runner
+        run: |
+          version=$(cargo metadata --manifest-path "$MANIFEST" --format-version 1 \
+            | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - name: Test (Node)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --manifest-path "$MANIFEST" --target wasm32-unknown-unknown
 
   # Built-in tools shell out to unix commands, so Windows only checks compilation.
   windows-check:
@@ -89,10 +234,156 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
+      # resolver = "3" skips dependency versions whose declared rust-version is
+      # too new, but a crate that declares none is taken at its newest.
+      # yoke-derive 0.8.3 (2026-09-15, no rust-version) needs a std API newer
+      # than 1.86; hold it at 0.8.2 here only — published consumers resolve
+      # their own lockfile and are unaffected.
+      - name: Pin transitive deps that dropped 1.86 without declaring it
+        run: cargo update -p yoke-derive --precise 0.8.2
       - name: Check
         run: cargo check --all-features
 
-  # agent claims to be a tested GASP-conformant runtime — this job is the
+  # The rutis bridge is its own crate (its own Cargo.toml, not a workspace
+  # member, not in the published yoagent package). It depends on yoagent by
+  # path, so it is built against this checkout; `rutis` is pinned exactly.
+  rutis-bridge:
+    name: yoagent-rutis bridge
+    needs: changes
+    if: needs.changes.outputs.rutis == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MANIFEST: integrations/yoagent-rutis/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            integrations/yoagent-rutis
+            integrations/yoagent-rutis/examples/rutis-agent-tools
+      - name: Format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path "$MANIFEST" --all-targets
+      - name: Documentation
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps
+      - name: Test
+        run: cargo test --manifest-path "$MANIFEST"
+      - name: Example
+        run: cargo run --manifest-path "$MANIFEST" --example policy_plugin
+      # rutis-agent's tools through the bridge (its own workspace; rutis-agent
+      # from git at rutis v0.9.1): one of the ecosystems the extensions guide
+      # names, kept working here. Scripted, no network beyond the git fetch.
+      - name: rutis-agent example
+        run: cargo run --manifest-path integrations/yoagent-rutis/examples/rutis-agent-tools/Cargo.toml
+
+  # The bridge declares rust-version 1.88, the rutis 0.9 release train's MSRV
+  # (yoagent's own is 1.86). Mirrors the `msrv` job above, including its
+  # yoke-derive pin; the language features build there too.
+  rutis-bridge-msrv:
+    name: yoagent-rutis MSRV (1.88)
+    needs: changes
+    if: needs.changes.outputs.rutis == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MANIFEST: integrations/yoagent-rutis/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/yoagent-rutis
+      # yoke-derive 0.8.3 declares no rust-version; held at 0.8.2 as in `msrv`.
+      - name: Pin transitive deps that declare no rust-version
+        run: |
+          cargo generate-lockfile --manifest-path "$MANIFEST"
+          cargo update --manifest-path "$MANIFEST" -p yoke-derive --precise 0.8.2
+      - name: Check
+        run: cargo check --manifest-path "$MANIFEST" --all-targets
+      - name: Check with the language features (rutis-bridge 0.9)
+        run: cargo check --manifest-path "$MANIFEST" --all-targets --features node,python,bun,go,websocket
+
+  # TypeScript (Node and Bun 1.4), Python and Go (1.24) plugins through rutis-bridge 0.9, end to end: real
+  # Node 22 (the floor: pi needs 22.19, rutis 0.9 22)
+  # and Python 3.12 runtimes load the example plugins and fixtures as
+  # rutis-loader rows. The npm and PyPI packages are pinned to the 0.9.1
+  # train (plugins/package-lock.json, plugins/requirements.txt). A missing
+  # runtime fails the job instead of skipping (YOAGENT_RUTIS_REQUIRE_RUNTIMES).
+  rutis-bridge-languages:
+    name: yoagent-rutis TypeScript / Bun / Python / Go plugins
+    needs: changes
+    if: needs.changes.outputs.rutis == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MANIFEST: integrations/yoagent-rutis/Cargo.toml
+      PLUGINS: integrations/yoagent-rutis/plugins
+      YOAGENT_RUTIS_REQUIRE_RUNTIMES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/yoagent-rutis
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # npm's download cache (~/.npm), keyed on the three lockfiles: the
+          # installs below (pi's alone is ~185 MB) stop re-downloading.
+          cache: npm
+          cache-dependency-path: |
+            integrations/yoagent-rutis/plugins/package-lock.json
+            integrations/yoagent-rutis/plugins/dsh/package-lock.json
+            integrations/yoagent-rutis/plugins/pi/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The Bun runtime's tests (languages_test `a_bun_…`): rutis-bun needs 1.4+.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4"
+      # The Go plugin's test (tests/go_test.rs) builds plugins/go: the rutis
+      # Go SDK's floor.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: integrations/yoagent-rutis/plugins/go/go.sum
+      - name: Install the rutis npm packages
+        run: npm ci --prefix "$PLUGINS"
+      # The dsh adapter's end-to-end test (tests/dsh_test.rs): dsh-tools,
+      # dsh-system-prompt and the adapter's other pins, in their own install.
+      - name: Install the dsh npm packages
+        run: npm ci --prefix "$PLUGINS/dsh"
+      # The pi adapter's end-to-end test (tests/pi_test.rs): pi's own
+      # packages (its extension loader, TypeBox), in their own install.
+      - name: Install the pi npm packages
+        run: npm ci --prefix "$PLUGINS/pi"
+      - name: Install the rutis Python package
+        run: |
+          python -m venv "$PLUGINS/.venv"
+          "$PLUGINS/.venv/bin/pip" install -r "$PLUGINS/requirements.txt"
+      - name: Clippy (each language feature, and all)
+        run: |
+          for features in node python bun go websocket node,python,bun,go,websocket; do
+            cargo clippy --manifest-path "$MANIFEST" --all-targets --features "$features"
+          done
+      - name: Documentation
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps --features node,python,bun,go,websocket
+      - name: Test
+        run: cargo test --manifest-path "$MANIFEST" --features node,python,bun,go,websocket
+      - name: Example
+        run: cargo run --manifest-path "$MANIFEST" --features node,python --example language_plugins
+      - name: pi extensions example (scripted, the fixture extension)
+        run: cargo run --manifest-path "$MANIFEST" --features node --example pi_extensions
+
+  # yoagent claims to be a tested GASP-conformant runtime — this job is the
   # test: emit an agent repo with the gasp bridge (mock provider, no network)
   # and run the protocol's conformance checker against it.
   gasp-conformance:

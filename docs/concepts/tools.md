@@ -5,8 +5,9 @@
 Every tool implements `AgentTool`:
 
 ```rust
-#[async_trait]
-pub trait AgentTool: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait AgentTool: rt::MaybeSend + rt::MaybeSync {
     fn name(&self) -> &str;
     fn label(&self) -> &str;
     fn description(&self) -> &str;
@@ -18,6 +19,10 @@ pub trait AgentTool: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 ```
+
+`rt::MaybeSend + rt::MaybeSync` is exactly `Send + Sync` on native targets, so
+a plain `#[async_trait]` impl is unchanged there. On wasm32 the bound is empty;
+see [WebAssembly & Cloudflare Workers](../guides/wasm-workers.md).
 
 | Method | Purpose |
 |--------|---------|
@@ -49,7 +54,10 @@ pub struct ToolContext {
 | `on_update` | Callback for streaming partial `ToolResult` updates to the UI (emits `ToolExecutionUpdate`) |
 | `on_progress` | Callback for emitting user-facing progress messages (emits `ProgressMessage`) |
 
-`ToolContext` implements `Clone` and `Debug`.
+`ToolContext` implements `Clone` and `Debug`. It is `#[non_exhaustive]`: outside
+the loop (tests, or driving a tool directly) build one with
+`ToolContext::new(id, name)` and its `with_*` builders. Delegation tools report
+a child run's stats with `ctx.report_delegated_run(..)`.
 
 ## ToolResult
 
@@ -123,6 +131,11 @@ impl AgentTool for WeatherTool {
 }
 ```
 
+> The built-in tools (`BashTool`, `ReadFileTool`, `WriteFileTool`,
+> `EditFileTool`, `ListFilesTool`, `SearchTool`) and `default_tools()` need the
+> default `native` feature. They do not exist with `default-features = false`
+> or on wasm32.
+
 Register custom tools alongside defaults:
 
 ```rust
@@ -147,7 +160,7 @@ let tools: Vec<Box<dyn AgentTool>> = vec![
 ];
 ```
 
-Enforcement is against the **resolved** path, not the string, so neither `..` nor a symlink pointing outside can escape — and a file that does not exist yet still resolves through its real parent, so writes are checked too. The rejection message deliberately does not echo the allowed roots, since tool results reach the model's transcript.
+Enforcement is against the **resolved** path, not the string, so neither `..` nor a symlink pointing outside can escape. That includes a dangling symlink, which a write would follow to create its target; a symlink loop is refused. A file that does not exist yet still resolves through its real parent, so writes are checked too, and the tool then does its I/O on the path it checked. Before 0.24.2, a `..` after a not-yet-existing directory, or a dangling symlink, could get past the check. Something changing the tree between the check and the I/O, such as a parallel `bash` call, is not covered. The rejection message deliberately does not echo the allowed roots, since tool results reach the model's transcript.
 
 ## `BashTool` is not a sandbox
 
@@ -155,7 +168,7 @@ Enforcement is against the **resolved** path, not the string, so neither `..` no
 
 `deny_patterns` is a substring check that catches typos and obvious mistakes — `rm  -rf /` with two spaces, a base64-decoded pipe, or an equivalent `find -delete` all sail past it. Treat it as a guardrail, never as a security boundary.
 
-Real isolation belongs outside the tool: run the agent in a container or VM, or gate calls through [`ToolMiddleware`](#tool-middleware), which sees the arguments before execution and can deny them.
+Real isolation belongs outside the tool: run the agent in a container or VM, or gate calls through [`ToolMiddleware`](#permissions-tool-middleware), which sees the arguments before execution and can deny them.
 
 For credentials specifically, commands inherit every environment variable the agent process holds — including any `*_API_KEY`. When the model composes the command, restrict what it can read:
 
@@ -183,7 +196,9 @@ async fn execute(&self, params: serde_json::Value, _ctx: ToolContext) -> Result<
 }
 ```
 
-**Exception: BashTool.** The built-in `BashTool` returns `Ok` even on non-zero exit codes, with both stdout and stderr in the result. This is intentional — the LLM needs to see the actual error output (compilation errors, test failures, etc.) to diagnose and fix issues. Only truly exceptional failures (e.g., command not found, cancellation) return `Err`.
+**Exception: BashTool.** The built-in `BashTool` returns `Ok` even on non-zero exit codes, with both stdout and stderr in the result. This is intentional — the LLM needs to see the actual error output (compilation errors, test failures, etc.) to diagnose and fix issues. Only failures outside the command return `Err`: a matched deny pattern, a refused confirmation, a timeout (its message carries the output printed so far), cancellation, or `bash` failing to start. A command that does not exist is an ordinary non-zero exit (127). On Unix, a timeout, a cancel or dropping the call kills the command's whole process group — pipeline stages, commands in a `&&` list and background jobs included; only a process that starts its own session (`setsid`) escapes. A command that finishes on its own leaves a background job alone if the job's output is redirected away from the tool (`npm run dev >dev.log 2>&1 &`); a job still writing to the tool's output keeps the call open until the timeout, which kills it. Because the command runs in its own process group, the terminal's Ctrl+C no longer reaches it: a host should cancel or drop the call on Ctrl+C (the CLI example aborts the run), and a command that prompts on `/dev/tty` (`sudo`, an SSH passphrase) stops until the timeout. On Windows only the `bash` process is killed.
+
+**A panicking tool** is contained by the loop, the same as a panicking middleware. The call ends as an error result (`tool '<name>' panicked: …`) that the model sees, and the run continues.
 
 ## Tool Execution Flow
 
@@ -368,8 +383,8 @@ impl AgentTool for DeployTool {
                 });
             }
 
-            // Simulate work
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Simulate work (`agent::rt::sleep` works on native and wasm32)
+            agent::rt::sleep(std::time::Duration::from_secs(2)).await;
         }
 
         // Only this final result is sent to the LLM
@@ -447,6 +462,68 @@ When an AI agent (like a coding assistant) uses agent, streaming tool output hel
 2. **Agent UIs** — Tools like web dashboards, IDE extensions, or chat interfaces can render live progress bars, log tails, or status indicators. The `details` field in `ToolResult` carries structured data (progress percentage, byte counts, etc.) that UIs can render however they want.
 
 The LLM itself doesn't see updates — it works with final results only. This is intentional: partial output would waste context tokens and confuse the model. The streaming is purely a **human-facing** feature.
+
+## Tools That Change at Runtime: `ToolSource`
+
+`with_tools` fixes an agent's tool list until you replace it. When the set of
+tools changes while the agent lives — plugins loaded and unloaded, an MCP
+server that reconnects with a different list, a feature flag — add a
+`ToolSource` instead:
+
+```rust
+use std::sync::{Arc, Mutex};
+use agent::{Agent, AgentTool, ToolSource};
+
+struct Swappable(Mutex<Vec<Arc<dyn AgentTool>>>);
+
+#[async_trait::async_trait]
+impl ToolSource for Swappable {
+    async fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+let agent = Agent::from_provider(provider, config)
+    .with_tools(my_static_tools)
+    .with_tool_source(Arc::new(Swappable(Mutex::new(vec![]))));
+```
+
+The contract:
+
+- **Consulted once per run.** Every `prompt*` and `continue_loop*` call asks
+  each source for its tools before the first request; the list is then fixed
+  for that run. A tool withdrawn mid-run stays offered until the run ends (make
+  it fail cleanly if its backend is gone); a tool added mid-run is offered from
+  the next run. Changing the list turn to turn could strand a call the model
+  already made.
+- **Prompt caching.** Tool definitions open the provider's cached prefix, so
+  *any* change to the offered set rewrites the whole cache. Per-run
+  consultation bounds that cost to run boundaries — it does not prevent it: a
+  run whose set differs from the previous run's pays a full prefix rewrite.
+  Order alone never costs anything: sourced tools are sorted by name after
+  collisions are resolved (the agent's own tools keep their order).
+- **No timeout.** The run waits for every source. On an `Agent`, dropping the
+  prompt future while it waits is the escape (sources are consulted before
+  any agent state is touched); a `SubAgentTool` stops waiting when the parent
+  run is cancelled.
+- **For that run only.** Sourced tools are appended after the agent's own
+  tools and dropped again when the run ends; they never join `with_tools`'
+  list. A model that calls a tool that is no longer offered gets the usual
+  `Tool … not found` error result.
+- **Name collisions.** Providers reject two tools with one name, so exactly
+  one survives: the agent's own tools (including the injected `shared_state`
+  tool) win, then earlier sources in installation order, then the earlier
+  tool within one source. Each dropped duplicate is logged with
+  `tracing::warn!`; the run is never refused.
+- **Failures.** A source that panics — while building its future or while it
+  runs — is contained, logged with the panic message, and contributes no
+  tools to that run.
+
+Several sources may be added. `SubAgentTool::with_tool_source` mirrors it —
+consulted once per delegation. An [extension](extensions.md)'s `tools` hook
+follows the same once-per-run rule; the [rutis bridge](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis)
+(`yoagent-rutis`) uses it, so an agent sees exactly the tools of the plugins
+loaded at each run start.
 
 ## Execution Strategies
 
@@ -536,3 +613,27 @@ serialize inside your middleware (e.g. a `tokio::sync::Mutex`) or switch to
 
 Sub-agents gate their own tool calls the same way via
 `SubAgentTool::with_tool_middleware`.
+
+Middleware can also see the conversation: `call.messages` is the loop's
+history (before `transform_context`, including the assistant message carrying
+the call), and `call.run_prompts` holds the user messages this run was given,
+which compaction cannot remove. For "what did the user ask?", use
+`call.user_request()`: it skips loop-injected messages
+(`agent::is_loop_injected`), never looks back past a compaction boundary,
+falls back to the run's prompts, and returns `None` when nothing says what the
+user wants — enough for policies such as "was this destructive call actually
+requested?". The [decision-model tool gate](decision-models.md#blocking-with_tool_gate)
+is one. `call.user_request_parts()` gives the same selection as structured
+`UserRequestParts` (`latest`, `reply`, `source`, `run_prompts`); the prose of
+`user_request()` is not a stable format.
+
+To unit-test a middleware without running an agent, build the request
+yourself:
+
+```rust
+let args = serde_json::json!({"path": "/tmp/x"});
+let prompts = [Message::user("delete /tmp/x")];
+let call = ToolCallRequest::new("call-1", "rm", &args)
+    .with_run_prompts(&prompts); // or .with_messages(&history)
+assert!(matches!(MyPolicy.before_tool(&call).await, ToolDecision::Allow));
+```

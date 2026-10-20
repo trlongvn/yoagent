@@ -14,8 +14,8 @@ In a multi-turn agent loop, each request sends the full context: system prompt +
 | **OpenAI** | Automatic (>1024 tokens), key-routed | 90% on hits | ✅ Sends `prompt_cache_key` |
 | **DeepSeek** | Automatic prefix cache | ~97% on hits | None needed |
 | **Google Gemini** | Implicit (automatic) | Varies | None needed — see below |
-| **Azure OpenAI** | Automatic (same as OpenAI) | 90% on hits | Not wired |
-| **OpenAI Responses** | Automatic, key-routed | 90% on hits | Not wired |
+| **Azure OpenAI** | Automatic (same as OpenAI), key-routed | 90% on hits | ✅ Sends `prompt_cache_key` |
+| **OpenAI Responses** | Automatic, key-routed | 90% on hits | ✅ Sends `prompt_cache_key` |
 | **Amazon Bedrock** | Explicit (`cachePoint` blocks) | — | Not wired |
 
 Savings are the cached-read discount off base input in this crate's own price
@@ -80,11 +80,19 @@ let agent = Agent::from_config(ModelConfig::openai("gpt-5.5", "GPT-5.5"))
 A blank key is treated as unset rather than sent literally — an empty
 `prompt_cache_key` would route every caller who did that onto one cache.
 
-This is gated on the `supports_prompt_cache_key` compat flag, which is on only
-for native OpenAI. `prompt_cache_key` is OpenAI's field: a strict
-OpenAI-compatible server that validates unknown keys would reject the whole
-request rather than ignore it, and the providers that cache automatically were
-never reading it.
+On Chat Completions this is gated on the `supports_prompt_cache_key` compat
+flag, which is on only for native OpenAI. `prompt_cache_key` is OpenAI's field:
+a strict OpenAI-compatible server that validates unknown keys would reject the
+whole request rather than ignore it, and the providers that cache automatically
+were never reading it.
+
+The **Responses API** ([OpenAI Responses](../providers/openai-responses.md),
+which the GPT-6 presets use, and [Azure OpenAI](../providers/azure-openai.md))
+gets the same key, chosen the same way, with no compat flag: the field is part
+of the Responses API itself, and Azure documents it too ("You don't need a
+specific API version to use `prompt_cache_key`"). Azure adds that above about
+15 requests a minute for one prefix and key, some requests may miss the cache —
+the same reason to set `session_key` for a hot system prompt.
 
 ### DeepSeek
 
@@ -184,7 +192,7 @@ agent 0.15 treats this as a first-class design constraint, in three parts.
 
 ### 1. History stops churning
 
-Compaction is a pure function of its input, and idempotent where it can be:
+Compaction is a pure function of its input, and idempotent where it can be. (On wasm32, `LlmCompaction` never summarises — there is no runtime to run the request on — so only its deterministic tiers apply.)
 
 - **Tool-output truncation fits its own budget.** The `[... N lines truncated ...]` marker is charged against `tool_output_max_lines`, so truncating an already-truncated result returns it byte for byte. Previously the marker pushed the result *over* the limit, so the next pass re-truncated it and restated the count — a second full-prefix invalidation on top of the first.
 - **Markers carry no drifting state.** The compaction marker's text is constant and generated summaries inherit the timestamp of what they replace, so the same history always compacts to the same bytes.
@@ -218,7 +226,7 @@ effective     = clamp( min(target / budget, compact_target_ratio), MIN_HEADROOM_
 - `turns` — `compact_headroom_turns`, how many more turns you want before the next compaction (default 30)
 - `growth_per_turn` — mean tokens added per turn, measured by the agent loop
 - `compact_target_ratio` — a **ceiling on retention**: the policy may compact harder than the ratio, never softer
-- `MIN_HEADROOM_RATIO` (0.15) — a floor, so runaway growth cannot ask compaction to discard everything
+- `MIN_HEADROOM_RATIO` (0.30; 0.15 before 0.22) — a floor, so runaway growth cannot ask compaction to discard everything. It was raised because compacting to 15% of the budget dropped the opening task prompt in most tool-heavy compactions; see [Compaction defaults](../evals/compaction-defaults.md)
 
 One interpretable knob — *how often am I willing to compact* — that behaves the same at turn 50 and turn 2400, and self-adjusts to workload: an agent producing huge tool output gets compacted harder automatically. It is also self-limiting; on short sessions where compaction is already rare, the derived ratio ties the fixed one and nothing changes.
 
@@ -248,7 +256,7 @@ Replaying a 2400-turn session at a 1:10 cache-to-input price ratio:
 
 The 4% that is *not* proportional is the genuinely free part, and it comes from compacting less often rather than from retaining less.
 
-**Above roughly 60 the setting stops doing anything.** The derived ratio hits [`MIN_HEADROOM_RATIO`] (0.15) and clamps, so 60, 80, 100 and 140 produce byte-identical runs. To compact harder than that, lower `compact_target_ratio` — it is the ceiling the headroom policy is capped by, not an independent knob.
+**Above roughly 60 the setting stops doing anything.** (These runs predate 0.22 and used the old 0.15 floor; with today's 0.30 floor the clamp is reached at a lower setting.) The derived ratio hits [`MIN_HEADROOM_RATIO`] and clamps, so 60, 80, 100 and 140 produce byte-identical runs. To compact harder than that, lower `compact_target_ratio` — it is the ceiling the headroom policy is capped by, not an independent knob.
 
 **Cheaper cache argues for a smaller context, not a larger one.** The same step from a fixed ratio to headroom 60 saves 19.4% at a 1:4 cache-to-input ratio and 26.0% at 1:50. That reads backwards until you notice that once cached tokens are nearly free per token, they dominate the *count* — and you are re-sending them on every request. Vendor ratios in practice run from about 1:10 to 1:50, so the payoff for a smaller working context is larger than a 1:4 assumption would suggest.
 
@@ -298,7 +306,7 @@ session. Compare rewrite counts, or compare dollars.
 
 ### Measured live: DeepSeek vs Anthropic
 
-`examples/llm_compaction_live.rs` runs a real multi-turn session and reports
+`examples/llm_compaction_live.rs` (run with `--features gasp`) runs a real multi-turn session and reports
 per-turn cache accounting. **"Not cached" means `input + cache_write`** — both
 halves are prompt tokens the provider had to process and bill for. Counting only
 `input` is the trap: Anthropic books a re-processed prefix to `cache_write` and
@@ -392,7 +400,7 @@ That is a consequence of the work above rather than an argument against the mode
 ## Best Practices
 
 1. **Keep system prompts stable** — changing the system prompt between turns invalidates the cache
-2. **Don't shuffle tools** — tool order matters for cache prefix matching
+2. **Don't shuffle tools** — tool order matters for cache prefix matching. Sourced tools ([`ToolSource`](tools.md#tools-that-change-at-runtime-toolsource)) are sorted by name, so order alone never costs anything, but any change to the *set* a source returns rewrites the cached prefix at the next run start
 3. **Let it work automatically** — the default `CacheStrategy::Auto` is optimal for most use cases
 4. **Monitor `cache_hit_rate()`** — if it's consistently low, check if your system prompt or tools are changing unexpectedly
 5. **Don't rewrite history yourself** — a custom `CompactionStrategy` or `transform_context` that edits already-sent messages costs the whole prefix from that point on. Append, or cut at a boundary and leave everything before it byte-identical.

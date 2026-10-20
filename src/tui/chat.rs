@@ -63,7 +63,7 @@ pub fn render_chat<'a>(entries: &'a [ChatEntry], theme: &'a Theme, area: Rect, b
 
         // Header
         lines.push(Line::from(vec![Span::styled(
-            format!("{label}"),
+            label.to_string(),
             label_style,
         )]));
         // Body

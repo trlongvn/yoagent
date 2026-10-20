@@ -15,10 +15,7 @@ use ::agent::agent_loop::{agent_loop, AgentLoopConfig};
 use ::agent::provider::mock::{MockResponse, MockToolCall};
 use ::agent::provider::{MockProvider, ProviderError, StreamConfig, StreamEvent, StreamProvider};
 use ::agent::types::*;
-use ::agent::{
-    AgentContext, AgentTool, CacheConfig, RetryConfig, ThinkingLevel, ToolContext, ToolError,
-    ToolExecutionStrategy, ToolResult,
-};
+use ::agent::{AgentContext, AgentTool, ToolContext, ToolError, ToolResult};
 
 // ---------------------------------------------------------------------------
 // Capturing provider — records every StreamConfig.messages it receives
@@ -102,34 +99,10 @@ fn make_config(
     provider: CapturingProvider,
     prepare_context: Option<::agent::PrepareContextFn>,
 ) -> AgentLoopConfig {
-    AgentLoopConfig {
-        provider: Arc::new(provider),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        tool_middleware: vec![],
-        output_schema: None,
-        retry_config: RetryConfig::default(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        turn_delay: None,
-    }
+    let mut config = AgentLoopConfig::new(Arc::new(provider), "mock");
+    config.api_key = "test".into();
+    config.prepare_context = prepare_context;
+    config
 }
 
 /// Extract the text of a `Message` (either User or ToolResult) if present.

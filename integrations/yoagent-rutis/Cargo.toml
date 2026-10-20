@@ -1,0 +1,117 @@
+[package]
+name = "yoagent-rutis"
+version = "0.3.1"
+edition = "2021"
+resolver = "3"
+description = "Extend yoagent agents at runtime with rutis plugins, as one yoagent Extension: tools, tool policy, output filters, turn notes, input checks, verifiers and events"
+license = "MIT"
+repository = "https://github.com/yologdev/yoagent"
+documentation = "https://docs.rs/yoagent-rutis"
+readme = "README.md"
+keywords = ["agent", "llm", "plugin", "rutis", "yoagent"]
+categories = ["asynchronous", "development-tools"]
+authors = ["Yuanhao <yuanhao@yolog.dev>"]
+# Installed locally for the end-to-end tests, the rutis-agent example (its
+# own workspace) and the notes for coding agents: never packaged.
+exclude = [
+    "CLAUDE.md",
+    "plugins/node_modules",
+    "plugins/.venv",
+    "plugins/dsh/node_modules",
+    "plugins/pi/node_modules",
+    "examples/rutis-agent-tools",
+]
+# The rutis 0.9 release train declares 1.88 (yoagent's own MSRV is 1.86).
+rust-version = "1.88"
+
+[dependencies]
+# The path's version (0.25 is the first release with `Extension`). yoagent
+# types are in this crate's API: a yoagent minor bump is a minor bump here.
+yoagent = { path = "../..", version = "0.25.1" }
+# 0.x caret: 0.9.x only (0.10 would be breaking). Any rutis minor bump is a
+# yoagent-rutis minor bump — its types are part of this crate's API. Since
+# 0.8 the packages in rutis's release train share one version.
+rutis = "0.9"
+# TypeScript / Python plugins and remote nodes (the `node`, `python` and
+# `websocket` features). Same train version as rutis; any rutis-bridge
+# minor bump is a yoagent-rutis minor bump too.
+rutis-bridge = { version = "0.9", optional = true, default-features = false }
+async-trait = "0.1"
+# Decodes plugin images to check them (yoagent itself uses 0.22).
+base64 = "0.22"
+futures = "0.3"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# Same crate rutis hands its cancellation tokens out as.
+tokio-util = "0.7"
+tracing = "0.1"
+
+[package.metadata.docs.rs]
+features = ["node", "python", "bun", "go", "websocket"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Rust plugins only. Each language feature provides the `yoagent` host
+# service to plugins in other languages, through rutis-bridge.
+default = []
+# TypeScript / JavaScript plugins in local Node runtimes (Unix).
+node = ["rutis-bridge/node"]
+# Go plugins (Go 1.24+, the rutis Go SDK): one binary per runtime, started
+# when a row needs it (Unix).
+go = ["rutis-bridge/go"]
+# Python plugins in local Python runtimes (Unix).
+python = ["rutis-bridge/python"]
+# TypeScript / JavaScript plugins in local Bun runtimes (Bun 1.4+, Unix).
+bun = ["rutis-bridge/bun"]
+# Remote nodes and runtimes over WebSocket (rustls).
+websocket = ["rutis-bridge/websocket"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Loads language plugins as rows in the end-to-end tests. The bridge never
+# loads plugins itself: that is the host's job.
+rutis-loader = { version = "0.9", features = ["node", "python", "bun", "go"] }
+tempfile = "3"
+# Captures the bridge's `log` output in its own test binary (tests/plugin_log_test.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+
+[[test]]
+name = "go_test"
+required-features = ["go"]
+
+[[test]]
+name = "languages_test"
+required-features = ["node", "python"]
+
+[[test]]
+name = "dsh_test"
+required-features = ["node"]
+
+[[test]]
+name = "pi_test"
+required-features = ["node"]
+
+[[test]]
+name = "plugin_log_test"
+required-features = ["node"]
+
+[[test]]
+name = "pi_log_test"
+required-features = ["node"]
+
+[[example]]
+name = "language_plugins"
+required-features = ["node", "python"]
+
+[[example]]
+name = "dsh_tools"
+required-features = ["node"]
+
+[[example]]
+name = "pi_extensions"
+required-features = ["node"]
+
+[[example]]
+name = "ecosystem_probe"
+required-features = ["node"]

@@ -4,22 +4,25 @@
   <img alt="agent" src="docs/images/banner.png" width="100%" height="auto">
 </picture>
 
-<a href="https://crates.io/crates/yoagent">crates.io</a> · <a href="https://yologdev.github.io/yoagent/">Docs</a> · <a href="https://docs.rs/yoagent">API</a> · <a href="https://github.com/yologdev/yoagent">GitHub</a> · <a href="https://deepwiki.com/yologdev/yoagent">DeepWiki</a> · <a href="CHANGELOG.md">Changelog</a>
+<a href="#quick-start">Getting started</a> · <a href="https://yologdev.github.io/yoagent/design-philosophy.html">Design philosophy</a> · <a href="https://yologdev.github.io/yoagent/">Docs</a> · <a href="https://docs.rs/yoagent">API</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="README.zh-CN.md">中文</a>
 
 [![][crates-shield]][crates-link]
 [![][docsrs-shield]][docsrs-link]
 [![][ci-shield]][ci-link]
 [![][msrv-shield]][msrv-link]
 [![][license-shield]][license-link]
+[![][deepwiki-shield]][deepwiki-link]
 
 **The agent loop for Rust.** Stream from any of 7 LLM protocols, run tools, loop until done.
+
+[A loop library, not an agent](https://yologdev.github.io/yoagent/design-philosophy.html): it powers [yoyo](https://github.com/yologdev/yoyo-evolve), a coding agent evolving its own source since March 2026, and runs from a laptop to a Cloudflare Worker.
 
 </div>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/loop.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/images/loop-light.svg">
-  <img alt="The agent loop: prompt, LLM stream, tool execution, loop" src="docs/images/loop.svg" width="100%">
+  <img alt="The yoagent loop: prompt, context, LLM stream, tool calls through a gate and back, a finish check, limits, and the Extension hooks at each step" src="docs/images/loop.svg" width="100%">
 </picture>
 
 ---
@@ -27,8 +30,9 @@
 ## Try it in one command — no API key
 
 ```bash
-git clone https://github.com/yologdev/yoagent && cd agent
-ollama serve &                                    # any local model works
+git clone https://github.com/yologdev/yoagent && cd yoagent
+ollama serve &
+ollama pull llama3.1:8b                           # or pass --model <any pulled model>
 cargo run --example cli -- --provider ollama
 ```
 
@@ -58,7 +62,7 @@ Point it at a hosted model instead by swapping the flag:
 
 ```bash
 ANTHROPIC_API_KEY=sk-... cargo run --example cli
-GROQ_API_KEY=...        cargo run --example cli -- --provider groq --model llama-3.3-70b-versatile
+GROQ_API_KEY=...        cargo run --example cli -- --provider groq --model openai/gpt-oss-120b
 cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model   # LM Studio, llama.cpp, vLLM
 ```
 
@@ -68,9 +72,14 @@ cargo run --example cli -- --api-url http://localhost:1234/v1 --model my-model  
 
 ```toml
 [dependencies]
-agent = "0.15"
+yoagent = "0.25"
 tokio = { version = "1", features = ["full"] }
 ```
+
+Building for wasm32? Use `default-features = false` (see
+[WebAssembly & Cloudflare Workers](https://yologdev.github.io/yoagent/guides/wasm-workers.html)).
+On a native target keep the default `native` feature: without it reqwest has no TLS, and every
+HTTPS provider call fails at runtime.
 
 ## Quick start
 
@@ -106,18 +115,24 @@ Swap the model by swapping the config — the provider follows, and the key is r
 provider's conventional env var:
 
 ```rust
-Agent::from_config(ModelConfig::groq("llama-3.3-70b-versatile", "Llama 3.3 70B")); // GROQ_API_KEY
-Agent::from_config(ModelConfig::google("gemini-2.5-pro", "Gemini 2.5 Pro"));       // GEMINI_API_KEY
-Agent::from_config(ModelConfig::ollama("http://localhost:11434", "llama3.1:8b"));  // no key
+Agent::from_config(ModelConfig::groq("openai/gpt-oss-120b", "GPT-OSS 120B"));    // GROQ_API_KEY
+Agent::from_config(ModelConfig::google("gemini-3.8-flash", "Gemini 3.8 Flash")); // GEMINI_API_KEY
+Agent::from_config(ModelConfig::ollama("http://localhost:11434/v1", "llama3.1:8b")); // no key
 ```
 
 ---
 
-## How agent differs
+## Why yoagent
 
-agent is deliberately narrow. It is the loop, tool execution, and the machinery you need to
-run that loop in production. It ships **no** vector stores, embedding pipelines, or task-graph
-layer — if your problem is retrieval or orchestration, one of these is the better fit:
+Every agent runs the same loop, and almost every hand-written one gets the same things wrong:
+streams that end badly, tools that panic or hang, context that runs out, runs that never stop,
+spend nobody can account for. yoagent writes that loop once, with each guarantee pinned by a
+test, and keeps one rule for what goes in: **does every agent need it, the same way?** Anything
+else is an extension, a feature or a companion crate
+([design philosophy](https://yologdev.github.io/yoagent/design-philosophy.html)).
+
+So it ships **no** vector stores, embedding pipelines, or task-graph layer — if your problem is
+retrieval or orchestration, one of these is the better fit:
 
 | If you need | Look at |
 |---|---|
@@ -134,9 +149,11 @@ What that focus bought:
   Messages, OpenAI Completions, OpenAI Responses, Azure, Gemini, Vertex, and Bedrock each have a
   real implementation, so provider-specific features (thinking budgets, prompt-cache breakpoints,
   reasoning deltas) survive instead of being flattened away.
-- **Every tool call passes one gate.** `ToolMiddleware` can allow, **modify**, or deny each call
-  at a single choke point shared by all execution strategies — the mechanism behind approval
-  prompts and policy engines.
+- **One plug-in contract for the whole run.** An `Extension` can add tools, check input, allow,
+  **modify** or deny each tool call, redact results, and check the final answer, with state
+  that starts fresh each run. Install it as host policy and it governs every sub-agent too.
+  Hooks that guard a call fail closed: a policy that cannot run denies, an input check rejects,
+  a redaction that fails withholds.
 - **Steer a run that's already going.** Inject guidance mid-flight; it's picked up between tool
   batches without restarting the turn.
 - **History is a tree, not a list.** [`Session`](src/session.rs) forks, checkpoints, and seeks.
@@ -145,7 +162,62 @@ What that focus bought:
   event log in a git repo — restore is clone + replay. Conformance-checked in CI.
 - **The whole loop is testable offline.** `MockProvider` scripts multi-turn tool-calling
   conversations and honours cancellation, so abort and steering paths are testable with no
-  network. 456 of our 463 tests need no key.
+  network or key.
+
+---
+
+## Extend it
+
+Everything that changes what the loop does goes through one contract, `Extension`: its run's
+`RunHooks` see `on_input`, `before_model`, `before_tool`, `after_tool`, `on_stop`, every event,
+and `finish`. A tool policy is a few lines:
+
+```rust
+use yoagent::extension::{ClonedHooks, RunHooks};
+use yoagent::{ToolCallRequest, ToolDecision};
+
+#[derive(Clone)]
+struct NoForcePush;
+
+#[async_trait::async_trait] // the `async-trait` crate
+impl RunHooks for NoForcePush {
+    async fn before_tool(&self, call: &ToolCallRequest<'_>) -> ToolDecision {
+        let command = call.args["command"].as_str().unwrap_or_default();
+        if command.contains("push --force") {
+            ToolDecision::Deny("force-push is not allowed here".into())
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+let agent = agent.with_extension(ClonedHooks::new("no-force-push", NoForcePush));
+```
+
+yoagent's own budget, tool gate and input guard are built the same way. Six runnable
+`extension_*` examples cover policies, redaction, verifiers, budgets, sub-agent policy and
+audit logs ([guide](https://yologdev.github.io/yoagent/concepts/extensions.html)).
+
+**Plugins and other ecosystems.** [`yoagent-rutis`](integrations/yoagent-rutis/) turns
+[rutis](https://github.com/arcships/rutis) plugins — Rust, TypeScript or Python, loaded,
+reloaded and unloaded at runtime — into one `Extension`. Through small adapters it also runs many
+[pi](https://github.com/earendil-works/pi) extensions and DeepSeek harness (DSH) tool plugins unchanged, with no
+change to yoagent's core: tools, tool policies, input checks, prompt additions and images cross
+over; commands and UI don't. An extension that hooks something the adapter can't enforce is
+refused, not half-run. How the 20 most-downloaded packages of each ecosystem fare (by monthly
+downloads, among npm's first 1000 search results per keyword), measured:
+[plugin compatibility](https://yologdev.github.io/yoagent/evals/plugin-compatibility.html).
+Agents built this way — a coding agent with pi and DSH plugins in your browser, a handoff agent
+that asks without waiting and reports back — live in [yobuild](https://github.com/yologdev/yobuild).
+
+## Runs where agents run
+
+The same loop builds natively and for `wasm32-unknown-unknown`. In yoyo's Cloudflare Worker we
+measured about **4 ms** to start and a median of **~45 ms of CPU per agent run** — an agent
+spends most of a run waiting on the model, which Workers do not bill as CPU. A minimal Worker
+(one provider via `Agent::from_provider`, one tool, no decision model) is about 330 KiB gzipped. HTTP MCP works over the host's `fetch`;
+[`yoagent-workers`](integrations/yoagent-workers/) turns the Workers AI binding into a decision
+model. See [WebAssembly & Cloudflare Workers](https://yologdev.github.io/yoagent/guides/wasm-workers.html).
 
 ---
 
@@ -169,147 +241,29 @@ Built something on agent? [Open a PR](CONTRIBUTING.md) and add it here — we'd 
 
 ## What's in the box
 
-<details open>
-<summary><b>The loop &amp; control</b></summary>
-
-- Full event stream: `AgentStart` → `TurnStart` → `MessageUpdate` (deltas) → `ToolExecution*` → `TurnEnd` → `AgentEnd`
-- Parallel tool execution by default; `Sequential` and `Batched { size }` strategies available
-- **Steering** — interrupt mid-run; **follow-ups** — queue work after completion; both queues are inspectable and editable
-- **`ToolMiddleware`** — async `Allow` / `Modify(args)` / `Deny(reason)` hooks gating every call. A denial becomes an error tool result the model sees, so the loop keeps going
-- **`InputFilter`** — rewrite or reject user input before it reaches the model (PII redaction, prompt-injection guards)
-- Execution limits (max turns, max tokens, wall-clock timeout), `abort()`, and lifecycle callbacks (`before_turn`, `after_turn`, `on_error`)
-- Automatic retry with exponential backoff and ±20% jitter, for rate-limit and network errors only
-
-</details>
-
-<details>
-<summary><b>Providers</b> — 7 protocols, 20+ providers</summary>
-
-| Protocol | Providers |
-|----------|-----------|
-| Anthropic Messages | Anthropic (Claude) |
-| OpenAI Completions | OpenAI, xAI, Groq, Cerebras, OpenRouter, Mistral, DeepSeek, MiniMax, Z.ai, Qwen, Meta (Muse Spark), Ollama, local servers, custom compatible APIs |
-| OpenAI Responses | OpenAI (Responses API) |
-| Azure OpenAI | Azure OpenAI |
-| Google Generative AI | Google Gemini |
-| Google Vertex | Google Vertex AI |
-| Bedrock ConverseStream | Amazon Bedrock |
-
-`ModelConfig` presets cover the common providers; `ModelConfig::openai_compat(..)` handles anything
-else with a `base_url`. Per-provider quirks (auth style, reasoning format, `max_tokens` field name)
-live in `OpenAiCompat` / `AnthropicCompat` flags — 12 compat profiles ship in the box.
-
-The `opencode_zen(..)` / `opencode_go(..)` gateways pick the wire protocol from the model id
-automatically, so one config reaches models across several vendors.
-
-Thinking/reasoning controls are wired for all 7 protocols. Client-side cache hints are sent on two:
-Anthropic gets `cache_control` breakpoints, native OpenAI gets a `prompt_cache_key`. Most others cache
-server-side with nothing to configure; Bedrock does not cache automatically, and its explicit
-`cachePoint` blocks are not yet wired. Context-overflow detection is centralised across 15+
-provider-specific error strings.
-
-</details>
-
-<details>
-<summary><b>Tools</b> — built-in, custom, MCP, OpenAPI</summary>
-
-Built in: `bash` (timeout, deny patterns), `read_file` / `write_file` (line numbers, path
-restrictions), `edit_file` (fuzzy-match hints on failure), `list_files`, `search` (ripgrep).
-Tools return stdout *and* stderr even on failure, so the model can self-correct.
-
-Custom tools implement one trait:
-
-```rust
-#[async_trait::async_trait]
-impl AgentTool for GreetTool {
-    fn name(&self) -> &str { "greet" }
-    fn label(&self) -> &str { "Greet" }
-    fn description(&self) -> &str { "Greets someone" }
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "object", "properties": { "name": { "type": "string" } } })
-    }
-    async fn execute(&self, params: serde_json::Value, _ctx: ToolContext)
-        -> Result<ToolResult, ToolError>
-    {
-        let name = params["name"].as_str().unwrap_or("stranger");
-        Ok(ToolResult {
-            content: vec![Content::Text { text: format!("Hello, {name}!") }],
-            details: serde_json::Value::Null,
-        })
-    }
-}
-```
-
-**MCP** — `with_mcp_server_stdio()` / `with_mcp_server_http()` connect to Model Context Protocol
-servers over stdio or Streamable HTTP (session ids, SSE framing, incremental parsing) and register
-their tools transparently.
-
-**OpenAPI** (`features = ["openapi"]`) — point `with_openapi_url()` at a spec and every operation
-becomes a tool, filtered by `OperationFilter`.
-
-</details>
-
-<details>
-<summary><b>Sub-agents &amp; shared state</b></summary>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/subagents.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/images/subagents-light.svg">
-  <img alt="Sub-agents sharing artifacts by reference through SharedState" src="docs/images/subagents.svg" width="100%">
-</picture>
-
-`SubAgentTool` delegates to a child loop with its own model, system prompt, tools, skills,
-middleware, retry policy, and turn limits — a fully independent configuration, not a thin shim.
-Run a cheap model for triage and an expensive one for the hard step in the same session.
-
-`SharedState` is a pluggable key-value store (`MemoryBackend`, `FileBackend`, or your own via the
-`SharedStateBackend` trait). A parent stores a large artifact once and sub-agents read it by key,
-so it never gets re-pasted into every context window. Opt in with `.with_shared_state(state)` —
-it injects the `shared_state` tool and a state summary into the sub-agent's system prompt.
-
-</details>
-
-<details>
-<summary><b>Context, sessions &amp; skills</b></summary>
-
-- **`ContextTracker`** — hybrid real-usage + estimation, calibrated against actual provider usage
-- **Tiered compaction** — truncate tool outputs → summarise old turns → drop middle turns
-- **`LlmCompaction`** — opt-in alternative that summarises the dropped span with a background LLM request instead of discarding it. The request runs off the hot path and is spliced in on a later turn, so the loop never stalls and can never wedge on it — an unfinished or failed summary falls back to the deterministic tiers. Buys retention quality; costs tokens the default never spends, and does *not* reduce prefix-cache breaks. Both paths report their own cost on `AgentEvent::ContextCompacted`
-
-  ```rust,ignore
-  let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
-      .with_compaction_strategy(LlmCompaction::from_config(
-          ModelConfig::anthropic("claude-haiku-4-5", "Haiku 4.5"),  // cheap model for summaries
-      ));
-  ```
-- **`Session`** — history as an id/parent tree with `append`, `seek`, `checkpoint`, `branch_tips`, and JSONL persistence. Appending after a seek forks a branch; it never overwrites
-- **Skills** — load [AgentSkills](https://agentskills.io)-standard `SKILL.md` directories. The agent sees a compact index and reads the full skill on demand, so skills stay cross-compatible with Claude Code, Codex CLI, Cursor, and others
-- **Structured outputs** — `prompt_structured::<T>()` returns typed, schema-validated replies, enforced natively where supported (Anthropic tool-forcing, OpenAI `json_schema`, Gemini `responseSchema`)
-
-</details>
-
-<details>
-<summary><b>Production concerns</b></summary>
-
-- **Cost tracking** — `CostConfig` carries separate input/output/cache-read/cache-write rates plus optional context tiers; `session_cost_usd()` gives a running total, `AgentEvent::AgentEnd` carries a `SessionStats` rollup, and `is_configured()` distinguishes "free" from "pricing unknown"
-- **Loop detection** — a model calling one tool with identical arguments forever trips none of the turn/token/duration limits until the whole budget is spent. On by default: steers on the third consecutive repeat, stops on the next, and emits `AgentEvent::LoopDetected` either way
-- **Retrievable tool output** — head-tail truncation discards the middle irrecoverably. Attach a `SharedState` and the full text is stashed, with the marker naming a key the model can fetch
-- **Telemetry** — `tracing` spans per loop / LLM stream / tool, recording tokens and cost. OpenTelemetry is bridged app-side via `tracing-opentelemetry`; the library carries no OTel dependency by design
-- **GASP** (`features = ["gasp"]`) — record runs into a [GASP](https://github.com/yologdev/gasp) agent repo; agent is a tested-conformant runtime, with the 7-check suite running in CI
-- **Serde throughout** — every core type is `Serialize` / `Deserialize` / `PartialEq`, so sessions persist and replay
-- **`set_model()`** — hot-swap the model mid-session without rebuilding the agent
-
-</details>
+| | | |
+|---|---|---|
+| **The loop** | Full event stream; parallel, sequential or batched tools; steering and follow-ups; execution limits; retry with backoff and jitter | [Agent loop](https://yologdev.github.io/yoagent/concepts/agent-loop.html) · [Events](https://yologdev.github.io/yoagent/concepts/messages-events.html) · [Retry](https://yologdev.github.io/yoagent/concepts/retry.html) |
+| **Extensions** | One plug-in contract for the run; `Budget`; the older hooks (`ToolMiddleware`, input filters, `TurnHook`, callbacks) still work | [Extensions](https://yologdev.github.io/yoagent/concepts/extensions.html) · [Callbacks](https://yologdev.github.io/yoagent/concepts/callbacks.html) |
+| **Providers** | 7 native protocols reaching 20+ providers; thinking controls; prompt-cache hints; one context-overflow classifier | [Providers](https://yologdev.github.io/yoagent/providers/overview.html) · [Prompt caching](https://yologdev.github.io/yoagent/concepts/prompt-caching.html) |
+| **Tools** | `bash`, file read/write/edit, `list_files`, `search`; custom tools via one trait; MCP over stdio or HTTP; OpenAPI specs; per-run `ToolSource`s | [Tools](https://yologdev.github.io/yoagent/concepts/tools.html) · [MCP](https://yologdev.github.io/yoagent/guides/mcp.html) · [OpenAPI](https://yologdev.github.io/yoagent/guides/openapi.html) |
+| **Sub-agents** | Child loops with their own model and tools; large artifacts passed by reference; spend rolled up | [Sub-agents](https://yologdev.github.io/yoagent/concepts/sub-agents.html) |
+| **Context** | Usage-calibrated tracking, tiered compaction, optional `LlmCompaction`, loop detection | [Context management](https://yologdev.github.io/yoagent/concepts/context-management.html) |
+| **Sessions, skills, structured output** | Branching session trees with JSONL; AgentSkills `SKILL.md`; typed `prompt_structured::<T>()` | [Sessions](https://yologdev.github.io/yoagent/concepts/session-trees.html) · [Skills](https://yologdev.github.io/yoagent/concepts/skills.html) · [Structured outputs](https://yologdev.github.io/yoagent/concepts/structured-outputs.html) |
+| **Decision models** (`decision`) | Typed yes/no, one-of-N and score judgments in a few hundred ms (Jev, Clef, OpenAI Decisions, any logprobs server); a tool gate and an input guard | [Decision models](https://yologdev.github.io/yoagent/concepts/decision-models.html) |
+| **Cost and telemetry** | Opt-in pricing (nothing priced by default); `SessionStats` per run incl. sub-agents; `tracing` spans with tokens and cost | [Pricing](https://yologdev.github.io/yoagent/concepts/pricing.html) · [Telemetry](https://yologdev.github.io/yoagent/concepts/telemetry.html) |
+| **Recording** (`gasp`) | serde on every core type; runs recorded into a [GASP](https://github.com/yologdev/gasp) repo, plugin logs too (opt-in) | [Persistence](https://yologdev.github.io/yoagent/concepts/persistence.html) · [GASP](https://yologdev.github.io/yoagent/concepts/gasp.html) |
+| **WebAssembly** | `--no-default-features` for `wasm32-unknown-unknown`, e.g. Cloudflare Workers | [WebAssembly & Workers](https://yologdev.github.io/yoagent/guides/wasm-workers.html) |
 
 ---
 
 ## Examples
 
-Ten runnable examples in [`examples/`](examples/). Five need no API key at all.
+Seventeen of the 22 runnable examples in [`examples/`](examples/) are below; ten need no API key at all (eleven counting `cli` with a local model). The rest are live-provider harnesses and offline evaluation sweeps.
 
 | Example | What it shows | Key needed |
 |---|---|---|
-| [`cli`](examples/cli.rs) | A 370-line coding agent — all tools, skills, streaming, colored output. Like a baby Claude Code | optional¹ |
+| [`cli`](examples/cli.rs) | A ~400-line coding agent — all tools, skills, streaming, colored output. Like a baby Claude Code | optional¹ |
 | [`rlm`](examples/rlm.rs) | An LLM that explores a codebase on its own by spawning sub-agents | yes |
 | [`code_review`](examples/code_review.rs) | Three sub-agents reviewing a diff in parallel, results merged | yes |
 | [`shared_state`](examples/shared_state.rs) | Passing a large artifact between sub-agents by reference | yes |
@@ -319,68 +273,49 @@ Ten runnable examples in [`examples/`](examples/). Five need no API key at all.
 | [`persistence`](examples/persistence.rs) | Save and restore a session | **no** |
 | [`telemetry`](examples/telemetry.rs) | `tracing` spans with token and cost fields | **no** |
 | [`gasp_emit`](examples/gasp_emit.rs) | Recording a run into a GASP repo | **no** |
+| [`decision`](examples/decision.rs) | Decision-model questions in one line, and attaching a model to an agent (feature `decision`) | yes |
+| [`extension_policy`](examples/extension_policy.rs), [`_redact`](examples/extension_redact.rs), [`_verifier`](examples/extension_verifier.rs), [`_budget`](examples/extension_budget.rs), [`_tree`](examples/extension_tree.rs), [`_audit`](examples/extension_audit.rs) | Extensions: a tool policy, redaction, a verifier, budgets, policy over sub-agents, an audit log ([guide](https://yologdev.github.io/yoagent/concepts/extensions.html)) | **no**² |
 
 ¹ `--provider ollama` or `--api-url` needs no key; hosted providers read their conventional env var.
 
----
+² Scripted offline by default; `-- --live` uses `DEEPSEEK_API_KEY` or `ANTHROPIC_API_KEY`.
 
-## Testing & CI
-
-`MockProvider` scripts a whole multi-turn tool-calling conversation with no network:
-
-```rust
-use agent::provider::mock::{MockProvider, MockResponse, MockToolCall};
-
-let provider = MockProvider::new(vec![
-    MockResponse::ToolCalls(vec![MockToolCall {
-        name: "search".into(),
-        arguments: serde_json::json!({ "pattern": "TODO" }),
-        provider_metadata: None,
-    }]),
-    MockResponse::Text("Found 3 TODOs.".into()),
-]);
-let agent = Agent::from_provider(provider, ModelConfig::mock());
-```
-
-It emits real `StreamEvent`s and honours the `CancellationToken`, so abort and steering paths are
-testable too.
-
-- **463 tests**, of which **456 run with no network and no API keys** — `cargo test --all-features`
-- Provider SSE streams tested at the HTTP level with `wiremock` across 8 suites
-- `clippy --all-targets --all-features` with `-Dwarnings`, `cargo fmt --check`
-- Linux + macOS test matrix, a Windows compile check, a pinned **MSRV 1.86** job, and a GASP conformance job
+The companion crates have their own: [`language_plugins`, `pi_extensions` and `dsh_tools`](integrations/yoagent-rutis/README.md)
+(TypeScript, Python, pi and DSH plugins) and a [Clef tool-gate Worker](integrations/yoagent-workers/examples/clef-worker/).
 
 ---
 
-## Module map
+## Testing
 
-| Module | What lives there |
-|---|---|
-| [`agent_loop`](src/agent_loop.rs) | The loop itself — `agent_loop`, `agent_loop_continue`, `AgentLoopConfig`, execution strategies |
-| [`agent`](src/agent.rs) | Optional stateful wrapper — history, tool registry, steering/follow-up queues |
-| [`types`](src/types.rs) | `Message`, `Content`, `AgentEvent`, `AgentTool`, `ToolMiddleware`, `InputFilter` |
-| [`provider/`](src/provider/) | `StreamProvider` trait, `ModelConfig`, registry, and the 7 protocol implementations + `MockProvider` |
-| [`tools/`](src/tools/) | `bash`, `file`, `edit`, `list`, `search`, `shared_state_tool` |
-| [`sub_agent`](src/sub_agent.rs) | `SubAgentTool` — delegation to child loops |
-| [`shared_state`](src/shared_state.rs) | `SharedState` + pluggable backends |
-| [`session`](src/session.rs) | Branching conversation trees with JSONL persistence |
-| [`context`](src/context.rs) | Token tracking, tiered compaction, execution limits |
-| [`skills`](src/skills.rs) | AgentSkills `SKILL.md` loading |
-| [`retry`](src/retry.rs) | Backoff with jitter |
-| [`mcp/`](src/mcp/) | MCP client, stdio + HTTP transports, tool adapter |
-| [`openapi/`](src/openapi/) | OpenAPI 3.0 → tools (feature `openapi`) |
-| [`gasp`](src/gasp.rs) | Run recording into a GASP repo (feature `gasp`) |
+`MockProvider` scripts a whole multi-turn tool-calling conversation with no network, and honours
+cancellation, so abort and steering paths are testable too. See
+[Testing Your Agent](https://yologdev.github.io/yoagent/guides/testing.html); how the crate itself is tested and what CI runs is
+in [CONTRIBUTING](CONTRIBUTING.md).
 
 ---
 
 ## Documentation
 
-- **[The book](https://yologdev.github.io/yoagent/)** — concepts, guides, and a page per provider ([source](docs/))
+- **[The book](https://yologdev.github.io/yoagent/)** — concepts, guides, a page per provider, and the [architecture and module map](https://yologdev.github.io/yoagent/architecture/overview.html) ([source](docs/))
+- **[Design philosophy](https://yologdev.github.io/yoagent/design-philosophy.html)** — why yoagent is a loop library, the one extension contract, and what that costs
 - **[API reference](https://docs.rs/yoagent)** — built with all features enabled
+- **For coding agents: [the yoagent skill](skills/yoagent/SKILL.md)** — which feature for which job, tips and pitfalls, what changed per version (AgentSkills `SKILL.md`; also in the published crate) — and [`llms.txt`](llms.txt), a map of every docs page
 - **[CHANGELOG](CHANGELOG.md)** — every release
 - **[CONTRIBUTING](CONTRIBUTING.md)** — how to build, test, and send a PR
 
 MSRV is **1.86**, enforced in CI. Raising it is a minor-version change.
+
+## Contributing
+
+Bug reports, ideas and PRs are welcome — [open an issue](https://github.com/yologdev/yoagent/issues/new/choose)
+or pick one labelled [help wanted](https://github.com/yologdev/yoagent/labels/help%20wanted).
+[CONTRIBUTING](CONTRIBUTING.md) covers building, the checks CI runs, and the PR checklist.
+Report security issues privately as described in [SECURITY](SECURITY.md).
+
+## Acknowledgements
+
+[rutis](https://github.com/arcships/rutis), the plugin runtime behind `yoagent-rutis`, and the
+contributors who send fixes and ideas — including the ones who suggest them on X.
 
 ## License
 
@@ -397,5 +332,7 @@ MIT — see [LICENSE](LICENSE).
 [msrv-link]: https://github.com/yologdev/yoagent/blob/main/Cargo.toml
 [license-shield]: https://img.shields.io/badge/license-MIT-white?labelColor=black&style=flat-square
 [license-link]: https://github.com/yologdev/yoagent/blob/main/LICENSE
+[deepwiki-shield]: https://img.shields.io/badge/DeepWiki-ask-1f6feb?labelColor=black&style=flat-square
+[deepwiki-link]: https://deepwiki.com/yologdev/yoagent
 [yoyo-stars]: https://img.shields.io/github/stars/yologdev/yoyo-evolve?labelColor=black&style=flat-square&color=c4f042
 [yoyo-link]: https://github.com/yologdev/yoyo-evolve

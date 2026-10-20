@@ -12,7 +12,7 @@
 //!   agent-cli.exe
 //!
 //! Flags:
-//!   --config <file>   override AGENT_CONFIG
+//!   --config FILE   override AGENT_CONFIG
 //!   --no-memory       disable uteke memory even if compiled in
 //!   /quit             exit the REPL
 

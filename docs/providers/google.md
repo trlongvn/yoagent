@@ -10,13 +10,14 @@ Two providers for Google's Gemini models:
 ```rust
 use agent::provider::ModelConfig;
 
-let agent = Agent::from_config(ModelConfig::google("gemini-2.5-flash", "Gemini 2.5 Flash"));
+let agent = Agent::from_config(ModelConfig::google("gemini-3.8-flash", "Gemini 3.8 Flash"));
 ```
 
 ### API Details
 
-- **Endpoint**: `{base_url}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}`
-- **Auth**: API key as query parameter
+- **Endpoint**: `{base_url}/v1beta/models/{model}:streamGenerateContent?alt=sse`
+- **Auth**: API key in the `x-goog-api-key` header (since 0.24.2; earlier versions put it in the URL, where transport errors could echo it)
+- **API key env**: `GEMINI_API_KEY`, then `GOOGLE_API_KEY` (see [API keys](overview.md#api-keys))
 - **Default base URL**: `https://generativelanguage.googleapis.com`
 - **Default context window**: 1,000,000 tokens
 
@@ -35,14 +36,107 @@ Google uses a different message format than OpenAI/Anthropic:
 | System prompt | `systemInstruction` field |
 | Tools | `tools[].functionDeclarations[]` |
 
+### Thinking
+
+Both Google AI Studio and Vertex AI map `ThinkingLevel` onto
+`generationConfig.thinkingConfig`, using exactly one of two fields:
+
+- **Gemini 3 and later: `thinkingLevel`.** Google documents `thinkingLevel` as
+  "Recommended for Gemini 3 or later models. Use with earlier models results
+  in an error." `Off` → (omitted), `Minimal` → `MINIMAL`, `Low` → `LOW`,
+  `Medium` → `MEDIUM`, `High` / `XHigh` / `Max` → `HIGH`.
+- **Gemini 2.x: `thinkingBudget`**, unchanged: 1,024 / 8,192 / 24,576 tokens
+  (see the [`ThinkingLevel` table](../reference/configuration.md#thinkinglevel)).
+
+The two are never sent together — Vertex: "If you specify both
+thinking_level and thinking_budget in the same request for a Gemini 3 model,
+the model returns an error."
+
+**How the generation is detected.** Google's rule is version-based, so the
+crate reads the version from the model id: the last path segment is taken (so
+`models/gemini-3.8-flash` and
+`projects/…/publishers/google/models/gemini-3.1-pro-preview` both work), an
+`@version` suffix is dropped, and a `gemini-<major>[.<minor>]` id with major ≥ 3
+gets `thinkingLevel`. `gemini-flash-latest` and `gemini-pro-latest` also get
+it (the changelog points them at 3.5 Flash and 3 Pro preview).
+`gemini-flash-lite-latest`, and any id the rule cannot read (`gemma-*`,
+tuned-model names, proxy aliases), keeps `thinkingBudget`, which Gemini 3
+still accepts for backward compatibility.
+
+**`MINIMAL` is not accepted everywhere.** Per Google's level table, 3.8 and
+3.7 Flash reject it and 3.1 Pro does not support it. The crate sends `MINIMAL`
+only where it is documented as accepted — 3.6 / 3.5 Flash, every 3.x
+Flash-Lite, 3 Flash — and clamps `Minimal` to `LOW` everywhere else, including
+the `-latest` aliases, which Google swaps to new models without notice.
+
+**`Off` sends nothing — and does not disable thinking on Gemini 3.** On
+every Gemini model `Off` omits `thinkingConfig`. On 2.x that is the crate's
+long-standing behaviour. On Gemini 3 thinking cannot be switched off this way:
+with no `thinkingConfig` the model thinks at its own **default** level —
+`HIGH` on 3.1 Pro, `MEDIUM` on 3.5–3.8 Flash, `MINIMAL` on 3.x Flash-Lite
+(`HIGH` on 3 Flash) — per Google's level tables. Google: "If you don't
+specify a thinking level, Gemini will use the Gemini 3 models' default
+thinking level (e.g., "high" for Gemini 3.1 Pro, and "medium" for Gemini 3.5
+Flash)", and "You cannot disable thinking for Gemini 3.1 Pro. Gemini 3 Flash
+and Flash-Lite also do not support full thinking-off."
+
+**To ask for the least thinking, use `ThinkingLevel::Minimal`.** It sends
+`MINIMAL` where the model accepts it — which Google says "Matches the "no
+thinking" setting for most queries" but "does not guarantee that thinking is
+off" — and `LOW` elsewhere.
+
+**Image and TTS models.** Google's Vertex AI thinking table lists narrower
+level sets for the image models: Gemini 3.1 Flash Image and 3.1 Flash-Lite
+Image accept "MINIMAL , HIGH", and Gemini 3 Pro Image accepts "HIGH" only.
+The crate reads any Gemini 3+ `-image` id that way: on the `MINIMAL`/`HIGH`
+models `Minimal` and `Low` send `MINIMAL` and `Medium` and above send `HIGH`;
+on `-pro…-image` ids every level sends `HIGH`. Gemini 3 TTS models
+(`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`,
+`gemini-3.1-flash-tts-preview`) are not in either guide's list of thinking
+models, so they get no `thinkingConfig` at any level. 2.x image and TTS ids
+keep the `thinkingBudget` payload unchanged.
+
+**Override.** When the id does not say what the model is, set `GoogleCompat`:
+
+```rust
+use agent::provider::{GoogleCompat, ModelConfig};
+
+let mut config = ModelConfig::google("my-gemini-proxy-alias", "Gemini via proxy");
+config.google = Some(GoogleCompat::force_thinking_level()); // or force_thinking_budget()
+```
+
+A forced `thinkingLevel` on an unrecognised id clamps `Minimal` to `LOW`,
+since the crate cannot know whether that model accepts `MINIMAL`; `Off` still
+sends nothing.
+
 ### Streaming
 
-Uses SSE format (`alt=sse`). Each chunk contains `candidates` with `content.parts` and optional `usageMetadata`.
+Uses SSE format (`alt=sse`). Each chunk contains `candidates` with `content.parts` and optional `usageMetadata`. The API key goes in the `x-goog-api-key` header.
+
+A turn is never an empty or truncated success:
+
+- A stream that ends (or drops) before any `finishReason` is a retryable network error. A drop *after* it keeps the response, so it is not billed twice.
+- An in-stream `{"error": …}` is an error. A 503 / `UNAVAILABLE` overload is retried, honouring `Retry-After` on an HTTP error; a 429 `RESOURCE_EXHAUSTED` (often an exhausted quota) is not.
+- `SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `SPII`, `IMAGE_SAFETY` and a prompt blocked via `promptFeedback.blockReason` end as `StopReason::Refusal` with the reason in `error_message`.
+- `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL` and `TOO_MANY_TOOL_CALLS` end as `StopReason::Error`, with Gemini's `finishMessage` when it sends one.
 
 ## Google Vertex AI
 
-`GoogleVertexProvider` uses the same message format but with Vertex AI authentication and endpoints.
+`GoogleVertexProvider` uses the same message format but with Vertex AI authentication and endpoints. It shares Gemini's stream parser, so everything under [Streaming](#streaming) applies to it too.
 
-- **Protocol**: `ApiProtocol::GoogleVertex`
-- **Auth**: OAuth2 / service account credentials
-- **Endpoint pattern**: `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent`
+- **Protocol**: `ApiProtocol::GoogleVertex`. There is no preset; build the config with `ModelConfig::custom`.
+- **Auth**: an OAuth2 access token passed with `with_api_key`, sent as `Authorization: Bearer {token}`. yoagent reads no service-account file, refreshes no token, and resolves no environment variable for `vertex`: mint the token yourself (e.g. `gcloud auth print-access-token`) and rebuild the agent before it expires.
+- **`base_url`**: `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models`. Requests go to `{base_url}/{model}:streamGenerateContent?alt=sse`.
+
+```rust
+use agent::provider::{ApiProtocol, ModelConfig};
+
+let agent = Agent::from_config(ModelConfig::custom(
+    ApiProtocol::GoogleVertex,
+    "vertex",
+    "https://us-central1-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-central1/publishers/google/models",
+    "gemini-3.8-flash",
+    "Gemini 3.8 Flash",
+))
+.with_api_key(access_token);
+```

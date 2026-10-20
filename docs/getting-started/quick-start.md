@@ -11,7 +11,7 @@ use agent::tools::default_tools;
 async fn main() {
     // The provider is selected from the config's protocol, and the API key is
     // read from ANTHROPIC_API_KEY. Add `.with_api_key(key)` to override it.
-    let mut agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+    let mut agent = Agent::from_config(ModelConfig::claude_sonnet_5())
         .with_system_prompt("You are a helpful coding assistant.")
         .with_tools(default_tools());
 
@@ -27,7 +27,7 @@ async fn main() {
             AgentEvent::ToolExecutionStart { tool_name, .. } => {
                 println!("\n→ Running tool: {}", tool_name);
             }
-            AgentEvent::ToolExecutionEnd { tool_name, result, is_error, .. } => {
+            AgentEvent::ToolExecutionEnd { tool_name, is_error, .. } => {
                 if is_error {
                     println!("  ✗ {} failed", tool_name);
                 } else {
@@ -86,7 +86,7 @@ use agent::tools::default_tools;
 
 #[tokio::main]
 async fn main() {
-    let mut agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+    let mut agent = Agent::from_config(ModelConfig::claude_sonnet_5())
         .with_system_prompt("You are a helpful assistant.")
         .with_tools(default_tools());
 
@@ -137,29 +137,11 @@ async fn main() {
         tools: agent::tools::default_tools(),
     };
 
-    let config = AgentLoopConfig {
-        provider: std::sync::Arc::new(AnthropicProvider),
-        model: "claude-sonnet-5".into(),
-        api_key: std::env::var("ANTHROPIC_API_KEY").unwrap(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::default(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-    };
+    let mut config = AgentLoopConfig::new(
+        std::sync::Arc::new(AnthropicProvider),
+        "claude-sonnet-5",
+    );
+    config.api_key = std::env::var("ANTHROPIC_API_KEY").unwrap();
 
     let prompts = vec![AgentMessage::Llm(Message::user("Hello!"))];
     let new_messages = agent_loop(prompts, &mut context, &config, tx, cancel).await;

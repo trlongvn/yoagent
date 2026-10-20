@@ -9,34 +9,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn make_config(provider: MockProvider) -> AgentLoopConfig {
-    AgentLoopConfig {
-        provider: std::sync::Arc::new(provider),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::default(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    }
+    let mut config = AgentLoopConfig::new(std::sync::Arc::new(provider), "mock");
+    config.api_key = "test".into();
+    config
 }
 
 fn collect_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -217,9 +192,10 @@ async fn test_abort_cancels_loop() {
 
     let new_messages = agent_loop(vec![prompt], &mut context, &config, tx, cancel).await;
 
-    // Should have user message but loop should exit early
-    // The prompt is added before the loop checks cancellation
-    assert!(new_messages.len() <= 2); // user + possibly error
+    // The prompt is added before the loop checks cancellation; nothing ran,
+    // so no cancel marker follows it.
+    assert_eq!(new_messages.len(), 1, "{new_messages:?}");
+    assert_eq!(new_messages[0].role(), "user");
 }
 
 #[tokio::test]
@@ -726,6 +702,27 @@ struct UsageProvider {
     calls: std::sync::atomic::AtomicUsize,
 }
 
+/// Records completed provider calls so tests can observe when the next turn
+/// starts without depending on wall-clock scheduling.
+struct NotifyingProvider {
+    inner: MockProvider,
+    calls: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl StreamProvider for NotifyingProvider {
+    async fn stream(
+        &self,
+        config: StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, ProviderError> {
+        let result = self.inner.stream(config, tx, cancel).await;
+        self.calls.send(()).expect("the test still observes calls");
+        result
+    }
+}
+
 #[async_trait::async_trait]
 impl StreamProvider for UsageProvider {
     async fn stream(
@@ -755,6 +752,161 @@ impl StreamProvider for UsageProvider {
 }
 
 #[tokio::test]
+async fn turn_delay_is_skipped_first_then_applied_between_turns() {
+    tokio::time::pause();
+
+    let (call_tx, mut call_rx) = mpsc::unbounded_channel();
+    let mut config = make_config(MockProvider::text("unused"));
+    config.provider = std::sync::Arc::new(NotifyingProvider {
+        inner: MockProvider::new(vec![
+            MockResponse::Text("first".into()),
+            MockResponse::Text("second".into()),
+        ]),
+        calls: call_tx,
+    });
+    config.turn_delay = Some(std::time::Duration::from_secs(5));
+
+    let follow_up_used = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follow_up_used_clone = follow_up_used.clone();
+    config.get_follow_up_messages = Some(Box::new(move || {
+        if !follow_up_used_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            vec![AgentMessage::Llm(Message::user("follow up"))]
+        } else {
+            Vec::new()
+        }
+    }));
+
+    let task = tokio::spawn(async move {
+        let mut context = AgentContext {
+            system_prompt: "test".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        agent_loop(
+            vec![AgentMessage::Llm(Message::user("start"))],
+            &mut context,
+            &config,
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    });
+
+    call_rx
+        .recv()
+        .await
+        .expect("the first turn starts immediately");
+    // Let the completed first turn reach the inter-turn sleep before moving
+    // the paused clock. Otherwise the test could advance before the sleep is
+    // registered and accidentally test task scheduling instead of the delay.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        call_rx.try_recv().is_err(),
+        "the follow-up call must not start before the delay"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        call_rx.try_recv().is_err(),
+        "the follow-up call must still be waiting after four seconds"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    call_rx
+        .recv()
+        .await
+        .expect("the follow-up call starts after five seconds");
+    task.await.expect("the agent loop completes");
+}
+
+struct EmbeddedErrorProvider;
+
+#[async_trait::async_trait]
+impl StreamProvider for EmbeddedErrorProvider {
+    async fn stream(
+        &self,
+        _config: StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, ProviderError> {
+        let message = Message::assistant(
+            Vec::new(),
+            StopReason::Error,
+            "error-model",
+            "error-provider",
+            Usage::default(),
+        )
+        .with_error_message("embedded failure");
+        tx.send(StreamEvent::Error {
+            message: message.clone(),
+        })
+        .expect("the forwarder is still listening");
+        Ok(message)
+    }
+}
+
+#[tokio::test]
+async fn embedded_stream_error_emits_balanced_start_and_end_events() {
+    let mut config = make_config(MockProvider::text("unused"));
+    config.provider = std::sync::Arc::new(EmbeddedErrorProvider);
+    config.retry_config = agent::RetryConfig::none();
+
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("start"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let events = collect_events(rx);
+    let error_start_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: AgentMessage::Llm(Message::Assistant {
+                        stop_reason: StopReason::Error,
+                        error_message: Some(message),
+                        ..
+                    })
+                } if message == "embedded failure"
+            )
+        })
+        .count();
+    let error_end_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::Llm(Message::Assistant {
+                        stop_reason: StopReason::Error,
+                        error_message: Some(message),
+                        ..
+                    })
+                } if message == "embedded failure"
+            )
+        })
+        .count();
+
+    assert_eq!(error_start_count, 1, "an embedded error needs one start");
+    assert_eq!(error_end_count, 1, "an embedded error needs one end");
+}
+
+#[tokio::test]
 async fn test_execution_limit_counts_cached_tokens() {
     let provider = std::sync::Arc::new(UsageProvider {
         usage: Usage {
@@ -768,41 +920,17 @@ async fn test_execution_limit_counts_cached_tokens() {
     });
     let provider_for_config: std::sync::Arc<dyn StreamProvider> = provider.clone();
 
-    let config = AgentLoopConfig {
-        provider: provider_for_config,
-        model: "usage-test".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: Some(Box::new(|| {
-            vec![AgentMessage::Llm(Message::user("follow up"))]
-        })),
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: Some(
-            ExecutionLimits::default()
-                .with_max_turns(50)
-                .with_max_total_tokens(100)
-                .with_max_duration(std::time::Duration::from_secs(60)),
-        ),
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::default(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    let mut config = AgentLoopConfig::new(provider_for_config, "usage-test");
+    config.api_key = "test".into();
+    config.get_follow_up_messages = Some(Box::new(|| {
+        vec![AgentMessage::Llm(Message::user("follow up"))]
+    }));
+    config.execution_limits = Some(
+        ExecutionLimits::default()
+            .with_max_turns(50)
+            .with_max_total_tokens(100)
+            .with_max_duration(std::time::Duration::from_secs(60)),
+    );
 
     let mut context = AgentContext {
         system_prompt: "test".into(),
@@ -875,38 +1003,13 @@ async fn test_retry_on_rate_limit_succeeds() {
             inner: MockProvider::text("Success after retries"),
         });
 
-    let config = AgentLoopConfig {
-        provider: provider.clone(),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig {
-            max_retries: 3,
-            initial_delay_ms: 10,
-            backoff_multiplier: 2.0,
-            max_delay_ms: 100,
-        },
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
+    let mut config = AgentLoopConfig::new(provider.clone(), "mock");
+    config.api_key = "test".into();
+    config.retry_config = agent::RetryConfig {
+        max_retries: 3,
+        initial_delay_ms: 10,
+        backoff_multiplier: 2.0,
+        max_delay_ms: 100,
     };
 
     let mut context = AgentContext {
@@ -947,38 +1050,13 @@ async fn test_retry_exhausted_returns_error() {
             inner: MockProvider::text("never reached"),
         });
 
-    let config = AgentLoopConfig {
-        provider: provider.clone(),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig {
-            max_retries: 2,
-            initial_delay_ms: 10,
-            backoff_multiplier: 2.0,
-            max_delay_ms: 100,
-        },
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
+    let mut config = AgentLoopConfig::new(provider.clone(), "mock");
+    config.api_key = "test".into();
+    config.retry_config = agent::RetryConfig {
+        max_retries: 2,
+        initial_delay_ms: 10,
+        backoff_multiplier: 2.0,
+        max_delay_ms: 100,
     };
 
     let mut context = AgentContext {
@@ -1026,34 +1104,9 @@ async fn test_no_retry_on_auth_error() {
             inner: MockProvider::text("never reached"),
         });
 
-    let config = AgentLoopConfig {
-        provider: provider.clone(),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::default(), // 3 retries, but auth is not retryable
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    // default RetryConfig (3 retries); auth errors are not retried
+    let mut config = AgentLoopConfig::new(provider.clone(), "mock");
+    config.api_key = "test".into();
 
     let mut context = AgentContext {
         system_prompt: "test".into(),
@@ -1088,34 +1141,9 @@ async fn test_retry_none_disables_retries() {
             inner: MockProvider::text("never reached"),
         });
 
-    let config = AgentLoopConfig {
-        provider: provider.clone(),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::none(), // disabled
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    let mut config = AgentLoopConfig::new(provider.clone(), "mock");
+    config.api_key = "test".into();
+    config.retry_config = agent::RetryConfig::none(); // disabled
 
     let mut context = AgentContext {
         system_prompt: "test".into(),
@@ -1326,36 +1354,12 @@ async fn test_on_error_fires_on_provider_error() {
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let error_msgs_clone = error_msgs.clone();
 
-    let config = AgentLoopConfig {
-        provider: std::sync::Arc::new(provider),
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: Some(std::sync::Arc::new(move |err| {
-            error_msgs_clone.lock().unwrap().push(err.to_string());
-        })),
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    let mut config = AgentLoopConfig::new(std::sync::Arc::new(provider), "mock");
+    config.api_key = "test".into();
+    config.retry_config = agent::RetryConfig::none();
+    config.on_error = Some(std::sync::Arc::new(move |err| {
+        error_msgs_clone.lock().unwrap().push(err.to_string());
+    }));
 
     let mut context = AgentContext {
         system_prompt: "test".into(),
@@ -1543,6 +1547,62 @@ async fn test_tool_ignoring_progress_no_panic() {
         .filter(|e| matches!(e, AgentEvent::ProgressMessage { .. }))
         .count();
     assert_eq!(progress_count, 0);
+}
+
+/// Steering collected after a tool batch must survive until the next turn.
+///
+/// The callback is intentionally empty at run start, returns a message after
+/// the tool completes, then becomes empty again. This distinguishes the
+/// post-tool result from the ordinary next-turn poll.
+#[tokio::test]
+async fn steering_queued_after_tool_execution_reaches_the_next_turn() {
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "silent_tool".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("done".into()),
+    ]);
+    let mut config = make_config(provider);
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let polls_clone = polls.clone();
+    config.get_steering_messages = Some(Box::new(move || {
+        if polls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            vec![AgentMessage::Llm(Message::user("interrupt"))]
+        } else {
+            Vec::new()
+        }
+    }));
+
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: vec![Box::new(SilentTool)],
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let new_messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("start"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert!(
+        new_messages.iter().any(|message| {
+            matches!(
+                message,
+                AgentMessage::Llm(Message::User { content, .. })
+                    if content.iter().any(|content| matches!(
+                        content,
+                        Content::Text { text } if text == "interrupt"
+                    ))
+            )
+        }),
+        "steering returned after tool execution must be injected into the next turn"
+    );
 }
 
 /// Two parallel tools both emit progress — events are distinguishable by tool_call_id.
@@ -2031,41 +2091,18 @@ async fn test_custom_compaction_strategy_is_called() {
     // Provider returns a simple text response
     let provider = MockProvider::text("Got it.");
 
-    let config = AgentLoopConfig {
-        provider: std::sync::Arc::new(provider),
-        model: "test".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: Some(ContextConfig {
-            max_context_tokens: 10, // Tiny budget to force compaction
-            system_prompt_tokens: 0,
-            keep_recent: 1,
-            keep_first: 1,
-            tool_output_max_lines: 10,
-            ..Default::default()
-        }),
-        compaction_strategy: Some(std::sync::Arc::new(MarkerCompaction)),
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    let mut config = AgentLoopConfig::new(std::sync::Arc::new(provider), "test");
+    config.api_key = "test".into();
+    config.context_config = Some(ContextConfig {
+        max_context_tokens: 10, // Tiny budget to force compaction
+        system_prompt_tokens: 0,
+        keep_recent: 1,
+        keep_first: 1,
+        tool_output_max_lines: 10,
+        ..Default::default()
+    });
+    config.compaction_strategy = Some(std::sync::Arc::new(MarkerCompaction));
+    config.retry_config = agent::RetryConfig::none();
 
     let prompt = AgentMessage::Llm(Message::user("Hello"));
     let mut context = AgentContext {
@@ -2112,41 +2149,18 @@ async fn test_none_compaction_strategy_uses_default() {
     // Provider returns a simple text response
     let provider = MockProvider::text("Got it.");
 
-    let config = AgentLoopConfig {
-        provider: std::sync::Arc::new(provider),
-        model: "test".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: Some(ContextConfig {
-            max_context_tokens: 10, // Tiny budget to force compaction
-            system_prompt_tokens: 0,
-            keep_recent: 1,
-            keep_first: 1,
-            tool_output_max_lines: 10,
-            ..Default::default()
-        }),
-        compaction_strategy: None, // Should fall back to DefaultCompaction
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    };
+    // no compaction_strategy: falls back to DefaultCompaction
+    let mut config = AgentLoopConfig::new(std::sync::Arc::new(provider), "test");
+    config.api_key = "test".into();
+    config.context_config = Some(ContextConfig {
+        max_context_tokens: 10, // Tiny budget to force compaction
+        system_prompt_tokens: 0,
+        keep_recent: 1,
+        keep_first: 1,
+        tool_output_max_lines: 10,
+        ..Default::default()
+    });
+    config.retry_config = agent::RetryConfig::none();
 
     let prompt = AgentMessage::Llm(Message::user("Hello"));
     let mut context = AgentContext {
@@ -2269,7 +2283,7 @@ async fn test_tool_call_with_provider_metadata_executes() {
 /// Records the ContextConfig each compact call receives; never modifies
 /// messages, so the loop's behavior is otherwise unaffected.
 struct RecordingCompaction {
-    calls: std::sync::Mutex<Vec<(usize, usize)>>, // (max_context_tokens, system_prompt_tokens)
+    calls: std::sync::Mutex<Vec<(usize, usize, f32)>>, // (max_context_tokens, system_prompt_tokens, target_ratio)
 }
 
 impl agent::CompactionStrategy for RecordingCompaction {
@@ -2278,10 +2292,11 @@ impl agent::CompactionStrategy for RecordingCompaction {
         messages: Vec<AgentMessage>,
         config: &agent::context::ContextConfig,
     ) -> Vec<AgentMessage> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((config.max_context_tokens, config.system_prompt_tokens));
+        self.calls.lock().unwrap().push((
+            config.max_context_tokens,
+            config.system_prompt_tokens,
+            config.compact_target_ratio,
+        ));
         messages
     }
 }
@@ -2291,51 +2306,31 @@ fn calibration_config(
     strategy: std::sync::Arc<RecordingCompaction>,
     max_context_tokens: usize,
 ) -> AgentLoopConfig {
-    AgentLoopConfig {
-        provider,
-        model: "usage-test".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: Some(Box::new(|| {
-            vec![AgentMessage::Llm(Message::user("follow up"))]
-        })),
-        context_config: Some(agent::context::ContextConfig {
-            max_context_tokens,
-            system_prompt_tokens: 500,
-            keep_recent: 1,
-            keep_first: 1,
-            tool_output_max_lines: 10,
-            ..Default::default()
-        }),
-        compaction_strategy: Some(strategy),
-        execution_limits: Some(
-            ExecutionLimits::default()
-                .with_max_turns(2)
-                .with_max_total_tokens(1_000_000)
-                .with_max_duration(std::time::Duration::from_secs(60)),
-        ),
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        output_schema: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        retry_config: agent::RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        tool_middleware: vec![],
-        turn_delay: None,
-    }
+    let mut config = AgentLoopConfig::new(provider, "usage-test");
+    config.api_key = "test".into();
+    config.get_follow_up_messages = Some(Box::new(|| {
+        vec![AgentMessage::Llm(Message::user("follow up"))]
+    }));
+    config.context_config = Some(agent::context::ContextConfig {
+        max_context_tokens,
+        system_prompt_tokens: 500,
+        keep_recent: 1,
+        keep_first: 1,
+        tool_output_max_lines: 10,
+        ..Default::default()
+    });
+    config.compaction_strategy = Some(strategy);
+    config.execution_limits = Some(
+        ExecutionLimits::default()
+            .with_max_turns(2)
+            .with_max_total_tokens(1_000_000)
+            .with_max_duration(std::time::Duration::from_secs(60)),
+    );
+    config.retry_config = agent::RetryConfig::none();
+    config
 }
 
-async fn run_calibration_loop(max_context_tokens: usize) -> Vec<(usize, usize)> {
+async fn run_calibration_loop(max_context_tokens: usize) -> Vec<(usize, usize, f32)> {
     // Real usage (5010 tokens) dwarfs the char-based estimate of the tiny
     // messages, so the measured overhead is ~5000 tokens.
     let provider = std::sync::Arc::new(UsageProvider {
@@ -2378,13 +2373,14 @@ async fn test_calibration_subtracts_measured_overhead() {
     assert!(calls.len() >= 2, "expected 2 turns, got {:?}", calls);
 
     // Turn 1: no real usage yet — config passes through unchanged.
-    assert_eq!(calls[0], (8000, 500));
+    assert_eq!(calls[0], (8000, 500, 0.7));
 
     // Turn 2: usage anchored at ~5010 vs a tiny estimate, so ~5000 tokens of
     // overhead are subtracted and the static reserve is zeroed (the measured
     // overhead already includes the real system prompt).
-    let (max, reserve) = calls[1];
+    let (max, reserve, ratio) = calls[1];
     assert_eq!(reserve, 0);
+    assert_eq!(ratio, 0.7);
     assert!(
         (2500..=3500).contains(&max),
         "expected ~3000 calibrated budget, got {}",
@@ -2399,8 +2395,61 @@ async fn test_calibration_floor_prevents_budget_collapse() {
     // calibrated budget must never drop below 10% of the configured one.
     let calls = run_calibration_loop(4000).await;
     assert!(calls.len() >= 2, "expected 2 turns, got {:?}", calls);
-    assert_eq!(calls[0], (4000, 500));
-    assert_eq!(calls[1], (400, 0));
+    assert_eq!(calls[0], (4000, 500, 0.7));
+    assert_eq!(calls[1], (400, 0, 0.3));
+}
+
+#[tokio::test]
+async fn compaction_headroom_ratio_reaches_the_strategy() {
+    let provider = std::sync::Arc::new(UsageProvider {
+        usage: Usage {
+            input: 5000,
+            output: 10,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 5010,
+        },
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let strategy = std::sync::Arc::new(RecordingCompaction {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut config = calibration_config(provider, strategy.clone(), 800);
+    let context_config = config
+        .context_config
+        .as_mut()
+        .expect("calibration config has context settings");
+    context_config.compact_target_ratio = 0.95;
+    context_config.compact_headroom_turns = Some(30);
+    config.get_follow_up_messages = Some(Box::new(|| {
+        vec![AgentMessage::Llm(Message::user("x".repeat(4000)))]
+    }));
+
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("start"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let calls = strategy.calls.lock().unwrap().clone();
+    assert!(
+        calls.len() >= 2,
+        "expected two compaction calls, got {calls:?}"
+    );
+    assert_eq!(calls[0].2, 0.95, "the configured ratio is used initially");
+    assert!(
+        calls[1].2 < 0.95,
+        "measured growth must adapt the ratio before compaction: {calls:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2726,8 +2775,8 @@ fn archived_agent_end_without_stats_still_deserializes() {
     }
 }
 
-/// `cost_usd` accrues only when the model has configured rates. `None` means
-/// "cannot price this", never "free".
+/// `cost_usd` accrues whenever the model has a `cost`, zero rates included.
+/// `None` means "cannot price this", never "free".
 #[tokio::test]
 async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
     let responses = || {
@@ -2768,7 +2817,7 @@ async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
         system_prompt: String::new(),
     };
     let mut priced = agent::provider::ModelConfig::anthropic("mock", "Mock");
-    priced.cost = agent::provider::CostConfig::new(3.0, 15.0);
+    priced.cost = Some(agent::provider::CostConfig::new(3.0, 15.0));
     let mut config = make_config(MockProvider::new(responses()));
     config.model_config = Some(priced);
     config.get_follow_up_messages = follow_up_once();
@@ -2784,6 +2833,32 @@ async fn cost_accrues_when_rates_are_configured_and_stays_none_otherwise() {
         .cost_usd
         .expect("priced model must report a cost");
     assert!((cost - 18.0).abs() < 1e-9, "cost {cost} != 18.0");
+
+    // Free: `Some` with zero rates is a known price of $0, not unknown.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut context = AgentContext {
+        messages: vec![],
+        tools: vec![],
+        system_prompt: String::new(),
+    };
+    let mut free = agent::provider::ModelConfig::mock();
+    free.cost = Some(agent::provider::CostConfig::new(0.0, 0.0));
+    let mut config = make_config(MockProvider::new(responses()));
+    config.model_config = Some(free);
+    config.get_follow_up_messages = follow_up_once();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("go"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        agent_end_stats(&collect_events(rx)).cost_usd,
+        Some(0.0),
+        "a free model must report Some(0.0), not None"
+    );
 }
 
 /// Hand out exactly one follow-up, so the loop takes two turns.
@@ -3666,6 +3741,33 @@ fn key_order_does_not_disguise_a_repeat() {
     );
 }
 
+/// A second signature that is steered must not make the first signature look
+/// already steered (or vice versa).
+#[test]
+fn steered_signatures_are_tracked_independently() {
+    use agent::context::{ExecutionLimits, ExecutionTracker, LoopVerdict};
+    let mut tracker = ExecutionTracker::new(
+        ExecutionLimits::default().with_max_consecutive_identical_tool_calls(Some(2)),
+    );
+    let call = |name: &str| vec![(name.to_string(), serde_json::json!({"q": 1}))];
+
+    assert_eq!(tracker.record_tool_calls(&call("a")), LoopVerdict::Continue);
+    assert!(matches!(
+        tracker.record_tool_calls(&call("a")),
+        LoopVerdict::Steer { tool_name, .. } if tool_name == "a"
+    ));
+    assert_eq!(tracker.record_tool_calls(&call("b")), LoopVerdict::Continue);
+    assert!(matches!(
+        tracker.record_tool_calls(&call("b")),
+        LoopVerdict::Steer { tool_name, .. } if tool_name == "b"
+    ));
+    assert_eq!(tracker.record_tool_calls(&call("a")), LoopVerdict::Continue);
+    assert!(matches!(
+        tracker.record_tool_calls(&call("a")),
+        LoopVerdict::Abort { tool_name, .. } if tool_name == "a"
+    ));
+}
+
 /// `Some(0)` disables the check rather than tripping on every call.
 #[test]
 fn a_zero_threshold_disables_the_check() {
@@ -4100,4 +4202,682 @@ async fn an_image_only_result_stashes_nothing() {
         state.keys().await.is_empty(),
         "nothing was elided, so nothing may be stored"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unparsed (truncated) tool arguments — #167
+// ---------------------------------------------------------------------------
+
+/// Records the transcript each turn is sent, then delegates to a MockProvider.
+/// With `tool_turn_stop` set, a turn carrying tool calls reports that stop
+/// reason instead of the mock's `ToolUse` — how a real provider reports a
+/// call cut off at the output token limit.
+struct RecordingProvider {
+    inner: MockProvider,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+    tool_turn_stop: Option<StopReason>,
+}
+
+#[async_trait::async_trait]
+impl StreamProvider for RecordingProvider {
+    async fn stream(
+        &self,
+        config: StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<agent::Message, ProviderError> {
+        self.seen.lock().unwrap().push(config.messages.clone());
+        let mut message = self.inner.stream(config, tx, cancel).await?;
+        if let (
+            Some(forced),
+            Message::Assistant {
+                content,
+                stop_reason,
+                ..
+            },
+        ) = (&self.tool_turn_stop, &mut message)
+        {
+            if content
+                .iter()
+                .any(|c| matches!(c, Content::ToolCall { .. }))
+            {
+                *stop_reason = forced.clone();
+            }
+        }
+        Ok(message)
+    }
+}
+
+/// Counts its executions; the name is set per instance.
+struct CountingTool {
+    name: &'static str,
+    runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for CountingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn label(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "counts runs"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolResult {
+            content: vec![Content::Text { text: "ran".into() }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+/// A tool call whose streamed arguments were cut off mid-JSON must not run
+/// on `{}` defaults: the loop answers it with an error tool result the model
+/// sees next turn, and keeps going. A zero-argument sibling call (empty
+/// argument stream) in the same turn still runs normally — the empty vs
+/// malformed distinction is the load-bearing one.
+#[tokio::test]
+async fn unparsed_tool_arguments_are_not_executed() {
+    use agent::provider::parse_tool_arguments;
+
+    let truncated = parse_tool_arguments(r#"{"paths":"#);
+    let empty = parse_tool_arguments("");
+    assert_eq!(empty, serde_json::json!({}));
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: MockProvider::new(vec![
+            MockResponse::ToolCalls(vec![
+                MockToolCall {
+                    provider_metadata: None,
+                    name: "delete_files".into(),
+                    arguments: truncated,
+                },
+                MockToolCall {
+                    provider_metadata: None,
+                    name: "list_files".into(),
+                    arguments: empty,
+                },
+            ]),
+            MockResponse::Text("retrying".into()),
+        ]),
+        seen: seen.clone(),
+        tool_turn_stop: None,
+    };
+    let mut config = make_config(MockProvider::text("unused"));
+    config.provider = std::sync::Arc::new(provider);
+
+    let delete_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let list_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: vec![
+            Box::new(CountingTool {
+                name: "delete_files",
+                runs: delete_runs.clone(),
+            }),
+            Box::new(CountingTool {
+                name: "list_files",
+                runs: list_runs.clone(),
+            }),
+        ],
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("clean up"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        delete_runs.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a call with truncated arguments must not run on its defaults"
+    );
+    assert_eq!(
+        list_runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a zero-argument call streamed as \"\" must still run"
+    );
+
+    // The loop continued: the second turn was requested, carrying the error.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the loop must continue to a second turn");
+    let results: Vec<(&str, bool, String)> = seen[1]
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult {
+                tool_name,
+                is_error,
+                content,
+                ..
+            } => Some((
+                tool_name.as_str(),
+                *is_error,
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let (_, is_error, text) = results
+        .iter()
+        .find(|(n, ..)| *n == "delete_files")
+        .expect("the truncated call must be answered with a tool result");
+    assert!(*is_error, "the answer must be an error result");
+    assert!(
+        text.contains("cut off") && text.contains("The tool was not run"),
+        "the model must be told why, got: {text}"
+    );
+    assert!(
+        text.contains("Do not resend the same call unchanged"),
+        "the model must not be told to retry verbatim — the same call would be cut \
+         off again, got: {text}"
+    );
+    let (_, list_error, _) = results
+        .iter()
+        .find(|(n, ..)| *n == "list_files")
+        .expect("the zero-argument call's result must be present");
+    assert!(!*list_error);
+
+    // UI pairing: the unexecuted call still gets Start and End events.
+    let events = collect_events(rx);
+    let ended_as_error = events.iter().any(|e| {
+        matches!(e, AgentEvent::ToolExecutionEnd { tool_name, is_error: true, .. }
+            if tool_name == "delete_files")
+    });
+    assert!(ended_as_error);
+}
+
+/// Runs one tool-call turn through the loop with a single `write_file` call
+/// carrying `arguments`, and returns (tool runs, provider requests, the
+/// call's error-result text if it was answered as an error).
+async fn run_single_marked_call(
+    arguments: serde_json::Value,
+    tool_turn_stop: Option<StopReason>,
+) -> (usize, usize, Option<String>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: MockProvider::new(vec![
+            MockResponse::ToolCalls(vec![MockToolCall {
+                provider_metadata: None,
+                name: "write_file".into(),
+                arguments,
+            }]),
+            MockResponse::Text("ok".into()),
+        ]),
+        seen: seen.clone(),
+        tool_turn_stop,
+    };
+    let mut config = make_config(MockProvider::text("unused"));
+    config.provider = std::sync::Arc::new(provider);
+
+    let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: vec![Box::new(CountingTool {
+            name: "write_file",
+            runs: runs.clone(),
+        })],
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("write it"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let seen = seen.lock().unwrap();
+    let error_text = seen.get(1).and_then(|msgs| {
+        msgs.iter().find_map(|m| match m {
+            Message::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+    });
+    (
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        seen.len(),
+        error_text,
+    )
+}
+
+/// The realistic shape of #167: the provider reports `StopReason::Length`
+/// (max_tokens hit mid-arguments), not `ToolUse`. The loop must still
+/// extract the call, answer it with the error result — not run it — and
+/// continue to the next turn. Only Error/Aborted end the run early.
+#[tokio::test]
+async fn a_length_turn_with_a_truncated_call_is_answered_and_the_loop_continues() {
+    let truncated = agent::provider::parse_tool_arguments(r#"{"path":"a.txt","content":"lo"#);
+    let (runs, requests, error_text) =
+        run_single_marked_call(truncated, Some(StopReason::Length)).await;
+    assert_eq!(runs, 0, "a truncated call must not run");
+    assert_eq!(
+        requests, 2,
+        "a Length turn with a tool call must continue to the next turn"
+    );
+    let text = error_text.expect("the truncated call must be answered with an error result");
+    assert!(
+        text.contains("cut off") && text.contains("output token limit"),
+        "got: {text}"
+    );
+}
+
+/// Double-encoded arguments (a JSON string holding the object) are valid
+/// JSON but not an object; they are answered with an error naming that,
+/// never run with every field read as missing.
+#[tokio::test]
+async fn double_encoded_arguments_are_answered_not_run() {
+    let raw = r#""{\"path\":\"src\"}""#;
+    let args = agent::provider::parse_tool_arguments(raw);
+    let (runs, requests, error_text) = run_single_marked_call(args, None).await;
+    assert_eq!(
+        runs, 0,
+        "a call whose arguments are a JSON string must not run"
+    );
+    assert_eq!(requests, 2, "the loop continues");
+    let text = error_text.expect("answered with an error result");
+    assert!(
+        text.contains("not a JSON object") && text.contains("a string"),
+        "the error must say what was wrong, not claim truncation; got: {text}"
+    );
+    assert!(!text.contains("cut off"), "got: {text}");
+}
+
+/// Complete but malformed JSON is a syntax error, not a truncation: telling
+/// the model to "make the arguments smaller" would have it resend the same
+/// mistake in pieces.
+#[tokio::test]
+async fn malformed_but_complete_arguments_are_not_called_cut_off() {
+    for raw in [r#"{"a":1,}"#, r#"{"a":1}{"b":2}"#] {
+        let args = agent::provider::parse_tool_arguments(raw);
+        let (runs, requests, error_text) = run_single_marked_call(args, None).await;
+        assert_eq!(runs, 0, "{raw}: malformed arguments must not run");
+        assert_eq!(requests, 2, "{raw}: the loop continues");
+        let text = error_text.expect("answered with an error result");
+        assert!(text.contains("not valid JSON"), "{raw}: got: {text}");
+        assert!(!text.contains("cut off"), "{raw}: got: {text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failed attempts are drained and closed, not raced
+// ---------------------------------------------------------------------------
+
+/// How a failing attempt of [`FailingProvider`] behaves before it returns
+/// its retryable error.
+#[derive(Clone, Copy)]
+enum Failure {
+    /// `Start`, a text delta, then the error: the loop must close the message.
+    Partial,
+    /// The error with no events at all: there is no message to close.
+    BeforeStart,
+    /// `Start`, a delta, and the provider's own `StreamEvent::Error`, then the
+    /// error: the provider closed the message, so the loop must not again.
+    ClosedByProvider,
+}
+
+/// Fails its first `failures` attempts as `mode` says; afterwards answers
+/// with `inner`.
+struct FailingProvider {
+    attempts: std::sync::atomic::AtomicUsize,
+    failures: usize,
+    mode: Failure,
+    inner: MockProvider,
+}
+
+#[async_trait::async_trait]
+impl StreamProvider for FailingProvider {
+    async fn stream(
+        &self,
+        config: StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<agent::Message, ProviderError> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt >= self.failures {
+            return self.inner.stream(config, tx, cancel).await;
+        }
+        if !matches!(self.mode, Failure::BeforeStart) {
+            let _ = tx.send(StreamEvent::Start);
+            let _ = tx.send(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: format!("partial-{attempt}"),
+            });
+        }
+        if matches!(self.mode, Failure::ClosedByProvider) {
+            let _ = tx.send(StreamEvent::Error {
+                message: Message::assistant(
+                    vec![],
+                    StopReason::Error,
+                    "mock",
+                    "mock",
+                    Usage::default(),
+                )
+                .with_error_message("provider closed it"),
+            });
+        }
+        Err(ProviderError::Network("stream cut".into()))
+    }
+}
+
+fn failing_config(
+    failures: usize,
+    mode: Failure,
+    max_retries: usize,
+    delay_ms: u64,
+) -> AgentLoopConfig {
+    let mut config = AgentLoopConfig::new(
+        std::sync::Arc::new(FailingProvider {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            failures,
+            mode,
+            inner: MockProvider::text("final answer"),
+        }),
+        "mock",
+    );
+    config.api_key = "test".into();
+    config.retry_config = agent::RetryConfig {
+        max_retries,
+        initial_delay_ms: delay_ms,
+        backoff_multiplier: 1.0,
+        max_delay_ms: delay_ms,
+    };
+    config
+}
+
+/// The assistant message lifecycle seen by consumers, one entry per event:
+/// "start", "delta:<text>", "end:<stop reason>:<error message>", and
+/// "retry:<attempt>/<max attempts>".
+fn assistant_lifecycle(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageStart {
+                message: AgentMessage::Llm(Message::Assistant { .. }),
+            } => Some("start".to_string()),
+            AgentEvent::MessageUpdate {
+                delta: StreamDelta::Text { delta },
+                ..
+            } => Some(format!("delta:{delta}")),
+            AgentEvent::MessageEnd {
+                message:
+                    AgentMessage::Llm(Message::Assistant {
+                        stop_reason,
+                        error_message,
+                        ..
+                    }),
+            } => Some(format!(
+                "end:{stop_reason:?}:{}",
+                error_message.clone().unwrap_or_default()
+            )),
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                ..
+            } => Some(format!("retry:{attempt}/{max_attempts}")),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn run_failing(config: &AgentLoopConfig) -> (Vec<String>, Vec<AgentMessage>) {
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    let new_messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("hi"))],
+        &mut context,
+        config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    (assistant_lifecycle(&collect_events(rx)), new_messages)
+}
+
+fn closing(n: usize, of: usize) -> String {
+    format!("end:Error:attempt {n} of {of} failed and will be retried: Network error: stream cut")
+}
+
+/// The sequence two failed `Partial` attempts and a success must produce.
+fn two_partial_failures_then_success() -> Vec<String> {
+    vec![
+        "start".into(),
+        "delta:partial-0".into(),
+        closing(1, 4),
+        "retry:1/4".into(),
+        "start".into(),
+        "delta:partial-1".into(),
+        closing(2, 4),
+        "retry:2/4".into(),
+        "start".into(),
+        "delta:final answer".into(),
+        "end:Stop:".into(),
+    ]
+}
+
+/// Every failed attempt's partial output is forwarded (deterministically,
+/// whatever the scheduler), closed by a `MessageEnd` with
+/// `StopReason::Error`, and marked as retried by `ProviderRetry`, so
+/// consumers can discard it and need not mistake it for the turn's result.
+#[tokio::test]
+async fn failed_attempts_are_forwarded_completely_closed_and_marked_as_retried() {
+    let (lifecycle, new_messages) = run_failing(&failing_config(2, Failure::Partial, 3, 1)).await;
+    assert_eq!(lifecycle, two_partial_failures_then_success());
+    // History holds only the successful answer, not the failed attempts.
+    assert_eq!(new_messages.len(), 2);
+}
+
+/// The same on a multi-threaded runtime, where the old abort let a
+/// scheduler-dependent subset of the failed attempt's events through (the
+/// race this fix removes; it reproduced in most runs). Repeated, because a
+/// race shows up only some of the time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_attempts_are_deterministic_on_a_multi_threaded_runtime() {
+    for _ in 0..20 {
+        let (lifecycle, _) = run_failing(&failing_config(2, Failure::Partial, 3, 1)).await;
+        assert_eq!(lifecycle, two_partial_failures_then_success());
+    }
+}
+
+/// An attempt that fails before streaming anything opened no message, so it
+/// gets no closing `MessageEnd` — only the `ProviderRetry`.
+#[tokio::test]
+async fn an_attempt_that_failed_before_starting_is_not_closed() {
+    let (lifecycle, _) = run_failing(&failing_config(1, Failure::BeforeStart, 3, 1)).await;
+    assert_eq!(
+        lifecycle,
+        ["retry:1/4", "start", "delta:final answer", "end:Stop:"]
+    );
+}
+
+/// A provider that closed its own attempt with `StreamEvent::Error` is not
+/// closed a second time.
+#[tokio::test]
+async fn an_attempt_the_provider_closed_is_not_closed_again() {
+    let (lifecycle, _) = run_failing(&failing_config(1, Failure::ClosedByProvider, 3, 1)).await;
+    assert_eq!(
+        lifecycle,
+        [
+            "start",
+            "delta:partial-0",
+            "end:Error:provider closed it",
+            "retry:1/4",
+            "start",
+            "delta:final answer",
+            "end:Stop:",
+        ]
+    );
+}
+
+/// When retries run out, the last attempt's message is closed with the very
+/// error message the turn returns, and no `ProviderRetry` follows it.
+#[tokio::test]
+async fn an_exhausted_retry_closes_the_last_attempt_with_the_returned_error() {
+    let (lifecycle, new_messages) = run_failing(&failing_config(10, Failure::Partial, 1, 1)).await;
+    assert_eq!(
+        lifecycle,
+        [
+            "start",
+            "delta:partial-0",
+            &closing(1, 2),
+            "retry:1/2",
+            "start",
+            "delta:partial-1",
+            "end:Error:Network error: stream cut",
+        ],
+    );
+    let returned = new_messages.iter().rev().find_map(|m| match m {
+        AgentMessage::Llm(Message::Assistant { error_message, .. }) => error_message.clone(),
+        _ => None,
+    });
+    assert_eq!(returned.as_deref(), Some("Network error: stream cut"));
+}
+
+/// `ProviderRetry` carries the error and the delay the loop then waits:
+/// the jittered backoff (±20% of 100 ms here), not the configured base.
+#[tokio::test]
+async fn provider_retry_reports_the_error_and_the_delay() {
+    let config = failing_config(1, Failure::Partial, 3, 100);
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    agent_loop(
+        vec![AgentMessage::Llm(Message::user("hi"))],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    let retries: Vec<_> = collect_events(rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                error,
+                delay_ms,
+                ..
+            } => Some((attempt, max_attempts, error, delay_ms)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    let (attempt, max_attempts, error, delay_ms) = &retries[0];
+    assert_eq!(
+        (*attempt, *max_attempts, error.as_str()),
+        (1, 4, "Network error: stream cut")
+    );
+    assert!((80..=120).contains(delay_ms), "delay_ms = {delay_ms}");
+}
+
+/// Cancelling during the backoff ends the turn at once, as aborted (not a
+/// failure: `on_error` is not called), without the announced attempt.
+#[tokio::test]
+async fn cancelling_during_the_backoff_aborts_the_turn_without_retrying() {
+    let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = errors.clone();
+    let mut config = failing_config(10, Failure::Partial, 3, 60_000);
+    config.on_error = Some(std::sync::Arc::new(move |e: &str| {
+        seen.lock().unwrap().push(e.to_string())
+    }));
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    let (events_tx, events_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if matches!(e, AgentEvent::ProviderRetry { .. }) {
+                canceller.cancel();
+            }
+            events.push(e);
+        }
+        let _ = events_tx.send(events);
+    });
+    let started = std::time::Instant::now();
+    let new_messages = agent_loop(
+        vec![AgentMessage::Llm(Message::user("hi"))],
+        &mut context,
+        &config,
+        tx,
+        cancel,
+    )
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the 60 s backoff was not interrupted"
+    );
+    // No second attempt after the cancel. The aborted message that ends the
+    // turn was never streamed, so it is announced on its own (#243): a
+    // consumer rebuilding the transcript from events sees what the history
+    // holds.
+    let lifecycle = assistant_lifecycle(&events_rx.await.unwrap());
+    assert_eq!(
+        lifecycle,
+        [
+            "start",
+            "delta:partial-0",
+            &closing(1, 4),
+            "retry:1/4",
+            "start",
+            "end:Aborted:Cancelled",
+        ],
+    );
+    let last = new_messages.iter().rev().find_map(|m| match m {
+        AgentMessage::Llm(Message::Assistant { stop_reason, .. }) => Some(stop_reason.clone()),
+        _ => None,
+    });
+    assert_eq!(last, Some(StopReason::Aborted));
+    assert!(errors.lock().unwrap().is_empty(), "{:?}", errors.lock());
 }

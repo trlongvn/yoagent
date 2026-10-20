@@ -1,10 +1,14 @@
 // Enables the `doc_cfg` feature badges on docs.rs only; a no-op on stable.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// wasm32 is single-threaded: `MaybeSend`/`MaybeSync` drop `Send`/`Sync` there
+// on purpose (host futures are not `Send`), so an `Arc` of such a value is
+// shared within one thread only. Native builds keep the lint.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 
-//! **agent** â€” the agent runtime for Rust.
+//! **agent** — the agent runtime for Rust.
 //!
 //! A simple, effective agent loop with tool execution and event streaming:
-//! `Prompt â†’ LLM stream â†’ tool execution â†’ loop`. The loop is the product;
+//! `Prompt → LLM stream → tool execution → loop`. The loop is the product;
 //! everything else is optional layers on top of it.
 //!
 //! # Quick start
@@ -12,60 +16,74 @@
 //! ```no_run
 //! use agent::{Agent, provider::ModelConfig, tools};
 //!
+//! # #[cfg(feature = "native")]
 //! # #[tokio::main]
 //! # async fn main() {
 //! // Provider is selected from the config's protocol; the API key is read
 //! // from ANTHROPIC_API_KEY. Call `.with_api_key(...)` to override.
-//! let mut agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5"))
+//! let mut agent = Agent::from_config(ModelConfig::claude_sonnet_5())
 //!     .with_system_prompt("You are a helpful coding assistant.")
 //!     .with_tools(tools::default_tools());
 //!
 //! let mut events = agent.prompt("List the files in the current directory").await;
 //! while let Some(event) = events.recv().await {
-//!     // stream text deltas, tool calls, usage â€” render however you like
+//!     // stream text deltas, tool calls, usage — render however you like
 //! }
 //! agent.finish().await;
 //! # }
+//! # #[cfg(not(feature = "native"))]
+//! # fn main() {}
 //! ```
 //!
 //! # What's in the box
 //!
-//! - **The loop** ([`agent_loop()`](agent_loop())) â€” a stateless free function; [`Agent`] is an
+//! - **The loop** ([`agent_loop()`](agent_loop())) — a stateless free function; [`Agent`] is an
 //!   optional stateful wrapper (history, tool registry, steering queues).
-//! - **7 provider protocols, 20+ providers** ([`provider`]) â€” Anthropic,
+//! - **7 provider protocols, 20+ providers** ([`provider`]) — Anthropic,
 //!   OpenAI (Completions + Responses), Azure, Gemini, Vertex, Bedrock, plus
 //!   OpenAI-compatible gateways (Groq, DeepSeek, xAI, OpenCode, Ollama, ...)
 //!   with per-provider quirk flags.
-//! - **Tools** ([`tools`]) â€” bash, read/write/edit file, search; add your own
+//! - **Tools** ([`tools`]) — bash, read/write/edit file, search; add your own
 //!   via the [`AgentTool`] trait. [MCP](mcp) servers and
 //!   [OpenAPI specs](https://docs.rs/yoagent/latest/yoagent/openapi/index.html)
-//!   (feature `openapi`) become tools transparently.
-//! - **Steering** â€” inject guidance into a running agent ([`Agent::steer`]);
+//!   (feature `openapi`) become tools transparently. A [`ToolSource`]
+//!   supplies tools resolved at the start of every run, for tool sets that
+//!   change while the agent lives (plugins, reconnecting servers).
+//! - **Steering** — inject guidance into a running agent ([`Agent::steer`]);
 //!   picked up between tool executions (per batch under the default parallel
 //!   strategy). Queue follow-ups, inspect/edit the queues.
-//! - **Structured outputs** ([`Agent::prompt_structured`]) â€” typed,
+//! - **Structured outputs** ([`Agent::prompt_structured`]) — typed,
 //!   schema-validated replies, enforced natively where supported (forced
 //!   tool call / `json_schema` / `responseSchema`).
-//! - **Permissions** ([`ToolMiddleware`]) â€” async approve/deny/modify hooks
+//! - **Permissions** ([`ToolMiddleware`]) — async approve/deny/modify hooks
 //!   gating every tool call; the mechanism behind approval prompts and
-//!   policy engines (agent ships no policy â€” you install it).
-//! - **Input filtering** ([`InputFilter`]) â€” rewrite or reject user input
-//!   before it reaches the model (PII redaction, prompt-injection guards).
-//! - **Sub-agents** ([`SubAgentTool`]) â€” delegation with per-sub-agent models
+//!   policy engines (agent ships no policy — you install it).
+//! - **Input filtering** ([`InputFilter`], [`AsyncInputFilter`]) — rewrite or
+//!   reject user input before it reaches the model (PII redaction,
+//!   prompt-injection guards).
+//! - **Turn hooks** ([`TurnHook`]) — an async hook before every LLM request
+//!   that may add one transient note to the request's latest user turn.
+//! - **Decision models** (feature `decision`) — typed questions (yes/no,
+//!   choice, score) answered with calibrated probabilities, e.g. TypeSafe's
+//!   Jev, or any OpenAI-compatible LLM that returns logprobs; fallbacks and
+//!   calibration; advisory skill/tool hints, and an opt-in, fail-closed tool
+//!   gate and input guard.
+//!   Off by default; nothing is sent until you pick a model.
+//! - **Sub-agents** ([`SubAgentTool`]) — delegation with per-sub-agent models
 //!   and [`SharedState`] for passing artifacts by reference.
-//! - **GASP** (feature `gasp`) â€” record runs into a
+//! - **GASP** (feature `gasp`) — record runs into a
 //!   [GASP](https://github.com/yologdev/gasp) agent repo: append-only
 //!   semantic event log, restore = clone + replay, conformance-checked in CI.
-//! - **Session trees** ([`Session`]) â€” branching conversation history with
+//! - **Session trees** ([`Session`]) — branching conversation history with
 //!   fork, checkpoints, and JSONL persistence; edit an earlier turn and
 //!   re-run without losing the original branch.
-//! - **Context management** ([`context`]) â€” token tracking and tiered
+//! - **Context management** ([`context`]) — token tracking and tiered
 //!   compaction so long sessions keep running.
-//! - **Skills** ([`skills`]) â€” load `SKILL.md` files per the
+//! - **Skills** ([`skills`]) — load `SKILL.md` files per the
 //!   [AgentSkills](https://agentskills.io) standard.
-//! - **Telemetry** â€” `tracing` spans per loop/LLM-stream/tool with token and
+//! - **Telemetry** — `tracing` spans per loop/LLM-stream/tool with token and
 //!   cost fields; bridge to OpenTelemetry app-side, negligible cost otherwise.
-//! - **Testing** ([`provider::mock::MockProvider`]) â€” script a whole multi-turn
+//! - **Testing** ([`provider::mock::MockProvider`]) — script a whole multi-turn
 //!   tool-calling conversation with no network. It honours the cancellation
 //!   token, so abort and steering paths are testable too.
 //!
@@ -76,14 +94,17 @@ pub mod agent_loop;
 pub mod context;
 pub mod core;
 pub mod decide;
+pub mod extension;
 pub mod llm_compaction;
 pub mod mcp;
 pub mod provider;
 pub mod retry;
+pub mod rt;
 pub mod session;
 pub mod shared_state;
 pub mod skills;
 pub mod sub_agent;
+pub mod tool_source;
 pub mod tools;
 pub mod types;
 
@@ -95,16 +116,25 @@ pub mod openapi;
 #[cfg_attr(docsrs, doc(cfg(feature = "gasp")))]
 pub mod gasp;
 
+#[cfg(feature = "decision")]
+#[cfg_attr(docsrs, doc(cfg(feature = "decision")))]
+pub mod decision;
+
+pub use core::{Agent, AgentBuildError, StructuredPromptError};
+// Not `pub use decide::…` as well: the two modules' error types share the
+// name `DecisionError`, so re-exporting both makes the name ambiguous at the
+// crate root.
 pub use agent_loop::{agent_loop, agent_loop_continue, PrepareContextFn};
 pub use context::{CompactionStrategy, DefaultCompaction};
-pub use core::{Agent, AgentBuildError, StructuredPromptError};
-pub use decide::{decide, Decision, DecisionError};
+pub use decide::{decide, Decision};
+pub use extension::{Extension, ExtensionMode, RunHooks};
 pub use llm_compaction::LlmCompaction;
 pub use retry::RetryConfig;
 pub use session::{Session, SessionEntry, SessionError};
 pub use shared_state::SharedState;
 pub use skills::SkillSet;
 pub use sub_agent::SubAgentTool;
+pub use tool_source::ToolSource;
 pub use types::*;
 
 #[cfg(any(feature = "memory", feature = "memory-onnx"))]

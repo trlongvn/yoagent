@@ -132,22 +132,21 @@ impl<'a> Widget for ComposerWidget<'a> {
         block.render(area, buf);
 
         // placeholder when empty
-        let display: Line;
         let prompt_span = Span::styled("> ", Style::default().fg(self.theme.accent));
-        if self.composer.text.is_empty() {
-            display = Line::from(vec![
+        let display: Line = if self.composer.text.is_empty() {
+            Line::from(vec![
                 prompt_span,
                 Span::styled(
                     "Ask the agent…",
                     Style::default().fg(self.theme.text_dimmed),
                 ),
-            ]);
+            ])
         } else {
-            display = Line::from(vec![
+            Line::from(vec![
                 prompt_span,
                 Span::styled(&self.composer.text, Style::default().fg(self.theme.text)),
-            ]);
-        }
+            ])
+        };
         let p = Paragraph::new(display);
         p.render(inner, buf);
     }

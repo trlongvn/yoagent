@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.18.1"
+version = "0.25.4"
 edition = "2021"
 # MSRV-aware dependency resolution (cargo 1.84+): prefer dependency versions
 # whose own rust-version fits ours. Without it CI re-resolves to whatever is
@@ -31,7 +31,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "fs", "macros", "process", "time", "io-util"] }
+# `fs` and `process` (which pulls in mio networking) are native-only; see
+# the `native` feature.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "time", "io-util"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"
 # 1.0.177 floor: the release that added rename_all_fields (AgentEvent wire format)
@@ -41,7 +43,7 @@ async-trait = "0.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
-reqwest = { version = "0.13", features = ["json", "stream", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 reqwest-eventsource = { package = "kameleoon-reqwest-eventsource", version = "0.6" }
 futures = "0.3"
 rand = "0.10.0"
@@ -69,23 +71,46 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 # no C toolchain, no GPU, and no runtime dylib. Optional so the default build
 # stays lean; enable with `--features needle3`.
 needle-infer = { version = "0.3.1", optional = true }
+# `Instant`/`SystemTime` that work on wasm32 too; plain re-exports of
+# `std::time` on native targets.
+web-time = "1"
+# SigV4 request signing for Amazon Bedrock (`provider::sigv4`). RustCrypto,
+# pure Rust. Used directly rather than through the TLS stack's primitives
+# (aws-lc-rs today), which are a transitive detail of reqwest's backend choice.
+sha2 = { version = "0.11", default-features = false }
+hmac = "0.13"
 openapiv3 = { version = "2", optional = true }
 serde_yaml_ng = { version = "0.10", optional = true }
 # 0.4.2 floor: 0.4.1 declared MSRV 1.85 but required 1.88 (let-chain)
 yoagent-state = { version = "0.5", optional = true }
+# The GASP recorder's plugin-log layer (`gasp::GaspRecorder::plugin_log_layer`).
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["registry"] }
 
 [features]
+default = ["native"]
+# Native hosts: built-in filesystem/shell tools, stdio MCP, shared state on
+# disk, the price-table disk cache, SOCKS proxies and all of reqwest's default
+# features (TLS among them: without it HTTPS provider calls fail at runtime).
+# Turning it off is how yoagent builds for `wasm32-unknown-unknown`
+# (e.g. Cloudflare Workers); see docs for what remains available there.
+native = ["tokio/process", "tokio/fs", "reqwest/default", "reqwest/socks"]
 openapi = ["dep:openapiv3", "dep:serde_yaml_ng", "reqwest/query"]
 config-file = ["dep:toml"]
 # Memory via external embedding API (OpenAI/Ollama) — no local model, small binary.
 memory = ["dep:uteke-core", "config-file"]
 # Memory with bundled ONNX embedding model (offline) — pulls ~200MB model + ort.
 memory-onnx = ["dep:uteke-core", "uteke-core/onnx", "dep:ort", "config-file"]
-gasp = ["dep:yoagent-state"]
+gasp = ["dep:yoagent-state", "dep:tracing-subscriber"]
 # Needle 3 on-device tool-calling (see `provider::needle3`). Pure Rust.
 needle3 = ["dep:needle-infer"]
+# Decision models (typed questions -> calibrated answers), e.g. TypeSafe Jev.
+# Off by default; adds no dependencies. Nothing is sent until you pick a model.
+decision = []
 
-[dev-dependencies]
+# Native test tooling. Target-scoped because Cargo builds every
+# dev-dependency for the target under test, and Tokio's `full`, tempfile and
+# wiremock do not build for wasm32 (see `tests/wasm32.rs`).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["registry", "fmt"] }
 tempfile = "3"
@@ -118,9 +143,124 @@ name = "memory_builtin"
 required-features = ["memory"]
 
 [[example]]
+name = "cli"
+required-features = ["native"]
+
+[[example]]
+name = "rlm"
+required-features = ["native"]
+
+[[example]]
+name = "sub_agent"
+required-features = ["native"]
+
+[[test]]
+name = "tools_test"
+required-features = ["native"]
+
+# Replays the native read tool's paging (`tools::DEFAULT_READ_MAX_LINES`).
+[[test]]
+name = "context_cache_test"
+required-features = ["native"]
+
+[[test]]
+name = "price_fetch_test"
+required-features = ["native"]
+
+[[test]]
+name = "price_enable_test"
+required-features = ["native"]
+
+[[test]]
+name = "integration_anthropic"
+required-features = ["native"]
+
+[[test]]
+name = "integration_gemini"
+required-features = ["native"]
+
+[[example]]
 name = "gasp_emit"
 required-features = ["gasp"]
 
 [[example]]
 name = "llm_compaction_live"
 required-features = ["gasp"]
+
+[[test]]
+name = "decision_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_agent_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_env_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_clef_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_openai_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_live"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_logprobs_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_fallback_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_calibrate_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_guard_test"
+required-features = ["decision"]
+
+[[test]]
+name = "decision_deprecation_test"
+required-features = ["decision"]
+
+[[example]]
+name = "decision"
+required-features = ["decision"]
+
+# Used only by cargo-mutants (`.cargo/mutants.toml`, the weekly mutation-testing
+# workflow): a mutant is rebuilt and the suite rerun hundreds of times, and
+# opt-level 1 roughly halves the test time (the 2400-turn replays in
+# `tests/context_cache_test.rs`). Profiles are ignored in dependents' builds.
+[profile.mutants]
+inherits = "test"
+debug = false
+opt-level = 1
+
+# `BashTool` kills a command's whole process group on timeout or cancel
+# (`killpg`). Already in the tree through tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# wasm32 (e.g. Cloudflare Workers): randomness from the JS host, and a
+# JS-backed executor/timer in place of a Tokio runtime.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["v4", "js"] }
+wasm-bindgen-futures = "0.4"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+# Runs `tests/wasm32.rs` under Node. Its runner, `wasm-bindgen-test-runner`
+# from wasm-bindgen-cli, must match the resolved wasm-bindgen version (the CI
+# job looks it up with `cargo metadata`).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.76"

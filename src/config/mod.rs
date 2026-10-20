@@ -179,28 +179,31 @@ impl AgentConfigFile {
             });
 
         let model_id = self.model_id.clone();
-        ModelConfig {
-            id: self.model_id,
-            name: if self.name.is_empty() {
-                model_id
-            } else {
-                self.name
-            },
-            api,
-            provider: self.provider,
-            base_url: self.base_url,
-            reasoning: self.reasoning,
-            context_window: self.context_window,
-            max_tokens: self.max_tokens,
-            cost: Default::default(),
-            headers: self.headers,
-            compat,
-            anthropic: None,
-        }
+        // `ModelConfig` is `#[non_exhaustive]` (private `list_priced`), so it
+        // is built through the normal constructor and then configured: the
+        // config file carries its own protocol, headers and window, which the
+        // constructors do not know about.
+        let mut config = ModelConfig::openai_compat(
+            self.base_url,
+            self.model_id,
+            self.provider,
+            OpenAiCompat::openai(),
+        );
+        config.api = api;
+        config.name = if self.name.is_empty() {
+            model_id
+        } else {
+            self.name
+        };
+        config.reasoning = self.reasoning;
+        config.context_window = self.context_window;
+        config.max_tokens = self.max_tokens;
+        config.cost = Default::default();
+        config.headers = self.headers;
+        config.compat = compat;
+        config
     }
 }
-
-/// Errors that can occur while loading config.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("AGENT_CONFIG not set and no default found")]

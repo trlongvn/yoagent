@@ -1,4 +1,4 @@
-//! Provider registry â€” maps ApiProtocol to StreamProvider implementations.
+//! Provider registry — maps ApiProtocol to StreamProvider implementations.
 
 use super::model::{ApiProtocol, ModelConfig};
 use super::traits::*;
@@ -166,7 +166,7 @@ mod tests {
 /// Resolve an API key from the conventional environment variable(s) for a
 /// provider name (the `ModelConfig.provider` string).
 ///
-/// Used as a fallback when no explicit key is set on the agent â€” an explicit
+/// Used as a fallback when no explicit key is set on the agent — an explicit
 /// `with_api_key` always wins. Conventions:
 ///
 /// | provider | env var(s), first match wins |
@@ -179,8 +179,8 @@ mod tests {
 /// | `meta` | `META_API_KEY`, then `MODEL_API_KEY` |
 /// | `opencode-zen` / `opencode-go` | `OPENCODE_API_KEY` |
 /// | `azure` | `AZURE_OPENAI_API_KEY` |
-/// | `bedrock` | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`), composed as `access:secret[:token]` |
-/// | `vertex` | none â€” pass a short-lived OAuth token via `with_api_key` |
+/// | `bedrock` | `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key, sent as a bearer token), then `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`), composed as `access:secret[:token]` and used to SigV4-sign. `Agent`, `SubAgentTool` and `LlmCompaction` do not call this for a `BedrockConverseStream` config, whatever its provider string: they leave the key empty and the Bedrock provider reads these variables per request |
+/// | `vertex` | none — pass a short-lived OAuth token via `with_api_key` |
 /// | `local` / `ollama` | no key needed (empty) |
 /// | anything else | `AGENT_API_KEY`, then `API_KEY` |
 pub fn resolve_api_key(provider: &str) -> Option<String> {
@@ -211,11 +211,21 @@ pub fn resolve_api_key(provider: &str) -> Option<String> {
         "opencode-zen" | "opencode-go" => first(&["OPENCODE_API_KEY"]),
         "azure" => first(&["AZURE_OPENAI_API_KEY"]),
         "bedrock" => {
-            let access = var("AWS_ACCESS_KEY_ID").ok()?;
-            let secret = var("AWS_SECRET_ACCESS_KEY").ok()?;
-            Some(match var("AWS_SESSION_TOKEN") {
-                Ok(token) => format!("{}:{}:{}", access, secret, token),
-                Err(_) => format!("{}:{}", access, secret),
+            // Empty values count as unset (a blanked-out export).
+            let set = |n: &str| var(n).ok().filter(|v| !v.trim().is_empty());
+            // A Bedrock API key wins, as in the AWS SDKs.
+            if let Some(token) = set(crate::provider::bedrock::BEARER_TOKEN_ENV) {
+                tracing::debug!(
+                    "resolved API key for provider 'bedrock' from ${}",
+                    crate::provider::bedrock::BEARER_TOKEN_ENV
+                );
+                return Some(token);
+            }
+            let access = set("AWS_ACCESS_KEY_ID")?;
+            let secret = set("AWS_SECRET_ACCESS_KEY")?;
+            Some(match set("AWS_SESSION_TOKEN") {
+                Some(token) => format!("{}:{}:{}", access, secret, token),
+                None => format!("{}:{}", access, secret),
             })
         }
         "vertex" => None,
@@ -228,7 +238,30 @@ pub fn resolve_api_key(provider: &str) -> Option<String> {
 /// for a provider that needs a key, then falls back to an empty string so
 /// the provider returns a clear authentication error instead of the failure
 /// being invisible until the first request.
-pub(crate) fn resolve_api_key_or_warn(provider: &str) -> String {
+///
+/// Resolution follows the config's **protocol** before its provider string:
+/// a `BedrockConverseStream` config always gets an empty key, whatever its
+/// provider is called (`ModelConfig::custom(.., "aws-bedrock", ..)` must not
+/// pick up `API_KEY`), and the Bedrock provider reads
+/// `AWS_BEARER_TOKEN_BEDROCK` / `AWS_*` itself when the request is built — so
+/// it can say exactly which variable is missing or malformed. The warning
+/// is still logged here when the environment has no Bedrock credentials.
+/// Without a config the provider is taken to be `anthropic`.
+pub(crate) fn resolve_api_key_or_warn(config: Option<&ModelConfig>) -> String {
+    if let Some(config) = config {
+        if config.api == ApiProtocol::BedrockConverseStream {
+            if resolve_api_key("bedrock").is_none() {
+                tracing::warn!(
+                    "no API key found for provider '{}' (Amazon Bedrock): {}; requests \
+                     will fail with an authentication error",
+                    config.provider,
+                    api_key_env_hint("bedrock")
+                );
+            }
+            return String::new();
+        }
+    }
+    let provider = config.map(|c| c.provider.as_str()).unwrap_or("anthropic");
     match resolve_api_key(provider) {
         Some(key) => key,
         None => {
@@ -263,8 +296,9 @@ fn api_key_env_hint(provider: &str) -> &'static str {
         "opencode-zen" | "opencode-go" => "set OPENCODE_API_KEY or call .with_api_key(...)",
         "azure" => "set AZURE_OPENAI_API_KEY or call .with_api_key(...)",
         "bedrock" => {
-            "set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) \
-             or call .with_api_key(\"access:secret[:token]\")"
+            "set AWS_BEARER_TOKEN_BEDROCK, or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY \
+             (+ AWS_SESSION_TOKEN), or call .with_api_key(...) with a Bedrock API key \
+             or \"access:secret[:token]\""
         }
         "vertex" => "pass a short-lived OAuth token via .with_api_key(...)",
         _ => "set AGENT_API_KEY (or API_KEY) or call .with_api_key(...)",
@@ -280,13 +314,13 @@ mod resolve_key_tests {
         // local/ollama need no key
         assert_eq!(resolve_api_key("local").as_deref(), Some(""));
         assert_eq!(resolve_api_key("ollama").as_deref(), Some(""));
-        // vertex expects an explicit OAuth token â€” never env-resolved
+        // vertex expects an explicit OAuth token — never env-resolved
         assert_eq!(resolve_api_key("vertex"), None);
     }
 
     #[test]
     fn test_meta_env_resolution() {
-        // Own vars as of this writing â€” grep before reusing MODEL_API_KEY in
+        // Own vars as of this writing — grep before reusing MODEL_API_KEY in
         // another test. Clear first: a developer shell may export these.
         std::env::remove_var("META_API_KEY");
         std::env::set_var("MODEL_API_KEY", "official-var");
@@ -382,7 +416,7 @@ mod registry_tests {
     }
 
     /// Each protocol must resolve to a provider that actually *speaks* that
-    /// protocol â€” guards against a mis-wired `register()` line (e.g. mapping
+    /// protocol — guards against a mis-wired `register()` line (e.g. mapping
     /// `GoogleVertex` to the Anthropic provider) that a mere is-some check
     /// would miss.
     #[test]

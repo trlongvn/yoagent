@@ -27,9 +27,7 @@ use ::agent::agent_loop::{agent_loop, AgentLoopConfig};
 use ::agent::provider::mock::MockResponse;
 use ::agent::provider::{MockProvider, ProviderError, StreamConfig, StreamEvent, StreamProvider};
 use ::agent::types::*;
-use ::agent::{
-    AgentContext, CacheConfig, RetryConfig, ThinkingLevel, ToolContext, ToolExecutionStrategy,
-};
+use ::agent::{AgentContext, ThinkingLevel, ToolContext};
 
 use ::agent::memory_integration::{
     effective_namespace, install_memory_hooks, make_prepare_context, MemoryManageTool,
@@ -41,6 +39,9 @@ use support::{service_with, FakeMemoryBackend};
 // ---------------------------------------------------------------------------
 // Loop harness
 // ---------------------------------------------------------------------------
+
+/// The provider's captured request log, shared with the caller.
+type CapturedRequests = Arc<Mutex<Vec<Vec<Message>>>>;
 
 /// A provider that fails every request — drives the loop down the
 /// `StopReason::Error` path.
@@ -59,34 +60,10 @@ impl StreamProvider for AlwaysErroringProvider {
 }
 
 fn make_config(provider: Arc<dyn StreamProvider>) -> AgentLoopConfig {
-    AgentLoopConfig {
-        provider,
-        model: "mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        tool_middleware: vec![],
-        output_schema: None,
-        retry_config: RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        turn_delay: None,
-    }
+    let mut config = AgentLoopConfig::new(provider, "mock");
+    config.api_key = "test".into();
+    config.thinking_level = ThinkingLevel::Off;
+    config
 }
 
 /// Records every request it sees.
@@ -96,7 +73,7 @@ struct CapturingProvider {
 }
 
 impl CapturingProvider {
-    fn new(inner: MockProvider) -> (Arc<Self>, Arc<Mutex<Vec<Vec<Message>>>>) {
+    fn new(inner: MockProvider) -> (Arc<Self>, CapturedRequests) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {

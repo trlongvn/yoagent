@@ -1,6 +1,8 @@
 # Summary
 
 [Introduction](introduction.md)
+[Design Philosophy](design-philosophy.md)
+[设计哲学](design-philosophy.zh-CN.md)
 
 # Getting Started
 
@@ -17,17 +19,22 @@
 - [Prompt Caching](concepts/prompt-caching.md)
 - [Retry with Backoff](concepts/retry.md)
 - [Skills](concepts/skills.md)
+- [Decision Models](concepts/decision-models.md)
 - [Sub-Agents & Shared State](concepts/sub-agents.md)
 - [State Persistence](concepts/persistence.md)
 - [Session Trees](concepts/session-trees.md)
 - [GASP: Your Agent Is a Git Repo](concepts/gasp.md)
+- [Extensions](concepts/extensions.md)
 - [Lifecycle Callbacks](concepts/callbacks.md)
 - [Telemetry](concepts/telemetry.md)
+- [Model Pricing](concepts/pricing.md)
 
 # Guides
 
 - [MCP Integration](guides/mcp.md)
 - [OpenAPI Tools](guides/openapi.md)
+- [WebAssembly & Cloudflare Workers](guides/wasm-workers.md)
+- [Testing Your Agent](guides/testing.md)
 
 # Providers
 
@@ -35,6 +42,7 @@
 - [Model Presets](providers/model-presets.md)
 - [Anthropic](providers/anthropic.md)
 - [OpenAI Compatible](providers/openai-compat.md)
+- [OpenAI Responses](providers/openai-responses.md)
 - [Google Gemini](providers/google.md)
 - [Amazon Bedrock](providers/bedrock.md)
 - [Azure OpenAI](providers/azure-openai.md)
@@ -49,6 +57,9 @@
 # Evaluations
 
 - [LlmCompaction: live evaluation](evals/llm-compaction-live.md)
+- [Compaction defaults: offline sweep](evals/compaction-defaults.md)
+- [Mutation testing: baseline](evals/mutation-baseline.md)
+- [Plugin compatibility: pi and DSH](evals/plugin-compatibility.md)
 
 # Architecture
 

@@ -13,10 +13,8 @@
 use super::model::ModelConfig;
 use super::traits::*;
 // Reuse the shared Google SSE error helpers instead of reimplementing.
-use super::google::is_error_payload;
-use super::traits::classify_sse_error_event;
+
 use crate::types::*;
-use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 pub struct GoogleVertexProvider;
@@ -32,7 +30,8 @@ impl GoogleVertexProvider {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl StreamProvider for GoogleVertexProvider {
     fn protocol(&self) -> Option<crate::provider::ApiProtocol> {
         Some(crate::provider::ApiProtocol::GoogleVertex)
@@ -54,15 +53,13 @@ impl StreamProvider for GoogleVertexProvider {
             .as_ref()
             .ok_or_else(|| ProviderError::Other("ModelConfig required".into()))?;
 
-        // Override the base_url to use Vertex format.
-        // The GoogleProvider's stream will use model_config.base_url, but we need
-        // a different URL pattern. We delegate to GoogleProvider with a modified config.
+        // Vertex's URL pattern differs from the Gemini API's.
         let vertex_url = Self::vertex_url(model_config, &config.model);
 
         // Create a modified model config with the Vertex URL pattern
         let mut vertex_model = model_config.clone();
-        // For Vertex, auth is via Bearer token (OAuth2), not API key in query param.
-        // We need to add the Authorization header.
+        // Vertex authenticates with an OAuth2 Bearer token, not a Gemini API
+        // key.
         vertex_model.headers.insert(
             "authorization".to_string(),
             format!("Bearer {}", config.api_key),
@@ -88,268 +85,22 @@ impl StreamProvider for GoogleVertexProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::classify(
+            return Err(ProviderError::classify_with_retry_after(
                 status.as_u16(),
                 &format!("Vertex AI error {}: {}", status, body),
+                retry_after,
             ));
         }
 
-        // Delegate SSE parsing to the Google provider's streaming logic.
-        // Since the response format is identical, we reuse GoogleProvider.
-        // However, we already have the response, so we'll parse it inline.
-        // For simplicity, delegate fully to GoogleProvider with modified config.
-        let mut modified_config = config.clone();
-        modified_config.model_config = Some(vertex_model);
-
-        // Actually, let's just delegate to GoogleProvider. The key difference
-        // is auth (Bearer vs API key in URL). We handle that by using a modified
-        // model config. But GoogleProvider builds its own URL... so let's just
-        // use GoogleProvider with a trick: empty api_key and auth in headers.
-        // We can't easily reuse GoogleProvider because it constructs its own URL.
-        // Instead, parse the SSE response directly (same format as Google GenAI).
-        parse_google_sse_response(response, &config, &model_config.provider, tx, cancel).await
+        // Same SSE format as the Gemini API: one parser for both.
+        super::google::parse_stream(response, &config.model, &model_config.provider, tx, cancel)
+            .await
     }
-}
-
-/// Parse a Google-format SSE response stream. Shared between Google and Vertex.
-async fn parse_google_sse_response(
-    response: reqwest::Response,
-    config: &StreamConfig,
-    provider_name: &str,
-    tx: mpsc::UnboundedSender<StreamEvent>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<Message, ProviderError> {
-    use futures::StreamExt;
-    use serde::Deserialize;
-    use tracing::{debug, warn};
-
-    let mut content: Vec<Content> = Vec::new();
-    let mut usage = Usage::default();
-    let mut stop_reason = StopReason::Stop;
-
-    let _ = tx.send(StreamEvent::Start);
-
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(ProviderError::Cancelled);
-            }
-            chunk = stream.next() => {
-                match chunk {
-                    None => break,
-                    Some(Err(e)) => {
-                        // Match the other providers: a transport failure is an
-                        // error (and retryable), not a silently truncated turn.
-                        let provider_err = ProviderError::Network(e.to_string());
-                        warn!("Vertex stream error: {}", provider_err);
-                        return Err(provider_err);
-                    }
-                    Some(Ok(bytes)) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event_str = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
-
-                            let data = event_str
-                                .lines()
-                                .find(|l| l.starts_with("data: "))
-                                .map(|l| &l[6..])
-                                .unwrap_or("");
-
-                            if data.is_empty() {
-                                continue;
-                            }
-
-                            // Google reports mid-stream failures as
-                            // {"error": {...}} payloads, which would otherwise
-                            // deserialize into an empty chunk and vanish. Without
-                            // this check a context-overflow envelope parses as
-                            // Chunk{candidates:None} and the turn returns a
-                            // silently truncated Ok — compaction never fires.
-                            if is_error_payload(data) {
-                                let provider_err = classify_sse_error_event(data);
-                                warn!("Vertex in-stream error: {}", provider_err);
-                                return Err(provider_err);
-                            }
-
-                            #[derive(Deserialize)]
-                            struct Chunk {
-                                #[serde(default)]
-                                candidates: Option<Vec<Candidate>>,
-                                #[serde(default, rename = "usageMetadata")]
-                                usage_metadata: Option<UsageMeta>,
-                            }
-                            #[derive(Deserialize)]
-                            struct Candidate {
-                                #[serde(default)]
-                                content: Option<CContent>,
-                                #[serde(default, rename = "finishReason")]
-                                finish_reason: Option<String>,
-                            }
-                            #[derive(Deserialize)]
-                            struct CContent {
-                                #[serde(default)]
-                                parts: Vec<Part>,
-                            }
-                            #[derive(Deserialize)]
-                            struct Part {
-                                #[serde(default)]
-                                text: Option<String>,
-                                #[serde(default)]
-                                thought: Option<bool>,
-                                #[serde(default, rename = "functionCall")]
-                                function_call: Option<FCall>,
-                                #[serde(default, rename = "thoughtSignature")]
-                                thought_signature: Option<String>,
-                            }
-                            #[derive(Deserialize)]
-                            struct FCall {
-                                name: String,
-                                #[serde(default)]
-                                args: Option<serde_json::Value>,
-                            }
-                            #[derive(Deserialize)]
-                            struct UsageMeta {
-                                #[serde(default, rename = "promptTokenCount")]
-                                prompt_token_count: Option<u64>,
-                                #[serde(default, rename = "candidatesTokenCount")]
-                                candidates_token_count: Option<u64>,
-                                #[serde(default, rename = "totalTokenCount")]
-                                total_token_count: Option<u64>,
-                                #[serde(default, rename = "cachedContentTokenCount")]
-                                cached_content_token_count: Option<u64>,
-                            }
-
-                            let parsed: Chunk = match serde_json::from_str(data) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    debug!("Failed to parse Vertex chunk: {}", e);
-                                    continue;
-                                }
-                            };
-
-                            for candidate in parsed.candidates.unwrap_or_default() {
-                                if let Some(c) = candidate.content {
-                                    for part in c.parts {
-                                        if let Some(text) = part.text {
-                                            if part.thought.unwrap_or(false) {
-                                                let think_idx = content.iter().position(|c| matches!(c, Content::Thinking { .. }));
-                                                let idx = match think_idx {
-                                                    Some(i) => i,
-                                                    None => {
-                                                        content.push(Content::thinking(String::new()));
-                                                        content.len() - 1
-                                                    }
-                                                };
-                                                if let Some(Content::Thinking { thinking, .. }) = content.get_mut(idx) {
-                                                    thinking.push_str(&text);
-                                                }
-                                                let _ = tx.send(StreamEvent::ThinkingDelta {
-                                                    content_index: idx,
-                                                    delta: text,
-                                                });
-                                                continue;
-                                            }
-                                            let idx = content.iter().position(|c| matches!(c, Content::Text { .. }));
-                                            let idx = match idx {
-                                                Some(i) => i,
-                                                None => {
-                                                    content.push(Content::Text { text: String::new() });
-                                                    content.len() - 1
-                                                }
-                                            };
-                                            if let Some(Content::Text { text: t }) = content.get_mut(idx) {
-                                                t.push_str(&text);
-                                            }
-                                            let _ = tx.send(StreamEvent::TextDelta {
-                                                content_index: idx,
-                                                delta: text,
-                                            });
-                                        }
-                                        if let Some(fc) = part.function_call {
-                                            let id = format!("vertex-fc-{}", content.len());
-                                            let args = fc.args.unwrap_or(serde_json::Value::Object(Default::default()));
-                                            // Gemini thinking conversations require the
-                                            // thought signature replayed on function calls.
-                                            let metadata = part.thought_signature.as_ref().map(|sig| {
-                                                serde_json::json!({"thought_signature": sig})
-                                            });
-                                            let idx = content.len();
-                                            content.push(Content::ToolCall { provider_metadata: metadata,
-                                                id: id.clone(),
-                                                name: fc.name.clone(),
-                                                arguments: args,
-                                            });
-                                            let _ = tx.send(StreamEvent::ToolCallStart {
-                                                content_index: idx,
-                                                id,
-                                                name: fc.name,
-                                            });
-                                            let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
-                                            stop_reason = StopReason::ToolUse;
-                                        }
-                                    }
-                                }
-                                if let Some(reason) = candidate.finish_reason {
-                                    stop_reason = match reason.as_str() {
-                                        "STOP" => StopReason::Stop,
-                                        "MAX_TOKENS" => StopReason::Length,
-                                        _ => StopReason::Stop,
-                                    };
-                                }
-                            }
-
-                            if let Some(u) = parsed.usage_metadata {
-                                // promptTokenCount includes cached tokens;
-                                // keep `input` as the uncached remainder so
-                                // downstream sums don't double-count.
-                                usage.input = u
-                                    .prompt_token_count
-                                    .unwrap_or(0)
-                                    .saturating_sub(u.cached_content_token_count.unwrap_or(0));
-                                usage.output = u.candidates_token_count.unwrap_or(0);
-                                usage.cache_read = u.cached_content_token_count.unwrap_or(0);
-                                usage.total_tokens = u.total_token_count.unwrap_or(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let message = Message::Assistant {
-        content,
-        stop_reason,
-        model: config.model.clone(),
-        provider: provider_name.to_string(),
-        usage,
-        timestamp: now_ms(),
-        error_message: None,
-    };
-
-    let _ = tx.send(StreamEvent::Done {
-        message: message.clone(),
-    });
-    Ok(message)
 }
 
 /// Build the request body for Vertex AI (same format as Google GenAI).
-/// Token budget for Vertex's thinkingConfig per level (same scale as Gemini).
-fn vertex_thinking_budget(level: ThinkingLevel) -> u32 {
-    match level {
-        ThinkingLevel::Off => 0,
-        ThinkingLevel::Minimal | ThinkingLevel::Low => 1024,
-        ThinkingLevel::Medium => 8192,
-        ThinkingLevel::High => 24576,
-    }
-}
-
 fn build_vertex_request_body(config: &StreamConfig) -> serde_json::Value {
     // Same format as Google GenAI
     let mut contents: Vec<serde_json::Value> = Vec::new();
@@ -443,12 +194,9 @@ fn build_vertex_request_body(config: &StreamConfig) -> serde_json::Value {
     if let Some(temp) = config.temperature {
         gen_config["temperature"] = serde_json::json!(temp);
     }
-    // Thinking: same thinkingConfig as the Gemini API.
-    if config.thinking_level != ThinkingLevel::Off {
-        gen_config["thinkingConfig"] = serde_json::json!({
-            "thinkingBudget": vertex_thinking_budget(config.thinking_level),
-            "includeThoughts": true,
-        });
+    // Thinking: same thinkingConfig as the Gemini API (level on 3+, budget on 2.x).
+    if let Some(thinking) = super::google::gemini_thinking_config(config) {
+        gen_config["thinkingConfig"] = thinking;
     }
     if gen_config != serde_json::json!({}) {
         body["generationConfig"] = gen_config;
@@ -532,8 +280,101 @@ mod tests {
     }
 
     #[test]
+    fn xhigh_and_max_clamp_to_the_flash_budget_ceiling() {
+        for level in [ThinkingLevel::XHigh, ThinkingLevel::Max] {
+            let body = build_vertex_request_body(&config(level));
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                24576
+            );
+        }
+        let body = build_vertex_request_body(&config(ThinkingLevel::Medium));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
+    }
+
+    #[test]
     fn thinking_off_omits_thinking_config() {
         let body = build_vertex_request_body(&config(ThinkingLevel::Off));
         assert!(body["generationConfig"]["thinkingConfig"].is_null());
+    }
+
+    fn vertex_thinking(model: &str, level: ThinkingLevel) -> serde_json::Value {
+        let mut c = config(level);
+        c.model = model.into();
+        build_vertex_request_body(&c)["generationConfig"]["thinkingConfig"].clone()
+    }
+
+    #[test]
+    fn gemini_3_on_vertex_sends_thinking_level_not_budget() {
+        // Vertex ids arrive bare or as full publisher resource paths.
+        for model in [
+            "gemini-3.1-pro-preview",
+            "publishers/google/models/gemini-3.1-pro-preview",
+            "projects/p/locations/global/publishers/google/models/gemini-3.1-pro-preview",
+        ] {
+            assert_eq!(
+                vertex_thinking(model, ThinkingLevel::High),
+                serde_json::json!({"thinkingLevel": "HIGH", "includeThoughts": true}),
+                "{model}"
+            );
+            // Off sends nothing: 3.1 Pro then thinks at its default (HIGH).
+            assert!(
+                vertex_thinking(model, ThinkingLevel::Off).is_null(),
+                "{model}"
+            );
+            // 3.1 Pro has no MINIMAL rung.
+            assert_eq!(
+                vertex_thinking(model, ThinkingLevel::Minimal)["thinkingLevel"],
+                "LOW",
+                "{model}"
+            );
+        }
+        // Image models on Vertex: only the levels the Vertex table lists.
+        assert_eq!(
+            vertex_thinking("gemini-3.1-flash-image", ThinkingLevel::Low)["thinkingLevel"],
+            "MINIMAL"
+        );
+        assert_eq!(
+            vertex_thinking("gemini-3-pro-image", ThinkingLevel::Low)["thinkingLevel"],
+            "HIGH"
+        );
+        assert!(vertex_thinking("gemini-3.1-flash-image", ThinkingLevel::Off).is_null());
+        assert_eq!(
+            vertex_thinking(
+                "projects/p/locations/global/publishers/google/models/gemini-3.5-flash-lite",
+                ThinkingLevel::Minimal
+            )["thinkingLevel"],
+            "MINIMAL"
+        );
+        // Positive control: the 2.5 path id on the same route keeps the budget.
+        assert_eq!(
+            vertex_thinking(
+                "projects/p/locations/global/publishers/google/models/gemini-2.5-pro",
+                ThinkingLevel::High
+            ),
+            serde_json::json!({"thinkingBudget": 24576, "includeThoughts": true})
+        );
+    }
+
+    #[test]
+    fn vertex_honours_the_google_compat_override() {
+        let mut c = config(ThinkingLevel::Medium);
+        c.model = "gemini-3.8-flash".into();
+        let mut mc = ModelConfig::custom(
+            crate::provider::ApiProtocol::GoogleVertex,
+            "vertex",
+            "https://example.invalid",
+            "gemini-3.8-flash",
+            "G",
+        );
+        mc.google = Some(crate::provider::GoogleCompat::force_thinking_budget());
+        c.model_config = Some(mc);
+        assert_eq!(
+            build_vertex_request_body(&c)["generationConfig"]["thinkingConfig"],
+            serde_json::json!({"thinkingBudget": 8192, "includeThoughts": true})
+        );
     }
 }

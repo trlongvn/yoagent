@@ -183,17 +183,13 @@ pub async fn decide(
                 raw: format!("{raw} (parse: {source})"),
             });
         }
-        Err(crate::core::StructuredPromptError::NoOutput) => {
-            return Err(DecisionError::NoOutput)
-        }
+        Err(crate::core::StructuredPromptError::NoOutput) => return Err(DecisionError::NoOutput),
         Err(crate::core::StructuredPromptError::Provider { message }) => {
             return Err(DecisionError::Provider { message })
         }
     };
 
-    let choice = match_option(&raw, &options).ok_or(DecisionError::NoMatch {
-        raw: raw.clone(),
-    })?;
+    let choice = match_option(&raw, &options).ok_or(DecisionError::NoMatch { raw: raw.clone() })?;
 
     Ok(Decision {
         choice,
@@ -215,10 +211,7 @@ fn match_option(raw: &str, options: &[String]) -> Option<String> {
         return Some(hit.clone());
     }
     let folded = trimmed.to_lowercase();
-    options
-        .iter()
-        .find(|o| o.to_lowercase() == folded)
-        .cloned()
+    options.iter().find(|o| o.to_lowercase() == folded).cloned()
 }
 
 fn validate_options(options: &[String]) -> Result<(), DecisionError> {
@@ -249,7 +242,7 @@ pub fn decision_config(config: ModelConfig) -> ModelConfig {
 
 /// Run a decision directly from a `ModelConfig`, without building an [`Agent`].
 ///
-/// Lower-level than [`decide`](decide): it drives the provider itself, so it
+/// Lower-level than [`decide`]: it drives the provider itself, so it
 /// works for a caller that already holds a registry and wants no agent state.
 /// The schema is enforced through [`StreamConfig::output_schema`], which every
 /// provider honours natively or warns about.
@@ -271,10 +264,7 @@ pub async fn decide_with_config(
         content: vec![Content::Text { text: query }],
         timestamp: 0,
     }];
-    stream_config.output_schema = Some(crate::provider::OutputSchema::new(
-        "decision",
-        schema,
-    ));
+    stream_config.output_schema = Some(crate::provider::OutputSchema::new("decision", schema));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -293,9 +283,7 @@ pub async fn decide_with_config(
         }
     }
 
-    let choice = match_option(&raw, &options).ok_or(DecisionError::NoMatch {
-        raw: raw.clone(),
-    })?;
+    let choice = match_option(&raw, &options).ok_or(DecisionError::NoMatch { raw: raw.clone() })?;
 
     Ok(Decision {
         choice,

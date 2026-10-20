@@ -2,6 +2,12 @@
 
 Sub-agents let a parent agent delegate tasks to child agent loops, each with their own system prompt, tools, and provider. The parent LLM invokes them like any other tool.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../images/subagents.svg">
+  <source media="(prefers-color-scheme: light)" srcset="../images/subagents-light.svg">
+  <img alt="Sub-agents sharing artifacts by reference through SharedState" src="../images/subagents.svg" width="100%">
+</picture>
+
 ## Overview
 
 ```
@@ -37,6 +43,9 @@ let researcher = SubAgentTool::from_config(
     .with_max_turns(10);
 ```
 
+(`ReadFileTool` and `SearchTool` are among the filesystem tools behind the
+default `native` feature.)
+
 ## Registering on a Parent Agent
 
 ```rust
@@ -64,7 +73,15 @@ When the parent LLM calls multiple sub-agents in a single response, they run con
 | `from_config(name, config)` / `from_provider(name, provider, config)` | Set the sub-agent's model, provider, and metadata from a `ModelConfig` — resolves the env key automatically and can use a different model than the parent |
 | `with_api_key()` | Override the env-resolved API key explicitly |
 | `with_tools()` | Tools available to the sub-agent (accepts `Vec<Arc<dyn AgentTool>>`) |
+| `with_tool_source()` | A `ToolSource` consulted once per delegation; its tools are offered for that run only, and the sub-agent's own tools win a name collision (see [Tools](tools.md#tools-that-change-at-runtime-toolsource)) |
+| `with_tool_middleware()` | Approve/deny/modify the sub-agent's own tool calls |
+| `with_turn_hook()` | A `TurnHook` for the sub-agent's own LLM requests |
+| `with_async_input_filter()` | Screen the task before the sub-agent runs; a `Reject` fails the tool call |
+| `with_shared_state()` / `with_scoped_shared_state()` | Shared key-value store (see [Shared State](#shared-state)) |
+| `with_context_config()` | Compaction budget for the sub-agent's context |
+| `with_max_tokens()` / `with_temperature()` | Override sampling settings (the model comes from `from_config` / `from_provider`) |
 | `with_max_turns(N)` | Turn limit (default: 10). Primary guard against runaway execution. |
+| `with_execution_limits(ExecutionLimits)` | All per-delegation limits: turns, tokens, duration, loop detection (default: 10 / 1M / 300 s / on). |
 | `with_thinking()` | Enable extended thinking for the sub-agent |
 | `with_cache_config()` | Prompt caching settings |
 | `with_turn_delay()` | Inter-turn delay to throttle API calls (useful for rate-limit-sensitive providers) |
@@ -76,7 +93,10 @@ When the parent LLM calls multiple sub-agents in a single response, they run con
 When the parent provides an `on_update` callback (standard for all tools), sub-agent events are forwarded as `ToolExecutionUpdate` events. The parent's UI sees real-time progress from the child:
 
 - Text deltas from the sub-agent's LLM responses
-- Tool call notifications from the sub-agent's tool usage
+- Tool call notifications from the sub-agent's tool usage (`[sub-agent calling tool: <name>]`)
+- Retry notices: a provider attempt that fails with a retryable error has its text deltas forwarded like any other, followed by `[sub-agent retrying after: <error>]`, so discard the partial text before that marker. `retry::retry_safe_events` on the parent's stream does not filter these: they arrive as `ToolExecutionUpdate`s
+
+The sub-agent's `ProgressMessage` events go to the parent's `on_progress` callback.
 
 ## Shared State
 
@@ -151,7 +171,7 @@ let state = SharedState::with_max_bytes(50 * 1024 * 1024); // 50MB
 
 A `set` call that would exceed capacity returns `Err(CapacityError)`.
 
-**FileBackend** — one file per key, persistent across process restarts:
+**FileBackend** (requires the default `native` feature; not available on wasm32) — one file per key, persistent across process restarts:
 
 ```rust
 use agent::shared_state::FileBackend;
@@ -166,7 +186,8 @@ Keys are percent-encoded to filenames (reversible, no collisions). Useful for de
 ```rust
 use agent::shared_state::{SharedStateBackend, SharedStateError};
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl SharedStateBackend for MyRedisBackend {
     async fn get(&self, key: &str) -> Result<Option<String>, SharedStateError> { ... }
     async fn set(&self, key: &str, value: String) -> Result<(), SharedStateError> { ... }
@@ -187,7 +208,7 @@ Sub-agents can use any provider supported by agent — not just Anthropic. Pass 
 ```rust
 use agent::provider::ModelConfig;
 
-let model_config = ModelConfig::xai("grok-4-1-fast-reasoning", "Grok 3 Mini Fast");
+let model_config = ModelConfig::xai("grok-4.7", "Grok 4.7");
 
 // `from_config` resolves OpenAiCompatProvider from the config's protocol and
 // the key from XAI_API_KEY.
@@ -201,8 +222,23 @@ This works with all providers: OpenAI, Groq, DeepSeek, Gemini, Mistral, xAI, and
 
 - **Context isolation**: Each invocation starts fresh. Sub-agents don't accumulate history across calls.
 - **Nesting supported**: Sub-agents can be given other `SubAgentTool`s for recursive delegation (see [`examples/rlm.rs`](../../examples/rlm.rs)). Use `with_max_turns()` to prevent infinite chains.
-- **Cancellation propagation**: The parent's cancellation token is forwarded. Aborting the parent aborts all sub-agents.
-- **Turn limiting**: The default 10-turn limit prevents runaway execution. The parent's execution limits also apply to total wall-clock time.
+- **Cancellation propagation**: The parent's cancellation token is forwarded. Aborting the parent aborts all sub-agents. A delegation cancelled during one of its LLM calls fails the tool call (`Sub-agent '<name>' failed: Cancelled`); one cancelled while its tools run fails with `Sub-agent '<name>' failed: [Agent stopped: cancelled]`; one cancelled before it answered at all (its input check or its first request) fails with `ToolError::Cancelled`, not an empty success; and waiting on a tool source is abandoned with `ToolError::Cancelled`.
+- **Limits**: Each delegation runs under its own limits — by default 10 turns, 5 minutes and 1M tokens, with loop detection on. The token count includes every turn's whole prompt, so a delegation working over a large context reaches 1M in a few turns. Change them with `with_execution_limits(ExecutionLimits)` (all of them) or `with_max_turns` (turns only):
+
+  ```rust
+  use std::time::Duration;
+  use agent::context::ExecutionLimits;
+
+  let researcher = SubAgentTool::from_config("researcher", ModelConfig::claude_sonnet_5())
+      .with_execution_limits(
+          ExecutionLimits::default()
+              .with_max_turns(40)
+              .with_max_total_tokens(usize::MAX)
+              .with_max_duration(Duration::from_secs(30 * 60)),
+      );
+  ```
+
+  The parent's limits are checked between its own turns and do not interrupt a running delegation.
 
 ## Isolating sub-agents from each other
 

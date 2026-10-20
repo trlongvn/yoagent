@@ -305,6 +305,224 @@ async fn test_continue_loop_with_sender() {
     assert!(!agent.is_streaming());
 }
 
+/// A tool that, called with `{"block": true}`, runs until its run is
+/// cancelled; otherwise it answers at once.
+struct WaitsForCancel;
+
+#[async_trait::async_trait]
+impl AgentTool for WaitsForCancel {
+    fn name(&self) -> &str {
+        "wait"
+    }
+    fn label(&self) -> &str {
+        "wait"
+    }
+    fn description(&self) -> &str {
+        "Waits until cancelled."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        if params["block"] == true {
+            ctx.cancel.cancelled().await;
+            return Err(ToolError::Cancelled);
+        }
+        Ok(ToolResult {
+            content: vec![Content::Text { text: "ok".into() }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+fn wait_call(block: bool) -> MockResponse {
+    MockResponse::ToolCalls(vec![MockToolCall {
+        provider_metadata: None,
+        name: "wait".into(),
+        arguments: serde_json::json!({"block": block}),
+    }])
+}
+
+/// The first run blocks in the tool; the next one calls it again, which
+/// succeeds only if the agent got its tools back.
+fn calls_wait() -> MockProvider {
+    MockProvider::new(vec![
+        wait_call(true),
+        wait_call(false),
+        MockResponse::Text("after".into()),
+    ])
+}
+
+/// Dropping a `*_with_sender` future (here: a timeout) stops the run
+/// cleanly: the run ends aborted and still sends `AgentEnd`, and the agent
+/// recovers its tools and history instead of staying "streaming" forever.
+#[tokio::test]
+async fn dropping_a_with_sender_future_cancels_the_run_and_the_agent_recovers() {
+    let mut agent = Agent::from_provider(calls_wait(), ModelConfig::mock())
+        .with_tools(vec![Box::new(WaitsForCancel)]);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let consumer = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+
+    let timed_out = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        agent.prompt_with_sender("wait please", tx),
+    )
+    .await;
+    assert!(timed_out.is_err(), "the tool never finishes on its own");
+
+    // The run was cancelled, not orphaned: it ends and its sender closes.
+    let events = tokio::time::timeout(std::time::Duration::from_secs(5), consumer)
+        .await
+        .expect("the cancelled run ended")
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+        "the cancelled run still sent AgentEnd"
+    );
+
+    // `finish` takes the state back: the run's messages, not streaming.
+    agent.finish().await;
+    assert!(!agent.is_streaming());
+    assert!(agent
+        .messages()
+        .iter()
+        .any(|m| matches!(m, AgentMessage::Llm(Message::User { .. }))));
+
+    // And the agent is usable again (this used to panic: "already
+    // streaming"), with its tool back: the next run calls it successfully.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let drain = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+    agent.prompt_with_sender("again", tx).await;
+    let events = drain.await.unwrap();
+    assert!(!agent.is_streaming());
+    let ends: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd { is_error, .. } => Some(*is_error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends, vec![false], "the restored tool ran: {events:?}");
+}
+
+/// `finish` is safe to cancel: a `finish` dropped mid-wait leaves the run
+/// pending, and a later `finish` still joins it and restores the history.
+#[tokio::test]
+async fn a_dropped_finish_leaves_the_run_to_the_next_one() {
+    let mut agent = Agent::from_provider(calls_wait(), ModelConfig::mock())
+        .with_tools(vec![Box::new(WaitsForCancel)]);
+    let mut rx = agent.prompt("wait please").await;
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), agent.finish()).await;
+    assert!(waited.is_err(), "the run is still blocked in its tool");
+    assert!(
+        agent.is_streaming(),
+        "the dropped finish left the run pending"
+    );
+
+    agent.abort();
+    agent.finish().await;
+    drain.await.unwrap();
+    assert!(!agent.is_streaming());
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|m| matches!(m, AgentMessage::Llm(Message::User { .. }))),
+        "the run's history came back"
+    );
+}
+
+/// A provider that panics mid-run.
+struct PanickingProvider;
+
+#[async_trait::async_trait]
+impl agent::provider::StreamProvider for PanickingProvider {
+    async fn stream(
+        &self,
+        _config: agent::provider::StreamConfig,
+        _tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, agent::provider::ProviderError> {
+        panic!("provider exploded");
+    }
+}
+
+/// A panic in a `*_with_sender` run reaches its caller, as it did when the
+/// loop ran inline; `prompt` + `finish` only log it.
+#[tokio::test]
+async fn a_panic_in_a_with_sender_run_reaches_the_caller() {
+    let caller = tokio::spawn(async {
+        let mut agent = Agent::from_provider(PanickingProvider, ModelConfig::mock());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        agent.prompt_with_sender("hi", tx).await;
+    });
+    let err = caller.await.expect_err("the panic propagated");
+    assert!(err.is_panic());
+    let payload = err.into_panic();
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(text.contains("provider exploded"), "{text}");
+
+    // Positive control: the receiver path only logs it.
+    let mut agent = Agent::from_provider(PanickingProvider, ModelConfig::mock());
+    let mut rx = agent.prompt("hi").await;
+    while rx.recv().await.is_some() {}
+    agent.finish().await;
+    assert!(!agent.is_streaming());
+}
+
+/// Positive control for the test above: a `*_with_sender` future that is
+/// not dropped runs to the end without being cancelled.
+#[tokio::test]
+async fn an_undropped_with_sender_run_is_not_cancelled() {
+    let mut agent = Agent::from_provider(
+        MockProvider::new(vec![MockResponse::Text("done".into())]),
+        ModelConfig::mock(),
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let consumer = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+    agent.prompt_with_sender("hi", tx).await;
+    let events = consumer.await.unwrap();
+    let last_assistant = agent.messages().iter().rev().find_map(|m| match m {
+        AgentMessage::Llm(Message::Assistant { stop_reason, .. }) => Some(stop_reason.clone()),
+        _ => None,
+    });
+    assert_eq!(last_assistant, Some(StopReason::Stop));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentEnd { .. })));
+}
+
 #[tokio::test]
 async fn test_prompt_with_sender_tools_restored() {
     struct DummyTool;
@@ -445,7 +663,7 @@ fn session_cost_usd_none_without_model_config() {
 
 #[test]
 fn session_cost_usd_none_when_rates_unconfigured() {
-    // ModelConfig::custom has all-zero cost rates: pricing is unknown, so
+    // ModelConfig::custom carries `cost: None`: pricing is unknown, so
     // the answer must be None ("can't price"), not Some(0.0) ("free").
     let mc = agent::provider::ModelConfig::custom(
         agent::provider::ApiProtocol::OpenAiCompletions,
@@ -468,9 +686,8 @@ fn session_cost_usd_sums_assistant_turns_only() {
         "m",
         "M",
     );
-    mc.cost.input_per_million = 3.0;
-    mc.cost.output_per_million = 15.0;
-    let expected_per_turn = mc.cost.cost_usd(&some_usage());
+    mc.cost = Some(agent::provider::CostConfig::new(3.0, 15.0));
+    let expected_per_turn = mc.cost.as_ref().unwrap().cost_usd(&some_usage());
 
     let agent = Agent::from_provider(MockProvider::text("x"), mc).with_messages(vec![
         AgentMessage::Llm(Message::user("hi")),
@@ -592,7 +809,7 @@ fn test_from_config_wires_model_and_config() {
     // from_config selects a built-in provider from config.api, sets the id,
     // and stashes pricing so session_cost_usd can price the session.
     let mut mc = agent::provider::ModelConfig::anthropic("claude-sonnet-5", "Sonnet 5");
-    mc.cost.input_per_million = 3.0;
+    mc.cost = Some(agent::provider::CostConfig::new(3.0, 0.0));
     let agent = Agent::from_config(mc).with_messages(vec![assistant_with_usage(some_usage())]);
     assert_eq!(agent.model, "claude-sonnet-5");
     assert!(
@@ -660,7 +877,37 @@ async fn test_set_model_switches_model_id() {
 fn test_model_config_mock_is_unpriced() {
     let mc = agent::provider::ModelConfig::mock();
     assert_eq!(mc.provider, "mock");
-    assert!(!mc.cost.is_configured());
+    assert!(mc.cost.is_none());
+}
+
+/// A config persisted before 0.19 stored unknown pricing as an all-zero
+/// `cost` object. It must still load, and load as unknown (`None`) — reading
+/// it as free would report $0 for a model that bills.
+#[test]
+fn session_cost_usd_none_for_legacy_all_zero_cost() {
+    let mut v = serde_json::to_value(agent::provider::ModelConfig::mock()).unwrap();
+    v["cost"] = serde_json::json!({
+        "input_per_million": 0.0,
+        "output_per_million": 0.0,
+        "cache_read_per_million": 0.0,
+        "cache_write_per_million": 0.0
+    });
+    let mc: agent::provider::ModelConfig = serde_json::from_value(v).unwrap();
+    assert!(mc.cost.is_none());
+    let agent = Agent::from_provider(MockProvider::text("x"), mc)
+        .with_messages(vec![assistant_with_usage(some_usage())]);
+    assert_eq!(agent.session_cost_usd(), None);
+}
+
+/// In memory, `Some` with zero rates is a free model — a local one, say — and
+/// must report a real `$0`, not "unknown".
+#[test]
+fn session_cost_usd_zero_for_free_model() {
+    let mut mc = agent::provider::ModelConfig::mock();
+    mc.cost = Some(agent::provider::CostConfig::new(0.0, 0.0));
+    let agent = Agent::from_provider(MockProvider::text("x"), mc)
+        .with_messages(vec![assistant_with_usage(some_usage())]);
+    assert_eq!(agent.session_cost_usd(), Some(0.0));
 }
 
 #[tokio::test]
@@ -1083,6 +1330,70 @@ async fn test_prompt_structured_surfaces_provider_error() {
     }
 }
 
+/// Provider answering 413 with an empty body, as Cerebras and Mistral do on
+/// overflow.
+struct EmptyBodyOverflowProvider;
+
+#[async_trait::async_trait]
+impl agent::provider::StreamProvider for EmptyBodyOverflowProvider {
+    async fn stream(
+        &self,
+        _config: agent::provider::StreamConfig,
+        _tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, agent::provider::ProviderError> {
+        Err(agent::provider::ProviderError::classify(413, ""))
+    }
+}
+
+#[tokio::test]
+async fn test_an_empty_body_overflow_is_detected_on_the_message() {
+    // The error carries no overflow phrase, only the status; the recorded
+    // turn must still report it as an overflow.
+    let mut agent = Agent::from_provider(
+        EmptyBodyOverflowProvider,
+        agent::provider::ModelConfig::mock(),
+    );
+    let mut rx = agent.prompt("hi").await;
+    while rx.recv().await.is_some() {}
+    agent.finish().await;
+
+    let last = agent.messages().last().and_then(|m| m.as_llm()).unwrap();
+    assert!(last.is_context_overflow(), "{last:?}");
+}
+
+/// Provider whose call is cancelled from its side.
+struct CancelledProvider;
+
+#[async_trait::async_trait]
+impl agent::provider::StreamProvider for CancelledProvider {
+    async fn stream(
+        &self,
+        _config: agent::provider::StreamConfig,
+        _tx: mpsc::UnboundedSender<agent::provider::StreamEvent>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, agent::provider::ProviderError> {
+        Err(agent::provider::ProviderError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn test_prompt_structured_reports_a_cancelled_call_as_provider_error() {
+    // A cancelled run ends as `Aborted` with empty text; it must still be
+    // reported as the provider's cancellation, not as NoOutput.
+    let mut agent = Agent::from_provider(CancelledProvider, agent::provider::ModelConfig::mock());
+    let err = agent
+        .prompt_structured::<Extracted>("extract", serde_json::json!({"type": "object"}))
+        .await
+        .unwrap_err();
+    match err {
+        agent::StructuredPromptError::Provider { message } => {
+            assert_eq!(message, "Cancelled");
+        }
+        other => panic!("expected Provider error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_prompt_structured_never_parses_stale_history() {
     // Seed history with an earlier turn's perfectly-parsable JSON; a failed
@@ -1135,6 +1446,75 @@ async fn test_middleware_never_sees_synthetic_structured_tool() {
         *calls.lock().unwrap(),
         0,
         "middleware saw the synthetic tool"
+    );
+}
+
+/// A user tool that shares the structured schema's name (`structured_output`).
+struct SchemaNamedTool {
+    ran: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SchemaNamedTool {
+    fn name(&self) -> &str {
+        "structured_output"
+    }
+    fn label(&self) -> &str {
+        "Schema-named tool"
+    }
+    fn description(&self) -> &str {
+        "A real tool whose name collides with the structured-output schema"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        *self.ran.lock().unwrap() = Some(params);
+        Ok(ToolResult {
+            content: vec![Content::Text { text: "ok".into() }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+/// On Anthropic's native structured-output path no synthetic tool is offered,
+/// so a call named after the schema is the user's own tool: it must execute,
+/// not be unwrapped into the answer. The answer is the final reply text.
+#[tokio::test]
+async fn test_native_structured_output_executes_schema_named_user_tool() {
+    let ran = Arc::new(std::sync::Mutex::new(None));
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "structured_output".into(),
+            arguments: serde_json::json!({"name": "tool-args", "count": 1}),
+        }]),
+        MockResponse::Text(r#"{"name":"answer","count":2}"#.into()),
+    ]);
+    let mut mc = ModelConfig::mock();
+    mc.anthropic =
+        Some(agent::provider::AnthropicCompat::default().with_native_structured_output(true));
+    let mut agent = Agent::from_provider(provider, mc)
+        .with_tools(vec![Box::new(SchemaNamedTool { ran: ran.clone() })]);
+    let out: Extracted = agent
+        .prompt_structured("extract", serde_json::json!({"type": "object"}))
+        .await
+        .expect("final text parses");
+    assert_eq!(
+        out,
+        Extracted {
+            name: "answer".into(),
+            count: 2
+        }
+    );
+    assert_eq!(
+        *ran.lock().unwrap(),
+        Some(serde_json::json!({"name": "tool-args", "count": 1})),
+        "the user's tool must run on the native path"
     );
 }
 
@@ -1300,4 +1680,224 @@ async fn test_drop_aborts_in_flight_tool_and_closes_channel() {
         drained.is_ok(),
         "dropping the Agent must close the event channel; it stayed open"
     );
+}
+
+/// A tool that panics when asked to.
+struct PanickyTool;
+
+#[async_trait::async_trait]
+impl AgentTool for PanickyTool {
+    fn name(&self) -> &str {
+        "panicky"
+    }
+    fn label(&self) -> &str {
+        "Panicky"
+    }
+    fn description(&self) -> &str {
+        "Panics on request"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {"boom": {"type": "boolean"}}})
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        if params["boom"].as_bool().unwrap_or(false) {
+            panic!("kaboom");
+        }
+        Ok(ToolResult {
+            content: vec![Content::Text { text: "ok".into() }],
+            details: serde_json::Value::Null,
+        })
+    }
+}
+
+fn panicky_call(boom: bool) -> MockResponse {
+    MockResponse::ToolCalls(vec![MockToolCall {
+        provider_metadata: None,
+        name: "panicky".into(),
+        arguments: serde_json::json!({ "boom": boom }),
+    }])
+}
+
+fn tool_ends(events: &[AgentEvent]) -> Vec<(bool, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } => match result.content.first() {
+                Some(Content::Text { text }) => Some((*is_error, text.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A panicking tool fails its call, not the run — and the agent keeps its
+/// tools for the next run (a dead loop task used to take them with it).
+#[tokio::test]
+async fn a_panicking_tool_fails_the_call_not_the_agent() {
+    let provider = MockProvider::new(vec![
+        panicky_call(true),
+        MockResponse::Text("recovered".into()),
+        panicky_call(false),
+        MockResponse::Text("done".into()),
+    ]);
+    let mut agent =
+        Agent::from_provider(provider, ModelConfig::mock()).with_tools(vec![Box::new(PanickyTool)]);
+
+    let mut rx = agent.prompt("first").await;
+    let mut first = Vec::new();
+    while let Some(e) = rx.recv().await {
+        first.push(e);
+    }
+    agent.finish().await;
+    let ends = tool_ends(&first);
+    assert_eq!(ends.len(), 1);
+    assert!(ends[0].0, "the panic is an error result");
+    assert!(ends[0].1.contains("panicked: kaboom"), "{}", ends[0].1);
+    assert!(matches!(first.last(), Some(AgentEvent::AgentEnd { .. })));
+
+    let mut rx = agent.prompt("second").await;
+    let mut second = Vec::new();
+    while let Some(e) = rx.recv().await {
+        second.push(e);
+    }
+    agent.finish().await;
+    assert_eq!(tool_ends(&second), vec![(false, "ok".to_string())]);
+}
+
+/// Under the default parallel strategy, a panicking call does not take its
+/// sibling down: both calls end, one as an error, one with its result.
+#[tokio::test]
+async fn a_panicking_tool_does_not_take_down_a_sibling_call() {
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![
+            MockToolCall {
+                provider_metadata: None,
+                name: "panicky".into(),
+                arguments: serde_json::json!({ "boom": true }),
+            },
+            MockToolCall {
+                provider_metadata: None,
+                name: "panicky".into(),
+                arguments: serde_json::json!({ "boom": false }),
+            },
+        ]),
+        MockResponse::Text("done".into()),
+    ]);
+    let mut agent =
+        Agent::from_provider(provider, ModelConfig::mock()).with_tools(vec![Box::new(PanickyTool)]);
+    let mut rx = agent.prompt("go").await;
+    let mut events = Vec::new();
+    while let Some(e) = rx.recv().await {
+        events.push(e);
+    }
+    agent.finish().await;
+
+    let mut ends = tool_ends(&events);
+    ends.sort();
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[0], (false, "ok".to_string()));
+    assert!(ends[1].0 && ends[1].1.contains("panicked"), "{:?}", ends[1]);
+}
+
+/// A cancel that lands while tools run ends the run with the cancel marker
+/// (emitted as a message, after the tool's result), so the last assistant
+/// message's `ToolUse` does not read as a normal stop. Deterministic: the
+/// tool returns only once the test has aborted.
+#[tokio::test]
+async fn a_cancel_during_tools_ends_with_the_cancel_marker() {
+    struct Gated(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl AgentTool for Gated {
+        fn name(&self) -> &str {
+            "gated"
+        }
+        fn label(&self) -> &str {
+            "Gated"
+        }
+        fn description(&self) -> &str {
+            "Returns when released"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            self.0.notified().await;
+            Ok(ToolResult {
+                content: vec![Content::Text {
+                    text: "done".into(),
+                }],
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![MockToolCall {
+            provider_metadata: None,
+            name: "gated".into(),
+            arguments: serde_json::json!({}),
+        }]),
+        MockResponse::Text("never reached".into()),
+    ]);
+    let mut agent = Agent::from_provider(provider, ModelConfig::mock())
+        .with_tools(vec![Box::new(Gated(release.clone()))]);
+    let mut rx = agent.prompt("go").await;
+    let mut events = Vec::new();
+    while let Some(e) = rx.recv().await {
+        if matches!(e, AgentEvent::ToolExecutionStart { .. }) {
+            agent.abort();
+            release.notify_one();
+        }
+        events.push(e);
+    }
+    agent.finish().await;
+
+    let Some(AgentEvent::AgentEnd { messages, .. }) = events.last() else {
+        panic!("the run must end with AgentEnd")
+    };
+    let n = messages.len();
+    assert!(
+        matches!(
+            &messages[n - 2],
+            AgentMessage::Llm(Message::ToolResult { .. })
+        ),
+        "the tool's result comes first: {messages:?}"
+    );
+    let is_marker = |m: &AgentMessage| {
+        matches!(m, AgentMessage::Llm(Message::User { content, .. })
+            if matches!(content.first(), Some(Content::Text { text }) if text == agent::agent_loop::CANCELLED_MARKER))
+    };
+    assert!(is_marker(&messages[n - 1]), "{messages:?}");
+    // Emitted like any message, for event consumers.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::MessageEnd { message } if is_marker(message))));
+}
+
+/// `Batched { size: 0 }` (it comes from config) runs the calls instead of
+/// panicking in `chunks(0)`.
+#[tokio::test]
+async fn batched_with_size_zero_does_not_panic() {
+    let provider = MockProvider::new(vec![panicky_call(false), MockResponse::Text("done".into())]);
+    let mut agent = Agent::from_provider(provider, ModelConfig::mock())
+        .with_tools(vec![Box::new(PanickyTool)])
+        .with_tool_execution(ToolExecutionStrategy::Batched { size: 0 });
+    let mut rx = agent.prompt("go").await;
+    let mut events = Vec::new();
+    while let Some(e) = rx.recv().await {
+        events.push(e);
+    }
+    agent.finish().await;
+    assert_eq!(tool_ends(&events), vec![(false, "ok".to_string())]);
 }

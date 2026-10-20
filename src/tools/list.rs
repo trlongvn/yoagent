@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// List files and directories. Uses `find` or `fd` for efficient traversal.
+/// List files under a directory. Uses `find` for traversal.
 pub struct ListFilesTool {
     pub max_results: usize,
     pub timeout: Duration,
@@ -88,10 +88,10 @@ impl AgentTool for ListFilesTool {
             return Err(ToolError::Cancelled);
         }
 
-        crate::tools::PathSandbox::new(self.allowed_paths.clone()).check(path)?;
+        let io_path = crate::tools::PathSandbox::new(self.allowed_paths.clone()).io_path(path)?;
 
         // Check path exists
-        if !std::path::Path::new(path).exists() {
+        if !io_path.exists() {
             return Err(ToolError::Failed(format!(
                 "Directory not found: {}. Check the path and try again.",
                 path
@@ -99,7 +99,8 @@ impl AgentTool for ListFilesTool {
         }
 
         let mut cmd = Command::new("find");
-        cmd.arg(path);
+        // A path starting with `-` would be read as a `find` expression.
+        cmd.arg(not_an_option(io_path));
         cmd.args(["-maxdepth", &max_depth.to_string()]);
 
         if let Some(pat) = pattern {
@@ -114,8 +115,7 @@ impl AgentTool for ListFilesTool {
         cmd.arg("-type").arg("f");
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // See bash.rs: dropping the `output()` future on the cancel/timeout arm
-        // must not leave `find` running detached.
+        // A timeout or cancel drops the output future; take `find` with it.
         cmd.kill_on_drop(true);
 
         let timeout = self.timeout;
@@ -132,13 +132,29 @@ impl AgentTool for ListFilesTool {
         let mut lines: Vec<&str> = stdout.lines().collect();
         lines.sort();
 
+        // `find` keeps walking past what it can't read (a subdirectory without
+        // permission, a file removed mid-walk), reports it on stderr and exits
+        // non-zero. The files it did list are the answer, with those errors as
+        // warnings, so a partial listing never reads as complete. Only a
+        // listing with nothing to show is a failure.
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stderr = stderr.trim();
+        // Capped on both paths: a wide walk can produce thousands of lines.
+        let warnings = (!stderr.is_empty()).then(|| match stderr.char_indices().nth(2000) {
+            Some((cut, _)) => format!("{}\n... (more warnings not shown)", &stderr[..cut]),
+            None => stderr.to_string(),
+        });
+        if let (false, true, Some(w)) = (result.status.success(), lines.is_empty(), &warnings) {
+            return Err(ToolError::Failed(format!("Listing error: {w}")));
+        }
+
         let total = lines.len();
         let truncated = total > self.max_results;
         if truncated {
             lines.truncate(self.max_results);
         }
 
-        let text = if lines.is_empty() {
+        let mut text = if lines.is_empty() {
             format!("No files found in {}", path)
         } else if truncated {
             format!(
@@ -151,9 +167,42 @@ impl AgentTool for ListFilesTool {
             format!("{}\n\n({} files)", lines.join("\n"), total)
         };
 
+        if let Some(w) = &warnings {
+            text.push_str(&format!(
+                "\nWarnings from find (the listing may be incomplete):\n{w}"
+            ));
+        }
+
         Ok(ToolResult {
             content: vec![Content::Text { text }],
-            details: serde_json::json!({ "total": total, "truncated": truncated }),
+            details: serde_json::json!({
+                "total": total,
+                "truncated": truncated,
+                "warnings": warnings,
+            }),
         })
+    }
+}
+
+/// Make a path unmistakable as an operand: `-x` becomes `./-x`.
+pub(crate) fn not_an_option(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.as_os_str().to_string_lossy().starts_with('-') {
+        std::path::Path::new(".").join(path)
+    } else {
+        path
+    }
+}
+
+#[cfg(test)]
+mod option_guard {
+    use super::not_an_option;
+    use std::path::PathBuf;
+
+    #[test]
+    fn only_a_leading_dash_is_rewritten() {
+        assert_eq!(not_an_option("-delete".into()), PathBuf::from("./-delete"));
+        assert_eq!(not_an_option("a/-b".into()), PathBuf::from("a/-b"));
+        assert_eq!(not_an_option("/abs".into()), PathBuf::from("/abs"));
+        assert_eq!(not_an_option(".".into()), PathBuf::from("."));
     }
 }

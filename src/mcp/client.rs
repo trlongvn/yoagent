@@ -1,20 +1,30 @@
 //! High-level MCP client.
 
-use super::transport::{HttpTransport, McpTransport, StdioTransport};
+#[cfg(feature = "native")]
+use super::transport::StdioTransport;
+use super::transport::{HttpTransport, McpTransport};
 use super::types::*;
+#[cfg(feature = "native")]
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// How long `connect_*` waits for the `initialize` handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// High-level MCP client that manages connection lifecycle and protocol.
 pub struct McpClient {
     transport: Arc<Mutex<Box<dyn McpTransport>>>,
     server_info: Option<ServerInfo>,
     capabilities: Option<ServerCapabilities>,
+    call_timeout: Option<Duration>,
 }
 
 impl McpClient {
-    /// Connect to an MCP server via stdio (spawn a child process).
+    /// Connect to an MCP server via stdio (spawn a child process). Native hosts only.
+    #[cfg(feature = "native")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native")))]
     pub async fn connect_stdio(
         command: &str,
         args: &[&str],
@@ -25,20 +35,32 @@ impl McpClient {
             transport: Arc::new(Mutex::new(Box::new(transport))),
             server_info: None,
             capabilities: None,
+            // Nothing else bounds a stdio call: a server that stops answering
+            // would hang the agent.
+            call_timeout: Some(crate::mcp::McpToolAdapter::DEFAULT_CALL_TIMEOUT),
         };
-        client.initialize().await?;
+        client.handshake().await?;
         Ok(client)
     }
 
     /// Connect to an MCP server via HTTP.
     pub async fn connect_http(url: &str) -> Result<Self, McpError> {
-        let transport = HttpTransport::new(url)?;
+        Self::connect_http_with(HttpTransport::new(url)?).await
+    }
+
+    /// Connect over a configured [`HttpTransport`] — with request headers
+    /// ([`HttpTransport::with_header`]), say. The handshake and timeouts are
+    /// those of [`connect_http`](Self::connect_http).
+    pub async fn connect_http_with(transport: HttpTransport) -> Result<Self, McpError> {
         let mut client = Self {
             transport: Arc::new(Mutex::new(Box::new(transport))),
             server_info: None,
             capabilities: None,
+            // The HTTP transport's idle read timeout already ends a stalled
+            // call; a long one that keeps streaming must not be cut off.
+            call_timeout: None,
         };
-        client.initialize().await?;
+        client.handshake().await?;
         Ok(client)
     }
 
@@ -48,7 +70,36 @@ impl McpClient {
             transport: Arc::new(Mutex::new(transport)),
             server_info: None,
             capabilities: None,
+            call_timeout: None,
         }
+    }
+
+    /// The bound tool adapters built from this client apply to each call
+    /// ([`McpToolAdapter::from_client`](crate::mcp::McpToolAdapter::from_client)):
+    /// five minutes over stdio, none over HTTP (its idle timeout already ends
+    /// a stalled call) or a custom transport.
+    pub fn call_timeout(&self) -> Option<Duration> {
+        self.call_timeout
+    }
+
+    /// Change the bound adapters built from this client apply to each call
+    /// (`None`: no bound; the run's cancellation still ends a call).
+    pub fn with_call_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// `initialize`, bounded: a server that never answers fails the connect
+    /// instead of hanging it.
+    async fn handshake(&mut self) -> Result<ServerInfo, McpError> {
+        crate::rt::timeout(HANDSHAKE_TIMEOUT, self.initialize())
+            .await
+            .unwrap_or_else(|_| {
+                Err(McpError::Transport(format!(
+                    "MCP server did not complete the initialize handshake within {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                )))
+            })
     }
 
     /// Initialize the MCP connection (handshake).
@@ -66,11 +117,14 @@ impl McpClient {
         self.server_info = Some(result.server_info.clone());
         self.capabilities = Some(result.capabilities);
 
-        // Send initialized notification (no response expected, but we send it as a request
-        // since our transport is request/response. Some servers ignore the id on notifications.)
-        let notify = JsonRpcRequest::new("notifications/initialized", None);
-        // Best-effort: ignore errors on the notification
-        let _ = self.send_request(notify).await;
+        // The handshake ends with a notification, which gets no response.
+        // (It used to be sent as a request and awaited: a spec-compliant
+        // server never answers it, so connecting over stdio could hang.)
+        // A server that never got it has not finished the handshake, so a
+        // failure here fails the connect (over stdio it means the server is
+        // gone) instead of surfacing later as a puzzling tools/list error.
+        let initialized = JsonRpcNotification::new("notifications/initialized", None);
+        self.transport.lock().await.notify(initialized).await?;
 
         Ok(result.server_info)
     }

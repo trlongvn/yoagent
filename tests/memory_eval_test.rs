@@ -30,10 +30,7 @@ use ::agent::memory_integration::{
 use ::agent::provider::mock::{MockProvider, MockResponse, MockToolCall};
 use ::agent::provider::{ProviderError, StreamConfig, StreamEvent, StreamProvider};
 use ::agent::types::*;
-use ::agent::{
-    AgentContext, AgentTool, CacheConfig, RetryConfig, ThinkingLevel, ToolContext, ToolError,
-    ToolExecutionStrategy, ToolResult,
-};
+use ::agent::{AgentContext, AgentTool, ToolContext, ToolError, ToolResult};
 use support::{service_with, FakeMemoryBackend};
 
 // ---------------------------------------------------------------------------
@@ -255,34 +252,9 @@ async fn run_case_with(
 }
 
 fn meter_config(provider: Arc<dyn StreamProvider>) -> AgentLoopConfig {
-    AgentLoopConfig {
-        provider,
-        model: "eval-mock".into(),
-        api_key: "test".into(),
-        thinking_level: ThinkingLevel::Off,
-        max_tokens: None,
-        temperature: None,
-        model_config: None,
-        convert_to_llm: None,
-        transform_context: None,
-        prepare_context: None,
-        get_steering_messages: None,
-        get_follow_up_messages: None,
-        context_config: None,
-        compaction_strategy: None,
-        execution_limits: None,
-        cache_config: CacheConfig::default(),
-        tool_output_sink: None,
-        tool_execution: ToolExecutionStrategy::default(),
-        tool_middleware: vec![],
-        output_schema: None,
-        retry_config: RetryConfig::none(),
-        before_turn: None,
-        after_turn: None,
-        on_error: None,
-        input_filters: vec![],
-        turn_delay: None,
-    }
+    let mut config = AgentLoopConfig::new(provider, "eval-mock");
+    config.api_key = "test".into();
+    config
 }
 
 /// The fact the seeded store holds — deliberately worded to match the query.

@@ -1,9 +1,9 @@
-//! LLM-based background compaction â€” a [`CompactionStrategy`] that summarizes
+//! LLM-based background compaction — a [`CompactionStrategy`] that summarizes
 //! old history with a standalone LLM request instead of discarding it.
 //!
 //! The default [`DefaultCompaction`](crate::context::DefaultCompaction) is
-//! deterministic: truncate â†’ one-line summaries â†’ drop. That is fast,
-//! byte-stable and free, but lossy in the worst way â€” decisions and constraints
+//! deterministic: truncate → one-line summaries → drop. That is fast,
+//! byte-stable and free, but lossy in the worst way — decisions and constraints
 //! from early turns simply vanish. This strategy spends tokens to get them back
 //! as prose: a "shift-handoff briefing" covering goals, progress, and decisions,
 //! spliced in where the dropped span used to be.
@@ -11,8 +11,8 @@
 //! # Choosing the summarizer
 //!
 //! **The summarizer must be fast enough to finish before the budget is
-//! crossed.** Reusing the loop's `ModelConfig` â€”
-//! `LlmCompaction::from_config(cfg)` with the session's own config â€” is the
+//! crossed.** Reusing the loop's `ModelConfig` —
+//! `LlmCompaction::from_config(cfg)` with the session's own config — is the
 //! obvious call, and for a slow loop model it is the worst one: `compact` then
 //! finds no briefing ready and takes the deterministic tiers, so the retention
 //! this strategy exists for is silently not delivered.
@@ -22,7 +22,7 @@
 //! DeepSeek-standalone. The rule is about speed, not about sharing a config.
 //!
 //! Measured on the `long_horizon` harness at a 30K configured budget (26K after
-//! the `system_prompt_tokens` reserve), **one run each â€” the model is not
+//! the `system_prompt_tokens` reserve), **one run each — the model is not
 //! deterministic, so read these as the shape of the effect, not as calibrated
 //! figures**. Both rows are the harness's own `[compaction #1]` line, and the
 //! two runs differ only in the summarizer:
@@ -43,7 +43,7 @@
 //! When briefings keep losing that race the strategy says so once, via
 //! `tracing::warn!`, rather than degrading silently. Note what it does *not*
 //! claim: while a request is in flight `arm` starts no second one, so a very
-//! slow summarizer costs fewer requests than it does fallbacks â€” measured at 19
+//! slow summarizer costs fewer requests than it does fallbacks — measured at 19
 //! fallbacks against 7 billed requests. The waste is worst in the middle
 //! regime, where the briefing lands but always just too late.
 //!
@@ -52,16 +52,16 @@
 //! **Buys: retention quality, at no added loop latency.**
 //! [`CompactionStrategy::compact`] is synchronous and sits on the hot path
 //! directly before each LLM turn, so a summarization round-trip cannot happen
-//! there â€” it would add seconds of latency exactly when the session is busiest.
+//! there — it would add seconds of latency exactly when the session is busiest.
 //! Instead the request runs in the background and the result is spliced in on a
 //! later turn:
 //!
 //! ```text
 //! turn N   (usage crosses trigger_ratio Â· budget)
-//!   â””â”€â”€ spawn: summarize messages[head_end..cut) with a standalone request
+//!   └── spawn: summarize messages[head_end..cut) with a standalone request
 //! turn N+1..M: loop continues untouched, no stall, no request
 //! turn M   (usage crosses the budget)
-//!   â””â”€â”€ splice: [head][summary][tail cut..]
+//!   └── splice: [head][summary][tail cut..]
 //! ```
 //!
 //! **Costs: tokens the default never spends.** Each summarization request pays
@@ -70,6 +70,15 @@
 //! repeatedly. Route it at a cheap model (see below) and watch the numbers on
 //! [`AgentEvent::ContextCompacted`], which reports the request's own usage next
 //! to the tokens it saved.
+//!
+//! The spend is also in the run's [`SessionStats::compaction`] — and so in
+//! [`SessionStats::total_cost_usd`], [`Agent::total_cost_usd`](crate::Agent::total_cost_usd)
+//! and [`Agent::compaction_spend`](crate::Agent::compaction_spend) — priced at
+//! the summarization model's own [`cost`](crate::provider::ModelConfig::cost).
+//! The request runs on its own task, so its spend is held until the next
+//! `compact` call the loop makes and counted by that run: a request still in
+//! flight when a run ends is counted by the next run, once, whether its
+//! briefing is spliced, discarded or rejected.
 //!
 //! # Why the request is standalone, not appended to the live session
 //!
@@ -81,7 +90,7 @@
 //!
 //! In-session forces the briefing to be billed at the **loop model's** output
 //! rate. Output runs 5-10x input, so the cache saving on the span is swamped
-//! by the output penalty â€” and the more expensive the loop model, the worse it
+//! by the output penalty — and the more expensive the loop model, the worse it
 //! gets. Per compaction, at a ~12K history / ~8K span / ~1K briefing:
 //!
 //! | loop model | standalone on Haiku | appended in-session |
@@ -92,8 +101,8 @@
 //!
 //! So the idea is backwards: it was motivated by "reuse the expensive model's
 //! cache", and the expensive model is exactly where it loses. It only wins when
-//! the loop model *is* the summarizer â€” DeepSeek in-session runs 3.2x cheaper
-//! than DeepSeek standalone â€” which is the configuration this strategy already
+//! the loop model *is* the summarizer — DeepSeek in-session runs 3.2x cheaper
+//! than DeepSeek standalone — which is the configuration this strategy already
 //! steers away from, since routing summarization at a cheap model is the
 //! documented shape.
 //!
@@ -124,7 +133,7 @@
 //! cargo test --test prefix_cache_harness -- --ignored --nocapture
 //! ```
 //!
-//! Re-run it and update this section after any change to compaction sizing â€”
+//! Re-run it and update this section after any change to compaction sizing —
 //! [`ContextConfig::compact_target_ratio`], [`ContextConfig::compact_headroom_turns`],
 //! [`DEFAULT_TRIGGER_RATIO`] and the `retain_tail_tokens` derivation all move
 //! these numbers, and nothing in CI will notice if they drift.
@@ -132,7 +141,7 @@
 //! # Guarantees
 //!
 //! **The loop can never wedge on this strategy.** Summary not ready, provider
-//! down, rate-limited, no tokio runtime â€” compaction falls back to the
+//! down, rate-limited, no tokio runtime — compaction falls back to the
 //! deterministic [`compact_messages`] for that turn and the loop keeps going.
 //!
 //! **A stale summary is never spliced.** The snapshotted prefix is fingerprinted
@@ -144,7 +153,7 @@
 //! never the one it received. That distinction is load-bearing: the agent loop
 //! writes the return value straight back into the session, so anchoring on the
 //! input meant that whenever the deterministic fallback rewrote history the
-//! pending summary was invalidated by the same call that ordered it â€” discarded
+//! pending summary was invalidated by the same call that ordered it — discarded
 //! on arrival, replaced by another request against a prefix the next fallback
 //! would rewrite in turn. That state was absorbing, and it cost one billed
 //! request per compaction for a result identical to
@@ -154,7 +163,7 @@
 //! budget the tail is compacted in place rather than the whole history: the
 //! summary sits exactly where `level3_drop_middle` starts cutting, so the naive
 //! move destroys what was just paid for. If head plus briefing exceed the budget
-//! on their own the briefing genuinely cannot be kept â€” the event then reports
+//! on their own the briefing genuinely cannot be kept — the event then reports
 //! [`CompactionMethod::Deterministic`], because claiming a splice the result
 //! does not contain is worse than reporting the fallback.
 //!
@@ -178,8 +187,8 @@
 //! environment variable when the strategy is built (warning if it finds none)
 //! and holds the result for its lifetime. Note this is *not*
 //! [`Agent`](crate::Agent)'s contract: `Agent` resolves lazily per request, so
-//! it does pick up a rotated environment key. Build a fresh strategy â€” or pass
-//! [`with_api_key`](LlmCompaction::with_api_key) â€” if credentials rotate
+//! it does pick up a rotated environment key. Build a fresh strategy — or pass
+//! [`with_api_key`](LlmCompaction::with_api_key) — if credentials rotate
 //! mid-session.
 //!
 //! # Known limitation: the headroom policy does not apply
@@ -187,7 +196,7 @@
 //! [`ContextConfig::compact_target_ratio`] and
 //! [`ContextConfig::compact_headroom_turns`] size the deterministic tiers, and
 //! the agent loop adapts the ratio to the session's observed growth. The
-//! *spliced* result ignores both â€” its size is set by
+//! *spliced* result ignores both — its size is set by
 //! [`with_retain_tail_tokens`](LlmCompaction::with_retain_tail_tokens) instead.
 //! The deterministic fallback and the safety net do still honour them, since
 //! both run through [`compact_messages`]. Consuming the adapted target on the
@@ -196,8 +205,8 @@
 //!
 //! # Model routing
 //!
-//! The summarization request is standalone â€” its own system prompt, no session
-//! history, no tools â€” so it can use a different, cheaper model than the main
+//! The summarization request is standalone — its own system prompt, no session
+//! history, no tools — so it can use a different, cheaper model than the main
 //! loop at no cost to the session itself:
 //!
 //! ```no_run
@@ -232,17 +241,17 @@ use tokio_util::sync::CancellationToken;
 /// Default fraction of the budget at which background summarization starts.
 ///
 /// Low enough that the summary is almost always ready before the budget is
-/// hit (the gap is `(1 âˆ’ ratio) Â· budget` tokens of session growth), high
+/// hit (the gap is `(1 − ratio) Â· budget` tokens of session growth), high
 /// enough that short sessions never pay for a summarization request at all.
 pub const DEFAULT_TRIGGER_RATIO: f32 = 0.6;
 
 /// Ceiling on the derived default for the retained tail of recent messages.
 ///
 /// The default is `min(DEFAULT_RETAIN_TAIL_TOKENS, budget / 4)`, not this
-/// constant flat â€” see
+/// constant flat — see
 /// [`with_retain_tail_tokens`](LlmCompaction::with_retain_tail_tokens) for why
 /// a fixed number silently disables the strategy on smaller budgets. 20k is the
-/// ballpark Pi ships (â‰ˆ 5â€“20 turns): enough recent detail that the model does
+/// ballpark Pi ships (≈ 5–20 turns): enough recent detail that the model does
 /// not lose its immediate working state.
 pub const DEFAULT_RETAIN_TAIL_TOKENS: usize = 20_000;
 
@@ -257,9 +266,9 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Constant first line of the spliced summary message.
 ///
 /// Constant so splices are recognizable in transcripts and replays. Note this
-/// buys no prefix-cache stability of its own â€” unlike `context`'s compaction
+/// buys no prefix-cache stability of its own — unlike `context`'s compaction
 /// marker, the varying briefing follows it in the same message.
-pub const SUMMARY_MARKER: &str = "[Context compacted â€” summary of earlier conversation]";
+pub const SUMMARY_MARKER: &str = "[Context compacted — summary of earlier conversation]";
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a context summarization assistant. You produce \
      structured handoff briefings of agent conversations so that work can \
@@ -272,12 +281,12 @@ const DEFAULT_INSTRUCTION: &str = "Summarize the conversation above as a handoff
      ## State & progress\nWhat has been done, what is currently in flight.\n\
      ## Key decisions & constraints\nDecisions made and why. Record the \
      constraints you were *given* as well as the choices made in response to \
-     them â€” deployment shape, scale, hard dependencies, things ruled out, \
+     them — deployment shape, scale, hard dependencies, things ruled out, \
      stated preferences. A reader who keeps the decisions but loses the \
      conditions that forced them cannot tell which are still binding.\n\
      ## Open items\nUnresolved questions and concrete next steps.\n\
      Be dense and factual. Include exact identifiers (paths, names, versions, \
-     numbers) â€” those are the details the next agent cannot reconstruct.";
+     numbers) — those are the details the next agent cannot reconstruct.";
 
 /// Cap on the bytes of any single content block serialized into the
 /// summarization transcript. Long tool outputs were already truncated on
@@ -288,7 +297,7 @@ const TRANSCRIPT_PER_BLOCK_BYTES: usize = 2_000;
 ///
 /// Per-block bounding is not enough on its own: the summarized span scales with
 /// the *main* model's budget, so a 1M-context session can hand a 200k-context
-/// summarizer far more than it can read â€” every request then fails on overflow
+/// summarizer far more than it can read — every request then fails on overflow
 /// and the strategy pays for nothing. Roughly 120k tokens at four bytes each,
 /// which fits the smallest model anyone routes this at. Checked per message, so
 /// the transcript may overshoot by at most one message's contribution.
@@ -308,7 +317,7 @@ const MIN_SUMMARY_TOKENS: u32 = 256;
 /// Identity of a snapshotted prefix, checked before splicing.
 ///
 /// History is append-only during a run, so `messages[0..cut)` should be
-/// unchanged when the background task finishes â€” but "should" is not a
+/// unchanged when the background task finishes — but "should" is not a
 /// correctness argument, and two things really can invalidate it:
 /// [`Agent::replace_messages`](crate::Agent::replace_messages), and a
 /// deterministic fallback rewriting history between spawn and splice. (The
@@ -318,7 +327,7 @@ const MIN_SUMMARY_TOKENS: u32 = 256;
 ///
 /// The hash folds each prefix message's index and its serialized bytes, so any
 /// realistic edit changes it and the stale summary is dropped instead of
-/// spliced. It is a 64-bit hash, not an identity check â€” a collision is
+/// spliced. It is a 64-bit hash, not an identity check — a collision is
 /// possible in principle and has never been the failure anyone hits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fingerprint {
@@ -335,7 +344,7 @@ fn fingerprint(messages: &[AgentMessage], cut: usize) -> Fingerprint {
             Err(e) => {
                 // Not reachable for the `AgentMessage` shapes serde_json can
                 // emit. If it ever is, two different unserializable messages
-                // would fold alike and weaken the very check this preserves â€”
+                // would fold alike and weaken the very check this preserves —
                 // so say so rather than degrading quietly.
                 debug_assert!(false, "AgentMessage failed to serialize: {e}");
                 tracing::error!("llm compaction: message {i} failed to serialize: {e}");
@@ -352,8 +361,8 @@ fn fingerprint(messages: &[AgentMessage], cut: usize) -> Fingerprint {
 /// Where the verbatim head may end without orphaning a tool call.
 ///
 /// [`safe_head_end`] walks back past an assistant that *opens* tool calls, but
-/// not past the results themselves. With `ToolExecutionStrategy::Parallel` â€” the
-/// default â€” one assistant message yields several `ToolResult` messages, so a
+/// not past the results themselves. With `ToolExecutionStrategy::Parallel` — the
+/// default — one assistant message yields several `ToolResult` messages, so a
 /// boundary landing strictly inside that run keeps the assistant and only
 /// *some* of its results; the rest fall into the summarized span and the
 /// provider rejects the request outright.
@@ -361,7 +370,7 @@ fn fingerprint(messages: &[AgentMessage], cut: usize) -> Fingerprint {
 /// [`DefaultCompaction`](crate::context::DefaultCompaction) never hit this
 /// because its Level 2 rewrites the whole pre-boundary region before Level 3
 /// cuts. Splicing is the first path that re-emits `messages[..head_end]`
-/// verbatim, so it is the first to need both pullbacks â€” applied to a fixed
+/// verbatim, so it is the first to need both pullbacks — applied to a fixed
 /// point, since one can expose the other.
 fn safe_head_boundary(messages: &[AgentMessage], end: usize) -> usize {
     let mut end = end;
@@ -417,7 +426,7 @@ struct Warned {
 /// Consecutive deterministic fallbacks before reporting that briefings are
 /// being issued and not used.
 ///
-/// Five, not two. Two consecutive misses is ordinary â€” one burst of large tool
+/// Five, not two. Two consecutive misses is ordinary — one burst of large tool
 /// results can cross the budget twice before any briefing lands. A session
 /// measured at seven splices in nine compactions (a 78% success rate) still
 /// contained a run of two, and a two-in-a-row threshold reported it as broken.
@@ -436,11 +445,17 @@ struct State {
     /// Whether any summarization request has ever been issued.
     ///
     /// Gates the losing-race warning. Without it the warning also fired in the
-    /// *inert* configuration â€” where `choose_cut` never finds a split and
-    /// `spawn_summarize` is never called â€” telling the caller they were
+    /// *inert* configuration — where `choose_cut` never finds a split and
+    /// `spawn_summarize` is never called — telling the caller they were
     /// "paying for briefings" having spent nothing, in the same session as
     /// `warn_inert_once` giving the opposite `trigger_ratio` advice.
     ever_spawned: bool,
+    /// What finished summarization requests cost that no run's stats have
+    /// counted yet. The request runs on its own task, outside the loop's
+    /// task-local scope, so it lands here and the next `compact` call — which
+    /// the loop makes inside its scope — moves it into the run's
+    /// [`SessionStats::compaction`].
+    unreported: CompactionSpend,
 }
 
 impl Default for State {
@@ -450,6 +465,7 @@ impl Default for State {
             fallbacks: 0,
             ever_spawned: false,
             warned: Warned::default(),
+            unreported: CompactionSpend::default(),
         }
     }
 }
@@ -458,8 +474,8 @@ impl Default for State {
 /// ends, however it ends.
 ///
 /// Setting the flag outside the task and clearing it inside meant a task that
-/// never reached the clear â€” hung request, panicking provider, runtime shutting
-/// down between spawn and poll â€” pinned the slot forever, silently degrading the
+/// never reached the clear — hung request, panicking provider, runtime shutting
+/// down between spawn and poll — pinned the slot forever, silently degrading the
 /// strategy to `DefaultCompaction` for the rest of the session. Tying the reset
 /// to a guard's `Drop` ties it to the task's lifetime instead of to two manually
 /// matched assignments.
@@ -510,14 +526,17 @@ fn lock(state: &Arc<Mutex<State>>) -> MutexGuard<'_, State> {
 /// the cost trade-off, and the known limitation.
 ///
 /// The state machine is per-session. Do not share one instance across
-/// concurrently running loops â€” `Agent` never does, but a hand-built
+/// concurrently running loops — `Agent` never does, but a hand-built
 /// [`AgentLoopConfig`](crate::agent_loop::AgentLoopConfig) could.
 pub struct LlmCompaction {
     provider: Arc<dyn StreamProvider>,
     config: ModelConfig,
+    /// The summarizer's rates: `config.cost` until [`reprice`](Self::reprice)
+    /// looks them up again.
+    cost: Mutex<Option<crate::provider::CostConfig>>,
     api_key: String,
     trigger_ratio: f32,
-    /// `None` derives it from the budget at call time â€” see
+    /// `None` derives it from the budget at call time — see
     /// [`with_retain_tail_tokens`](LlmCompaction::with_retain_tail_tokens).
     retain_tail_tokens: Option<usize>,
     system_prompt: String,
@@ -579,25 +598,26 @@ impl LlmCompaction {
         let provider = registry
             .resolve(&config.api)
             .ok_or(crate::AgentBuildError::NoProviderForProtocol(config.api))?;
-        let api_key = crate::provider::resolve_api_key_or_warn(&config.provider);
+        let api_key = crate::provider::resolve_api_key_or_warn(Some(&config));
         Ok(Self::build(provider, config, api_key))
     }
 
     /// A compaction strategy that summarizes with an explicit provider.
     ///
     /// The escape hatch for custom [`StreamProvider`] implementations and test
-    /// doubles â€” pair with [`ModelConfig::mock`](crate::provider::ModelConfig::mock).
+    /// doubles — pair with [`ModelConfig::mock`](crate::provider::ModelConfig::mock).
     /// The config is still required so the model id, context window, and pricing
     /// stay defined together, matching
     /// [`Agent::from_provider`](crate::Agent::from_provider).
     pub fn from_provider(provider: Arc<dyn StreamProvider>, config: ModelConfig) -> Self {
-        let api_key = crate::provider::resolve_api_key_or_warn(&config.provider);
+        let api_key = crate::provider::resolve_api_key_or_warn(Some(&config));
         Self::build(provider, config, api_key)
     }
 
     fn build(provider: Arc<dyn StreamProvider>, config: ModelConfig, api_key: String) -> Self {
         Self {
             provider,
+            cost: Mutex::new(config.cost.clone()),
             config,
             api_key,
             trigger_ratio: DEFAULT_TRIGGER_RATIO,
@@ -642,9 +662,9 @@ impl LlmCompaction {
     /// strategy outright: summarization is first attempted at
     /// `trigger_ratio Â· budget`, and if the tail alone would consume all the
     /// history that exists at that point, there is nothing left to summarize.
-    /// The default therefore derives from the budget â€”
+    /// The default therefore derives from the budget —
     /// `min(`[`DEFAULT_RETAIN_TAIL_TOKENS`]`, budget / 4)`, recomputed per call
-    /// so it tracks the loop's calibrated budget â€” rather than being a fixed
+    /// so it tracks the loop's calibrated budget — rather than being a fixed
     /// number that silently no-ops on smaller context windows.
     ///
     /// An explicit value here is used as given. If it turns out to be too
@@ -669,7 +689,7 @@ impl LlmCompaction {
     /// Cap on briefing length in output tokens. Default: 2000, floor: 256.
     ///
     /// A briefing that hits this cap comes back with `StopReason::Length` and is
-    /// rejected rather than spliced â€” a truncated handoff loses the "Open items"
+    /// rejected rather than spliced — a truncated handoff loses the "Open items"
     /// section the instruction puts last.
     pub fn with_max_summary_tokens(mut self, tokens: u32) -> Self {
         if tokens < MIN_SUMMARY_TOKENS {
@@ -703,7 +723,8 @@ impl LlmCompaction {
     /// channel, so the sender has to come in from the side. Pair it with
     /// [`Agent::prompt_with_sender`](crate::Agent::prompt_with_sender), where
     /// the caller owns the channel. Without it the per-compaction cost is still
-    /// logged at `info!`, but nothing structured is emitted.
+    /// logged at `info!` and summed in [`SessionStats::compaction`], but no
+    /// per-compaction event is emitted.
     ///
     /// ```no_run
     /// # use agent::provider::ModelConfig;
@@ -734,8 +755,32 @@ impl LlmCompaction {
 
     /// Cost of the summarization request, when the model's rates are known.
     fn summary_cost(&self, usage: &Usage) -> Option<f64> {
-        let cost = &self.config.cost;
-        cost.is_configured().then(|| cost.cost_usd(usage))
+        self.cost().as_ref().map(|cost| cost.cost_usd(usage))
+    }
+
+    /// The summarizer's current rates.
+    fn cost(&self) -> Option<crate::provider::CostConfig> {
+        self.cost.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Re-price the summarization model against the process-wide price
+    /// table now — [`ModelConfig::reprice`] on its config — for a strategy
+    /// built before
+    /// [`prices::enable_bundled`](crate::provider::prices::enable_bundled),
+    /// `prices::enable_live`,
+    /// [`global::install_override`](crate::provider::prices::global::install_override)
+    /// or [`global::install_fetched`](crate::provider::prices::global::install_fetched).
+    /// Same rules as [`ModelConfig::reprice`]: only a config a first-party
+    /// pricing constructor built is looked up again, the cost may become
+    /// `None`, and a cost you set yourself is replaced.
+    ///
+    /// Takes `&self`, so it reaches a strategy already installed:
+    /// [`Agent::reprice`](crate::Agent::reprice) calls it (through
+    /// [`CompactionStrategy::reprice`]). Requests sent after the call are
+    /// priced at the new rates; one already in flight keeps the old ones.
+    pub fn reprice(&self) {
+        let cost = self.config.clone().reprice().cost;
+        *self.cost.lock().unwrap_or_else(|e| e.into_inner()) = cost;
     }
 
     /// The tail budget for this call: explicit if set, else derived from the
@@ -747,7 +792,7 @@ impl LlmCompaction {
 
     /// Choose the head/tail split: the largest `cut` (on a safe turn boundary,
     /// past the verbatim head) that leaves at least `retain_tail_tokens` of
-    /// tail â€” i.e. summarize as much as possible while keeping the recent
+    /// tail — i.e. summarize as much as possible while keeping the recent
     /// working set intact. Returns `(head_end, cut)`.
     fn choose_cut(
         &self,
@@ -788,14 +833,14 @@ impl LlmCompaction {
     /// Report, once, that briefings are being paid for and thrown away.
     ///
     /// A run where every compaction takes the deterministic path still issues
-    /// a summarization request each time â€” so the session pays input tokens
+    /// a summarization request each time — so the session pays input tokens
     /// for the summarized span and output tokens for a briefing it never uses,
     /// and silently gets the lossy behaviour `LlmCompaction` was chosen to
     /// avoid. `CompactionMethod::Deterministic` on the event is the only other
     /// signal, and only if the caller is listening for it.
     ///
     /// The usual cause is a summarizer too slow to finish before the budget is
-    /// crossed â€” most often because it is the *loop's* own model.
+    /// crossed — most often because it is the *loop's* own model.
     /// `LlmCompaction::from_config(loop_config)` is the obvious call and, for a
     /// slow loop model, the worst one.
     ///
@@ -804,7 +849,7 @@ impl LlmCompaction {
     /// Measured over 60 fed-back rounds with a summarizer slower than the
     /// compaction interval: 13 fallbacks for "not ready" against 6 fingerprint
     /// rejections, and zero splices. It is **not** the case that the fallback
-    /// invalidates the pending summary â€” see the guarantee above; `arm` always
+    /// invalidates the pending summary — see the guarantee above; `arm` always
     /// fingerprints the history `compact` is about to return, never the one it
     /// received, precisely so that cannot happen.
     ///
@@ -818,7 +863,7 @@ impl LlmCompaction {
             if state.fallbacks < FALLBACKS_BEFORE_WARNING || state.warned.losing_race {
                 return;
             }
-            // Nothing has been spawned, so nothing is being paid for â€” this is
+            // Nothing has been spawned, so nothing is being paid for — this is
             // the inert configuration, which `warn_inert_once` already reports
             // with the *opposite* trigger_ratio advice. Claiming a cost here
             // would be false and would contradict that message in the same
@@ -832,7 +877,7 @@ impl LlmCompaction {
             "llm compaction: {FALLBACKS_BEFORE_WARNING} compactions in a row fell back to the \
              deterministic tiers, so this session is getting DefaultCompaction's retention while \
              still issuing summarization requests it does not splice. The usual cause is a \
-             summarizer too slow to finish before the budget is crossed â€” name a cheaper, faster \
+             summarizer too slow to finish before the budget is crossed — name a cheaper, faster \
              model than the loop's rather than reusing its config, or lower trigger_ratio \
              (currently {}) to start summarizing sooner.",
             self.trigger_ratio,
@@ -864,11 +909,17 @@ impl LlmCompaction {
 
     /// Spawn the standalone summarization request for `messages[head_end..cut)`.
     fn spawn_summarize(&self, messages: &[AgentMessage], head_end: usize, cut: usize) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // Note: `ever_spawned` stays false here on purpose â€” no request is
+        // wasm32 has no Tokio runtime: the same no-runtime path as below,
+        // decided at compile time. Compaction stays deterministic there.
+        #[cfg(target_arch = "wasm32")]
+        let handle: Result<tokio::runtime::Handle, ()> = Err(());
+        #[cfg(not(target_arch = "wasm32"))]
+        let handle = tokio::runtime::Handle::try_current();
+        let Ok(handle) = handle else {
+            // Note: `ever_spawned` stays false here on purpose — no request is
             // issued, so nothing is being paid for.
-            // The strategy is wholly inert here â€” every compaction will be
-            // deterministic â€” so this is a warning, not a debug note.
+            // The strategy is wholly inert here — every compaction will be
+            // deterministic — so this is a warning, not a debug note.
             let mut state = lock(&self.state);
             if !state.warned.no_runtime {
                 state.warned.no_runtime = true;
@@ -886,12 +937,13 @@ impl LlmCompaction {
         let fp = fingerprint(messages, cut);
         // Summarize only [head_end, cut). The head survives the splice
         // verbatim, so including it would put those messages in the context
-        // twice â€” once as themselves, once inside the briefing.
+        // twice — once as themselves, once inside the briefing.
         let transcript = serialize_transcript(&messages[head_end..cut]);
         let provider = Arc::clone(&self.provider);
         let state = Arc::clone(&self.state);
         let cancel = self.cancel.child_token();
         let (timeout, retry) = (self.timeout, self.retry.clone());
+        let cost = self.cost();
 
         // `StreamConfig` is #[non_exhaustive]: construct via `new` and mutate,
         // per its own documented convention.
@@ -902,7 +954,11 @@ impl LlmCompaction {
             self.instruction
         ))];
         stream_config.max_tokens = Some(self.max_summary_tokens);
-        stream_config.model_config = Some(self.config.clone());
+        stream_config.model_config = Some({
+            let mut config = self.config.clone();
+            config.cost = cost.clone();
+            config
+        });
         // `temperature` is left at the `StreamConfig::new` default of `None`:
         // there is no temperature quirk flag in the compat matrix, so an
         // explicit value goes through verbatim, and the newest reasoning models
@@ -927,24 +983,53 @@ impl LlmCompaction {
             cut
         );
 
-        handle.spawn(async move {
-            // Whatever happens below â€” hung request, panic, runtime shutdown â€”
-            // the slot returns to Idle when this guard drops.
-            let mut guard = InflightGuard {
-                state: Arc::clone(&state),
-                disarmed: false,
-            };
+        // The summary's logs go where the run's own logs go.
+        use tracing::instrument::{Instrument, WithSubscriber};
+        spawn_on(
+            &handle,
+            async move {
+                // Whatever happens below — hung request, panic, runtime shutdown —
+                // the slot returns to Idle when this guard drops.
+                let mut guard = InflightGuard {
+                    state: Arc::clone(&state),
+                    disarmed: false,
+                };
 
-            let outcome = summarize(&provider, stream_config, timeout, &retry, &cancel).await;
-            let Some((text, usage)) = outcome else { return };
+                let Some(response) =
+                    summarize(&provider, stream_config, timeout, &retry, &cancel).await
+                else {
+                    return;
+                };
+                // Billed whether or not the briefing is accepted below.
+                lock(&state)
+                    .unreported
+                    .record_request(&assistant_usage(&response), cost.as_ref());
+                let Some((text, usage)) = accept_summary(response) else {
+                    return;
+                };
 
-            lock(&state).phase = Phase::Ready(Box::new(Summary {
-                fingerprint: fp,
-                head_end,
-                usage,
-                text,
-            }));
-            guard.disarm();
+                lock(&state).phase = Phase::Ready(Box::new(Summary {
+                    fingerprint: fp,
+                    head_end,
+                    usage,
+                    text,
+                }));
+                guard.disarm();
+            }
+            .in_current_span()
+            .with_current_subscriber(),
+        );
+    }
+
+    /// Move the spend of finished requests into the enclosing loop's
+    /// [`SessionStats::compaction`]. Outside a loop it stays in the ledger,
+    /// for the next call that runs inside one.
+    fn report_spend(&self) {
+        crate::agent_loop::record_compaction(|stats| {
+            let spend = std::mem::take(&mut lock(&self.state).unreported);
+            if !spend.is_empty() {
+                stats.merge(&spend);
+            }
         });
     }
 
@@ -1010,7 +1095,7 @@ impl LlmCompaction {
     /// one it received.** The agent loop writes the return value straight back
     /// into the session, so a summary fingerprinted over the *input* is
     /// invalidated by the very same call whenever the deterministic fallback
-    /// rewrites history â€” the summary is discarded on arrival, a replacement is
+    /// rewrites history — the summary is discarded on arrival, a replacement is
     /// spawned against a prefix the next fallback will rewrite in turn, and the
     /// strategy pays for a request per compaction while never splicing again.
     fn arm(&self, messages: &[AgentMessage], config: &ContextConfig, budget: usize) {
@@ -1038,25 +1123,27 @@ impl LlmCompaction {
 /// Why [`LlmCompaction::choose_cut`] found no split.
 #[derive(Debug)]
 enum NoCut {
-    /// Not enough history yet â€” expected early, resolves as the session grows.
+    /// Not enough history yet — expected early, resolves as the session grows.
     HistoryTooShort,
-    /// The retained tail leaves nothing to summarize â€” a misconfiguration that
+    /// The retained tail leaves nothing to summarize — a misconfiguration that
     /// will not resolve on its own.
     TailTooLarge,
 }
 
 /// Run one summarization request to completion, with timeout and retry.
 ///
-/// Returns the briefing and its usage, or `None` if it could not be produced â€”
-/// every failure path logs before returning, so a silent degradation to
-/// deterministic compaction is not possible.
+/// Returns the completed response — still to be checked by
+/// [`accept_summary`] — or `None` if there was none: every failure path logs
+/// before returning, so a silent degradation to deterministic compaction is
+/// not possible. A failed or timed-out attempt reports no usage, so only a
+/// returned response has spend to count.
 async fn summarize(
     provider: &Arc<dyn StreamProvider>,
     stream_config: StreamConfig,
     timeout: Duration,
     retry: &RetryConfig,
     cancel: &CancellationToken,
-) -> Option<(String, Usage)> {
+) -> Option<Message> {
     for attempt in 0..=retry.max_retries {
         if cancel.is_cancelled() {
             tracing::debug!("llm compaction: cancelled");
@@ -1064,8 +1151,8 @@ async fn summarize(
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         // Drain events we don't consume so the provider never blocks.
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let result = tokio::time::timeout(
+        let drain = crate::rt::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = crate::rt::timeout(
             timeout,
             provider.stream(stream_config.clone(), tx, cancel.clone()),
         )
@@ -1090,16 +1177,16 @@ async fn summarize(
                         // calling; this did not.
                         .unwrap_or_else(|| retry.delay_for_attempt(attempt + 1));
                     tracing::debug!("llm compaction: {e}, retrying in {delay:?}");
-                    tokio::time::sleep(delay).await;
+                    crate::rt::sleep(delay).await;
                     continue;
                 }
                 tracing::warn!("llm compaction: summarization failed: {e}");
                 return None;
             }
-            Ok(Ok(message)) => return accept_summary(message),
+            Ok(Ok(message)) => return Some(message),
         }
         if attempt < retry.max_retries {
-            tokio::time::sleep(retry.delay_for_attempt(attempt + 1)).await;
+            crate::rt::sleep(retry.delay_for_attempt(attempt + 1)).await;
         }
     }
     None
@@ -1139,8 +1226,32 @@ fn accept_summary(message: Message) -> Option<(String, Usage)> {
     Some((text, assistant_usage(&message)))
 }
 
+/// Start the background summary on the runtime it was found on. On wasm32
+/// this is never reached (there is no runtime handle), but it must compile;
+/// there the host executor stands in.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_on<F>(handle: &tokio::runtime::Handle, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    handle.spawn(future);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_on<F>(_handle: &tokio::runtime::Handle, future: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    crate::rt::spawn(future);
+}
+
 impl CompactionStrategy for LlmCompaction {
+    fn reprice(&self) {
+        LlmCompaction::reprice(self);
+    }
+
     fn compact(&self, messages: Vec<AgentMessage>, config: &ContextConfig) -> Vec<AgentMessage> {
+        self.report_spend();
         let budget = config
             .max_context_tokens
             .saturating_sub(config.system_prompt_tokens);
@@ -1148,7 +1259,7 @@ impl CompactionStrategy for LlmCompaction {
         let messages_before = messages.len();
 
         let mut wasted: Option<crate::types::Usage> = None;
-        // 1. Over budget and a summary is ready â†’ splice (verify identity).
+        // 1. Over budget and a summary is ready → splice (verify identity).
         if used > budget {
             let ready = {
                 let mut state = lock(&self.state);
@@ -1188,7 +1299,7 @@ impl CompactionStrategy for LlmCompaction {
                     // so without this the per-compaction cost would be visible
                     // nowhere in the default configuration.
                     tracing::info!(
-                        "llm compaction: {method:?} â€” summarized {summarized} messages, \
+                        "llm compaction: {method:?} — summarized {summarized} messages, \
                          {messages_before} -> {} messages ({used} -> {after} tokens); \
                          request used {} in / {} out{}",
                         result.len(),
@@ -1210,7 +1321,7 @@ impl CompactionStrategy for LlmCompaction {
                     // resets the streak. Reaching here with `Deterministic`
                     // means the summary was ready, was paid for, and was then
                     // discarded because head + briefing overflowed the budget
-                    // on their own â€” the most expensive fallback there is.
+                    // on their own — the most expensive fallback there is.
                     //
                     // Resetting on it did more than under-count: it *cleared*
                     // the streak, so a session alternating this path with the
@@ -1235,8 +1346,8 @@ impl CompactionStrategy for LlmCompaction {
                     return result;
                 }
                 // The request was billed even though the briefing is unusable.
-                // `types.rs` states the contract plainly â€” "the request was
-                // still paid for, so the event still reports it" â€” and the
+                // `types.rs` states the contract plainly — "the request was
+                // still paid for, so the event still reports it" — and the
                 // sibling discard branch above already honours it. Reporting
                 // `None` here meant a cost-accounting caller under-counted
                 // exactly the failure mode that wastes the most.
@@ -1245,7 +1356,7 @@ impl CompactionStrategy for LlmCompaction {
             }
         }
 
-        // 2. Over budget with no usable summary â†’ deterministic fallback.
+        // 2. Over budget with no usable summary → deterministic fallback.
         //    `wasted` is set when a briefing was produced and then rejected, so
         //    the event below can still report what it cost.
         //    The loop always makes progress; a slow or dead summarizer can
@@ -1272,7 +1383,7 @@ impl CompactionStrategy for LlmCompaction {
             return result;
         }
 
-        // 3. Under budget â†’ arm against the history we are handing back.
+        // 3. Under budget → arm against the history we are handing back.
         self.arm(&messages, config, budget);
         messages
     }
@@ -1297,7 +1408,7 @@ fn clip(text: &str, max: usize) -> &str {
 
 /// Serialize the summarized span into a plain-text transcript for the
 /// summarization request. Bounded per content block *and* in total; tool
-/// arguments and results are included in clipped form â€” identifiers matter,
+/// arguments and results are included in clipped form — identifiers matter,
 /// repetition does not.
 fn serialize_transcript(messages: &[AgentMessage]) -> String {
     let mut out = String::new();
@@ -1433,6 +1544,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clip_keeps_only_the_prefix_within_the_byte_limit() {
+        assert_eq!(clip("0123456789", 4), "0123");
+        assert_eq!(clip("0123456789", 0), "");
+        assert_eq!(clip("éclair", 2), "é");
+        // A limit inside a multi-byte char backs off to the previous boundary.
+        assert_eq!(clip("éclair", 1), "");
+    }
+
     fn mock(text: &str) -> LlmCompaction {
         LlmCompaction::from_provider(Arc::new(MockProvider::text(text)), ModelConfig::mock())
     }
@@ -1469,7 +1589,7 @@ mod tests {
         peak_tokens: usize,
     }
 
-    /// Append a turn, compact, **feed the result back** â€” the call pattern in
+    /// Append a turn, compact, **feed the result back** — the call pattern in
     /// `agent_loop.rs`. Tests must use this rather than re-passing pristine
     /// input: a summary is fingerprinted against the history `compact` returns,
     /// so replaying the original vector exercises a contract the loop never
@@ -1526,6 +1646,25 @@ mod tests {
                     if text.contains("Ship the parser"))))
         }));
         assert!(run.peak_tokens <= 2_000, "the budget must hold throughout");
+    }
+
+    /// Outside an agent loop there is no run to charge, so the spend of
+    /// finished requests waits in the ledger instead of being dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spend_outside_a_loop_stays_in_the_ledger() {
+        let (provider, calls) = ScriptedProvider::new("## Goal\nShip the parser.");
+        let strategy = LlmCompaction::from_provider(provider, ModelConfig::mock())
+            .with_trigger_ratio(0.1)
+            .with_retain_tail_tokens(200);
+        let cfg = config(2_000);
+
+        drive(&strategy, &cfg, 30, |i| turn(i, 400)).await;
+        settle().await;
+        let sent = calls.load(std::sync::atomic::Ordering::SeqCst) as u32;
+        assert!(sent > 0);
+        // Every response is in the ledger; one still in flight may not be.
+        let unreported = lock(&strategy.state).unreported.requests;
+        assert!(unreported >= sent.saturating_sub(1) && unreported <= sent);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1591,7 +1730,7 @@ mod tests {
     }
 
     /// Regression: a fixed 20k tail made the strategy a silent no-op on any
-    /// budget under ~33k â€” `choose_cut` never found a split, nothing was
+    /// budget under ~33k — `choose_cut` never found a split, nothing was
     /// logged, and behaviour was identical to `DefaultCompaction`.
     #[tokio::test(flavor = "multi_thread")]
     async fn default_retain_tail_scales_to_a_small_budget() {
@@ -1750,7 +1889,7 @@ mod tests {
     }
 
     /// The handoff asked specifically whether Level 1 stays idempotent on a
-    /// spliced history â€” it must, or a later compaction pass rewrites those
+    /// spliced history — it must, or a later compaction pass rewrites those
     /// bytes again and costs another prefix-cache break. Driven with a verbose
     /// summarizer so the safety net actually runs over the spliced shape.
     #[tokio::test(flavor = "multi_thread")]
@@ -1849,7 +1988,7 @@ mod tests {
             .collect()
     }
 
-    /// An assistant message opening two tool calls followed by both results â€”
+    /// An assistant message opening two tool calls followed by both results —
     /// the shape `ToolExecutionStrategy::Parallel` produces by default.
     fn parallel_tool_turn(i: usize) -> Vec<AgentMessage> {
         let (a, b) = (format!("call-{i}a"), format!("call-{i}b"));
@@ -1897,7 +2036,7 @@ mod tests {
     /// Regression: the agent loop writes `compact()`'s result straight back
     /// (`agent_loop.rs`), so a summary fingerprinted over the *input* was
     /// invalidated by the same call whenever the fallback rewrote history. That
-    /// state was absorbing â€” measured at 22 paid requests and 0 splices over 25
+    /// state was absorbing — measured at 22 paid requests and 0 splices over 25
     /// rounds. Every other test in this file re-passes the pristine input, which
     /// is exactly why none of them caught it.
     #[tokio::test(flavor = "multi_thread")]
@@ -1930,7 +2069,7 @@ mod tests {
             assert!(
                 spliced_rounds > 0 || requests == 0,
                 "turn_chars={turn_chars}: {requests} summarization requests paid for and never \
-                 spliced â€” the fallback is invalidating its own pending summary"
+                 spliced — the fallback is invalidating its own pending summary"
             );
         }
     }
@@ -2039,13 +2178,13 @@ mod tests {
             let orphans = orphaned_tool_calls(&run.messages);
             assert!(
                 orphans.is_empty(),
-                "keep_first={keep_first}: orphaned tool_use ids {orphans:?} â€” a provider \
+                "keep_first={keep_first}: orphaned tool_use ids {orphans:?} — a provider \
                  would reject this outright"
             );
         }
     }
 
-    /// Returns a successful response carrying a non-`Stop` stop reason â€” the
+    /// Returns a successful response carrying a non-`Stop` stop reason — the
     /// shape a truncated or refused briefing arrives in.
     struct StoppedProvider {
         reason: StopReason,
@@ -2071,7 +2210,7 @@ mod tests {
         }
     }
 
-    /// Never returns â€” stands in for a hung request with no provider timeout.
+    /// Never returns — stands in for a hung request with no provider timeout.
     struct HangingProvider;
 
     #[async_trait::async_trait]
@@ -2087,7 +2226,7 @@ mod tests {
     }
 
     /// A truncated or refused briefing is non-empty text, so the old
-    /// emptiness check let it through â€” and splicing *deletes* the span it
+    /// emptiness check let it through — and splicing *deletes* the span it
     /// replaces, making that permanent data loss.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_non_stop_summary_is_rejected_not_spliced() {
@@ -2168,7 +2307,7 @@ mod tests {
         );
     }
 
-    /// A provider that always fails â€” MockProvider never errors, so the
+    /// A provider that always fails — MockProvider never errors, so the
     /// failure path needs its own double.
     struct FailingProvider;
 
@@ -2189,7 +2328,7 @@ mod tests {
     /// Lives here, in `mod tests`, because the helpers do. The sibling
     /// `losing_race_warning` module calls `warn_losing_race_once` directly, so
     /// deleting its only call site in `compact` left every one of those tests
-    /// green while disconnecting the feature entirely â€” the counter would never
+    /// green while disconnecting the feature entirely — the counter would never
     /// move for any real user.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_counts_real_fallbacks_and_warns_on_the_streak() {
@@ -2200,7 +2339,7 @@ mod tests {
         let cfg = config(2_000);
 
         // The summarizer always fails, so no briefing is ever ready and every
-        // compaction takes the deterministic path â€” the condition the warning
+        // compaction takes the deterministic path — the condition the warning
         // exists to report.
         for expected in 1..FALLBACKS_BEFORE_WARNING {
             let _ = strategy.compact(history(30, 400), &cfg);
@@ -2236,7 +2375,7 @@ mod tests {
         // a *retryable* error, and `delay_for_attempt` was called 0-indexed
         // against its documented 1-indexed contract, so the first retry
         // panicked on `usize` underflow. The task died instantly, the guard
-        // dropped, and the assertion held â€” on a debug-only panic on a detached
+        // dropped, and the assertion held — on a debug-only panic on a detached
         // task. With the indexing fixed the first backoff is ~1s and the slot
         // is legitimately still in flight at 100ms.
         let strategy = LlmCompaction::from_provider(Arc::new(FailingProvider), ModelConfig::mock())
@@ -2261,7 +2400,7 @@ mod losing_race_warning {
     use super::*;
 
     /// A strategy that has already issued at least one request, which is what
-    /// the losing-race warning is gated on â€” without it the warning would
+    /// the losing-race warning is gated on — without it the warning would
     /// claim a cost in the inert configuration, where nothing is ever spawned.
     fn strategy() -> LlmCompaction {
         let s = LlmCompaction::from_config(crate::provider::ModelConfig::mock());
@@ -2271,8 +2410,8 @@ mod losing_race_warning {
 
     /// The warning is one-shot, and only after a *streak*.
     ///
-    /// A single fallback is ordinary â€” the first compaction of a session
-    /// usually arrives before any summary could have been ready â€” so warning on
+    /// A single fallback is ordinary — the first compaction of a session
+    /// usually arrives before any summary could have been ready — so warning on
     /// it would train callers to ignore the message.
     #[test]
     fn one_fallback_is_quiet_and_the_warning_fires_once() {
@@ -2281,7 +2420,7 @@ mod losing_race_warning {
             s.warn_losing_race_once();
             assert!(
                 !lock(&s.state).warned.losing_race,
-                "fewer than {FALLBACKS_BEFORE_WARNING} consecutive fallbacks must stay quiet â€” \
+                "fewer than {FALLBACKS_BEFORE_WARNING} consecutive fallbacks must stay quiet — \
                  a short run of misses happens in sessions that are working"
             );
         }
@@ -2289,7 +2428,7 @@ mod losing_race_warning {
         s.warn_losing_race_once();
         assert!(
             lock(&s.state).warned.losing_race,
-            "a streak of {FALLBACKS_BEFORE_WARNING} must warn â€” the session is issuing \
+            "a streak of {FALLBACKS_BEFORE_WARNING} must warn — the session is issuing \
              briefings it never splices"
         );
 
@@ -2305,7 +2444,7 @@ mod losing_race_warning {
 
     /// All `Content::Text` of a message, whatever its role.
     ///
-    /// Not `context::message_text` â€” that walks `block_texts`, which matches
+    /// Not `context::message_text` — that walks `block_texts`, which matches
     /// only `Message::ToolResult` and returns empty for the `User` message a
     /// briefing is spliced in as. Both assertions below used it at first and
     /// were therefore inspecting nothing: the "briefing is absent" check passed
@@ -2323,7 +2462,7 @@ mod losing_race_warning {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            AgentMessage::Extension(_) => String::new(),
+            AgentMessage::Custom(_) => String::new(),
         }
     }
 
@@ -2332,7 +2471,7 @@ mod losing_race_warning {
     /// In the *inert* configuration `choose_cut` never finds a split, so
     /// `spawn_summarize` is never called and not one token is spent. Warning
     /// there told the caller they were "paying for briefings" having paid
-    /// nothing â€” in the same session as `warn_inert_once`, which gives the
+    /// nothing — in the same session as `warn_inert_once`, which gives the
     /// **opposite** `trigger_ratio` advice. Two warnings, contradicting each
     /// other, both about a cost that does not exist.
     #[test]
@@ -2357,7 +2496,7 @@ mod losing_race_warning {
     /// contained a run of consecutive misses, and a non-retracting latch
     /// reported it as broken for the rest of the run.
     ///
-    /// Drives a real splice rather than simulating the clear â€” the sibling
+    /// Drives a real splice rather than simulating the clear — the sibling
     /// discard test showed the staging is cheap, and a simulated version would
     /// not catch the clear being deleted from `compact`.
     #[test]
@@ -2402,7 +2541,7 @@ mod losing_race_warning {
         let result = strategy.compact(messages, &config);
         assert!(
             result.iter().any(|m| text_of(m).contains("brief")),
-            "fixture must actually splice â€” the briefing must appear in the result"
+            "fixture must actually splice — the briefing must appear in the result"
         );
         let s = lock(&strategy.state);
         assert_eq!(s.fallbacks, 0, "a landed splice resets the streak");
@@ -2417,8 +2556,8 @@ mod losing_race_warning {
     ///
     /// This is the wiring the policy test below cannot reach, and it is where
     /// the bug was: `fallbacks = 0` sat on the shared success exit, so the
-    /// "summary ready but head + briefing overflow the budget" branch â€” which
-    /// sets `method = Deterministic` and leaves via that same exit â€” cleared
+    /// "summary ready but head + briefing overflow the budget" branch — which
+    /// sets `method = Deterministic` and leaves via that same exit — cleared
     /// the counter. Alternating it with the not-ready path sawtoothed 1,0,1,0,
     /// so a session could take six consecutive deterministic compactions,
     /// three of them paid for, and never warn.
@@ -2468,7 +2607,7 @@ mod losing_race_warning {
             !result
                 .iter()
                 .any(|m| context::message_text(m).contains("bbbb")),
-            "fixture must actually take the discard branch â€” the oversized briefing \
+            "fixture must actually take the discard branch — the oversized briefing \
              must not appear in the result"
         );
         assert_eq!(
@@ -2487,7 +2626,7 @@ mod losing_race_warning {
     ///
     /// **Scope:** this pins the streak *policy*, not the wiring. It sets
     /// `fallbacks = 0` directly rather than driving a real splice, so deleting
-    /// the reset from `compact`'s success path would not fail it â€” exercising
+    /// the reset from `compact`'s success path would not fail it — exercising
     /// that needs a summary staged in `Phase::Ready` with a matching
     /// fingerprint. Stated because a test that reads stronger than it is, is
     /// worse than one that admits its limit.

@@ -85,11 +85,14 @@ impl StreamProvider for BulkProvider {
     }
 }
 
-/// Resolve a model id to a **priced** preset where one exists.
+/// Resolve a model id to its named preset where one exists.
 ///
-/// `ModelConfig::anthropic` leaves `CostConfig` at zero, which makes
-/// `is_configured()` false and blanks the cost column — the one number this
-/// harness exists to surface.
+/// Prices alone would not need this: the generic constructors look a listed
+/// id up in the bundled `prices.json` (enabled in `main`) too. The presets
+/// matter for everything else they set — the 1M context window this harness measures compaction against, the
+/// max output, and for GPT-6 the Responses API. Ids the price table does not
+/// list come back unpriced, which blanks the cost column — the one number
+/// this harness exists to surface — so that is noted.
 fn priced(id: &str) -> ModelConfig {
     match id {
         "claude-sonnet-5" => ModelConfig::claude_sonnet_5(),
@@ -97,6 +100,11 @@ fn priced(id: &str) -> ModelConfig {
         "claude-opus-5" => ModelConfig::claude_opus_5(),
         "claude-opus-4-8" => ModelConfig::claude_opus_4_8(),
         "claude-fable-5" => ModelConfig::claude_fable_5(),
+        "claude-fable-5-1" => ModelConfig::claude_fable_5_1(),
+        "claude-opus-5-5" => ModelConfig::claude_opus_5_5(),
+        "gpt-6-astra" => ModelConfig::gpt_6_astra(),
+        "gpt-6-sol" => ModelConfig::gpt_6_sol(),
+        "gpt-6-luna" => ModelConfig::gpt_6_luna(),
         // DeepSeek caches automatically, server-side: this crate sends no
         // `cache_control` on the OpenAI-compat path, and `openai_compat.rs`
         // maps `prompt_cache_hit_tokens` onto `Usage::cache_read`. So a hit
@@ -109,21 +117,37 @@ fn priced(id: &str) -> ModelConfig {
         // column over-reports rather than under-reports off-peak runs.
         // DeepSeek has no cache-write category at all: populating its cache
         // is free, which is the asymmetry the provider comparison turns on.
-        "deepseek-v4-flash" => deepseek_priced("deepseek-v4-flash", 0.44, 1.32, 0.014),
+        // `deepseek-v4-flash` is a legacy name DeepSeek still accepts, served
+        // by V4.1 Flash and billed at the Flash price.
+        "deepseek-flash" => deepseek_priced("deepseek-flash", 0.30, 1.20, 0.006),
+        "deepseek-v4-flash" => deepseek_priced("deepseek-v4-flash", 0.30, 1.20, 0.006),
         "deepseek-v4-pro" => deepseek_priced("deepseek-v4-pro", 1.32, 3.96, 0.044),
-        other if other.starts_with("deepseek") => ModelConfig::deepseek(other, other),
-        other => {
-            eprintln!("note: no priced preset for '{other}' — the cost column will be blank");
-            ModelConfig::anthropic(other, other)
+        other if other.starts_with("deepseek") => {
+            noting_unpriced(ModelConfig::deepseek(other, other))
         }
+        other => noting_unpriced(ModelConfig::anthropic(other, other)),
     }
 }
 
-/// A DeepSeek config carrying peak-window rates. `cache_write` is 0 because
-/// DeepSeek has no write category — populating its cache is free.
+fn noting_unpriced(config: ModelConfig) -> ModelConfig {
+    if config.cost.is_none() {
+        note_unpriced(&config.id);
+    }
+    config
+}
+
+fn note_unpriced(model: &str) {
+    eprintln!(
+        "note: the bundled prices.json does not list '{model}' — the cost column will be blank"
+    );
+}
+
+/// A DeepSeek config carrying peak-window rates. `cache_write` is left unset
+/// because DeepSeek has no write category (it would bill at the input rate,
+/// but DeepSeek never reports cache-write tokens — a miss is plain input).
 fn deepseek_priced(id: &str, input: f64, output: f64, cache_read: f64) -> ModelConfig {
     let mut config = ModelConfig::deepseek(id, id);
-    config.cost = CostConfig::new(input, output).with_cache_read(cache_read);
+    config.cost = Some(CostConfig::new(input, output).with_cache_read(cache_read));
     config
 }
 
@@ -326,6 +350,9 @@ fn briefings(messages: &[AgentMessage]) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The cost column needs prices: opt in to the bundled snapshot before any
+    // config is built (nothing is priced by default).
+    agent::provider::prices::enable_bundled();
     // INFO surfaces the strategy's own per-compaction line, which reports the
     // cost even when no event sender is wired. `env-filter` is not among the
     // crate's tracing-subscriber features, so this is level-based rather than
@@ -555,6 +582,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // The same spend as the events' rows, summed by the loop into the runs'
+    // `SessionStats::compaction`. It is counted when a request finishes rather
+    // than when its briefing is spliced or discarded, so the two can differ by
+    // requests the session never used (or one still in flight at the end).
+    let compaction_spend = agent.compaction_spend().clone();
+    let total_cost_usd = agent.total_cost_usd();
     drop(agent);
     drop(compact_tx);
 
@@ -622,7 +655,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\n{:<14} {:>10} {:>10} {:>8} {:>10} {:>9}",
         "method", "before", "after", "span", "req in/out", "cost"
     );
-    let mut total_cost = 0.0;
+    // `None` once any summarization request could not be priced: a partial
+    // sum printed as a dollar figure would understate the spend.
+    let mut total_cost = Some(0.0);
     for (method, before, after, summary) in &compactions {
         let (span, io, cost) = match summary {
             Some(s) => (
@@ -632,7 +667,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             None => ("-".into(), "-".into(), None),
         };
-        total_cost += cost.unwrap_or(0.0);
+        // A row with no summary made no request, so it adds nothing; a
+        // request with no cost is unpriced and poisons the total.
+        if summary.is_some() {
+            total_cost = total_cost.zip(cost).map(|(t, c)| t + c);
+        }
         println!(
             "{:<14} {before:>10} {after:>10} {span:>8} {io:>10} {:>9}",
             format!("{method:?}"),
@@ -640,7 +679,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "-".into()),
         );
     }
-    println!("\nsummarization cost: ${total_cost:.4}");
+    match total_cost {
+        Some(c) => println!("\nsummarization cost: ${c:.4}"),
+        None => println!("\nsummarization cost: unpriced"),
+    }
+    println!(
+        "SessionStats::compaction: {} request(s), {}/{} tokens, {}",
+        compaction_spend.requests,
+        compaction_spend.usage.input,
+        compaction_spend.usage.output,
+        compaction_spend
+            .cost_usd
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "unpriced".into()),
+    );
+    println!(
+        "agent total (turns + summaries): {}",
+        total_cost_usd
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "unpriced".into()),
+    );
 
     println!("\n{}", "=".repeat(72));
     println!("SESSION TOKENS & PROMPT CACHE");

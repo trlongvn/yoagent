@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // restore terminal on panic so raw mode never leaks
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::restore();
+        ratatui::restore();
         let _ = io::stdout().flush();
         panic_hook(info);
     }));

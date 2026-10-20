@@ -1,0 +1,1388 @@
+//! Decision models: typed questions in, calibrated probabilities out.
+//!
+//! A decision model evaluates a `state` (text or JSON) against typed
+//! questions — **Noul** (yes/no), **Choice** (one of N options), **Score**
+//! (an ordered scale) — and returns typed answers with probabilities, not
+//! prose. They are fast (a few hundred ms per request: medians of 230–444 ms
+//! for Jev and Clef in our measurements) and cheap, which makes them useful
+//! for the small judgments an agent makes constantly: is this request asking
+//! for an action, which skill fits, does this tool call destroy data.
+//!
+//! "Noul" is deliberate: it is the SystemOne wire vocabulary (`"type":
+//! "noul"`), shared by TypeSafe's API and self-hosted servers such as JevK5,
+//! so the types read the same as the requests they produce.
+//!
+//! Behind the `decision` Cargo feature, off by default. Nothing is ever sent
+//! until you construct a [`DecisionModel`] and use it — an API key in the
+//! environment enables nothing on its own.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), agent::decision::DecisionError> {
+//! use agent::decision::DecisionModel;
+//!
+//! let jev = DecisionModel::jev(); // TypeSafe Jev; key from TYPESAFE_API_KEY
+//! let urgent = jev.noul("Help! My payouts have been failing for 3 days.",
+//!                       "Does this convey urgency?").await?;
+//! let team = jev.choice("My card was charged twice.",
+//!                       "Which team should handle this?",
+//!                       ["billing", "technical", "sales"]).await?;
+//! println!("urgent: {:.2}, team: {} ({:.2})", urgent.p_true(), team.choice(), team.confidence());
+//! # Ok(()) }
+//! ```
+//!
+//! Several questions about one state go in one request:
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), agent::decision::DecisionError> {
+//! # let jev = agent::decision::DecisionModel::jev();
+//! let eval = jev
+//!     .ask("Help! My payouts have been failing for 3 days.")
+//!     .noul("urgent", "Does this convey urgency?")
+//!     .choice("team", "Which team should handle this?", ["billing", "technical"])
+//!     .score("mood", "How frustrated is the customer?", ["Calm", "Frustrated", "Very angry"])
+//!     .send()
+//!     .await?;
+//! let urgent = eval.p_true("urgent").unwrap_or(0.0);
+//! # Ok(()) }
+//! ```
+//!
+//! Integrations depend on the [`DecisionBackend`] trait, never on a vendor:
+//! [`SystemOneBackend`] speaks the SystemOne HTTP API (TypeSafe, OpenCode Zen,
+//! self-hosted JevK5), [`LogprobBackend`] turns any OpenAI-compatible server
+//! that returns logprobs into a decision model
+//! ([`DecisionModel::logprobs`]), [`OpenAiDecisionBackend`] speaks OpenAI's
+//! Decisions API ([`DecisionModel::gpt_6_luna`]), [`MockBackend`] scripts
+//! answers for tests,
+//! and any other backend plugs in through [`DecisionModel::from_backend`].
+//! Chain fallbacks with [`DecisionModel::or`]; measure a model on your own
+//! labelled examples with [`calibrate()`].
+//!
+//! ```no_run
+//! # async fn demo() {
+//! use agent::decision::{calibrate, CalibrationExample, DecisionModel};
+//!
+//! // Hosted Jev, falling back to a local llama-server.
+//! let model = DecisionModel::jev()
+//!     .or(DecisionModel::logprobs("http://localhost:8080", "llama-3.1-8b-instruct"));
+//! let q = "Does this ask to delete data?";
+//! let report = calibrate(&model, vec![
+//!     CalibrationExample::noul("rm -rf build/", q, true),
+//!     CalibrationExample::noul("list src/", q, false),
+//! ]).await;
+//! println!("{report}");
+//! # }
+//! ```
+//!
+//! # Limits you should know
+//!
+//! - **Hosted backends see the state.** Whatever you evaluate is sent to the
+//!   vendor. [`DecisionModel::local`] keeps it on your machine.
+//! - **Thresholds are per model.** A threshold tuned on `jev-1.13.0` is not
+//!   portable to the next release; pin a version with
+//!   [`with_model`](DecisionModel::with_model) once you tune one.
+//! - **Adversarial content can steer answers.** State is data to the model,
+//!   not an instruction channel it defends. Never treat a decision model as a
+//!   security boundary.
+//! - Known weak spots (Jev 1.13): literal reading, arithmetic, counting and
+//!   dates, and large states full of irrelevant detail.
+//!
+//! See the book chapter *Decision models* for the agent integrations
+//! (`Agent::with_decision_model`, `Agent::with_tool_gate`,
+//! `Agent::with_input_guard`).
+
+mod advisory;
+mod answer;
+mod backend;
+mod calibrate;
+mod error;
+mod gate;
+mod guard;
+mod logprobs;
+mod mock;
+mod openai;
+mod question;
+mod systemone;
+
+pub use advisory::Advisory;
+pub use answer::{
+    distribution_confidence, Answer, ChoiceAnswer, DecisionUsage, Evaluation, NoulAnswer,
+    ScoreAnswer,
+};
+pub use backend::{Capabilities, DecisionBackend};
+pub use calibrate::{
+    calibrate, calibrate_with, CalibrationError, CalibrationExample, CalibrationOptions,
+    CalibrationReport, Expected, ReliabilityBin, ThresholdPoint,
+};
+pub use error::{DecisionError, FallbackAttempt};
+pub use gate::ToolGate;
+pub use guard::InputGuard;
+pub use logprobs::LogprobBackend;
+pub use mock::MockBackend;
+pub use openai::OpenAiDecisionBackend;
+pub use question::{Question, QuestionKind, Request};
+pub use systemone::{parse_systemone_response, SystemOneBackend};
+
+use crate::provider::CostConfig;
+use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// The `prices.json` provider key for TypeSafe's models.
+pub(crate) const TYPESAFE_PRICE_PROVIDER: &str = "typesafe";
+
+/// The `prices.json` provider key for Cloudflare Workers AI's models.
+pub(crate) const CLOUDFLARE_PRICE_PROVIDER: &str = "cloudflare";
+
+/// The `prices.json` provider key for OpenAI's Decisions API models — not
+/// `openai`: a decision is billed at its own rate, not the chat model's.
+pub(crate) const OPENAI_DECISIONS_PRICE_PROVIDER: &str = "openai-decisions";
+
+/// Default overall timeout of one [`DecisionModel`] call, retries included.
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+enum Slot {
+    SystemOne(SystemOneBackend),
+    Logprobs(LogprobBackend),
+    OpenAi(OpenAiDecisionBackend),
+    Custom(Arc<dyn DecisionBackend>),
+}
+
+impl Slot {
+    fn get(&self) -> &dyn DecisionBackend {
+        match self {
+            Slot::SystemOne(b) => b,
+            Slot::Logprobs(b) => b,
+            Slot::OpenAi(b) => b,
+            Slot::Custom(b) => b.as_ref(),
+        }
+    }
+
+    /// Evaluate, adding to `billed` what a failed call was billed for — a
+    /// response that arrived but could not be used (a refusal, an unusable
+    /// answer). The built-in backends report it; a custom backend's failure
+    /// carries no spend.
+    async fn evaluate_billed(
+        &self,
+        request: &Request,
+        billed: &std::sync::Mutex<Option<Evaluation>>,
+    ) -> Result<Evaluation, DecisionError> {
+        match self {
+            Slot::SystemOne(b) => b.evaluate_billed(request, billed).await,
+            Slot::Logprobs(b) => b.evaluate_billed(request, billed).await,
+            Slot::OpenAi(b) => b.evaluate_billed(request, billed).await,
+            Slot::Custom(b) => b.evaluate(request).await,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Pricing {
+    /// TypeSafe's list prices from the resolved price table, by the reported
+    /// model id — only while requests go to TypeSafe's own host.
+    TypeSafeList,
+    /// Workers AI's list prices from the resolved price table, by the model
+    /// id (`clef`, `clef-flash`) — only while requests go to Cloudflare.
+    CloudflareList,
+    /// OpenAI's Decisions API list prices from the resolved price table, by
+    /// the reported model id — only while requests go to `api.openai.com`.
+    OpenAiDecisionsList,
+    Fixed(CostConfig),
+    Unpriced,
+}
+
+/// A decision model: a backend plus the model id to ask for. The handle
+/// everything else takes.
+///
+/// Cheap to clone (the backend is shared). Choose one with a preset —
+/// [`jev`](Self::jev), [`jev_opencode`](Self::jev_opencode),
+/// [`jev_opencode_free`](Self::jev_opencode_free),
+/// [`clef`](Self::clef), [`clef_flash`](Self::clef_flash),
+/// [`gpt_6_luna`](Self::gpt_6_luna), [`local`](Self::local),
+/// [`logprobs`](Self::logprobs) — or [`from_backend`](Self::from_backend);
+/// everything else has defaults. Chain fallbacks with [`or`](Self::or).
+#[derive(Clone)]
+pub struct DecisionModel {
+    backend: Slot,
+    model: String,
+    /// One call's overall budget — the whole fallback chain's.
+    timeout: Duration,
+    pricing: Pricing,
+    /// This member's own limit per attempt, inside the overall budget.
+    attempt_timeout: Option<Duration>,
+    /// Tried in order after this model fails (flat: members have none).
+    fallbacks: Vec<DecisionModel>,
+}
+
+impl std::fmt::Debug for DecisionModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("DecisionModel");
+        d.field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("pricing", &self.pricing);
+        if let Some(t) = self.attempt_timeout {
+            d.field("attempt_timeout", &t);
+        }
+        match &self.backend {
+            Slot::SystemOne(b) => d.field("backend", b),
+            Slot::Logprobs(b) => d.field("backend", b),
+            Slot::OpenAi(b) => d.field("backend", b),
+            Slot::Custom(_) => d.field("backend", &"custom"),
+        };
+        if !self.fallbacks.is_empty() {
+            d.field("fallbacks", &self.fallbacks);
+        }
+        d.finish()
+    }
+}
+
+impl DecisionModel {
+    /// TypeSafe's Jev (`jev-latest`), key from `TYPESAFE_API_KEY` and base
+    /// URL from `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), both
+    /// read at call time. Priced from the process-wide price table by the
+    /// versioned id the API reports — while the base URL is TypeSafe's host;
+    /// pointed elsewhere it is unpriced. **Unpriced until the process opts
+    /// in** ([`prices::enable_bundled`](crate::provider::prices::enable_bundled)
+    /// or a user layer; the bundled snapshot has $0.042 per million input
+    /// tokens for `jev-1.13.0`, output free).
+    pub fn jev() -> Self {
+        Self {
+            backend: Slot::SystemOne(SystemOneBackend::typesafe()),
+            model: "jev-latest".into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::TypeSafeList,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Jev through OpenCode Zen (`jev-1.13`), key from `OPENCODE_API_KEY`.
+    /// Unpriced: a gateway's bill is not the vendor's list price.
+    pub fn jev_opencode() -> Self {
+        Self {
+            backend: Slot::SystemOne(SystemOneBackend::opencode_zen()),
+            model: "jev-1.13".into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::Unpriced,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Jev's free tier on OpenCode Zen (`jev-1.13-free`), key from
+    /// `OPENCODE_API_KEY`. Unpriced like [`jev_opencode`](Self::jev_opencode);
+    /// set [`with_cost`](Self::with_cost) if you want it reported as $0.
+    pub fn jev_opencode_free() -> Self {
+        Self {
+            model: "jev-1.13-free".into(),
+            ..Self::jev_opencode()
+        }
+    }
+
+    /// Cloudflare's Clef (`@cf/cloudflare/clef`, 27B) on Workers AI, called
+    /// through the REST API on Cloudflare account `account_id`. The API token
+    /// (Workers AI Read and Edit) is read at call time from
+    /// `CLOUDFLARE_API_TOKEN`, then `CLOUDFLARE_AUTH_TOKEN`, or set with
+    /// [`with_api_key`](Self::with_api_key) — on wasm32 there is no process
+    /// environment. Priced from the process-wide price table by the model id
+    /// the response reports — **unpriced until the process opts in**
+    /// ([`prices::enable_bundled`](crate::provider::prices::enable_bundled):
+    /// $0.24 per million input tokens). That is the list price, while
+    /// Cloudflare bills in neurons with a daily free allocation.
+    ///
+    /// Keep the preset's model id: Clef's input schema accepts only `clef`
+    /// and `clef-flash`, each at its own URL, and
+    /// [`with_model`](Self::with_model) changes the id but not the URL. For
+    /// Clef Flash use [`clef_flash`](Self::clef_flash).
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), agent::decision::DecisionError> {
+    /// use agent::decision::DecisionModel;
+    /// let model = DecisionModel::clef("your-account-id");
+    /// let urgent = model.noul("Checkout fails for every customer.", "Is this urgent?").await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Inside a Cloudflare Worker, the `yoagent-workers` crate runs Clef
+    /// through the Worker's AI binding instead, with no token.
+    pub fn clef(account_id: impl AsRef<str>) -> Self {
+        Self::workers_ai(account_id, "clef")
+    }
+
+    /// Cloudflare's Clef Flash (`@cf/cloudflare/clef-flash`, 9B, faster) on
+    /// Workers AI; otherwise as [`clef`](Self::clef). $0.09 per million
+    /// input tokens.
+    pub fn clef_flash(account_id: impl AsRef<str>) -> Self {
+        Self::workers_ai(account_id, "clef-flash")
+    }
+
+    fn workers_ai(account_id: impl AsRef<str>, model: &str) -> Self {
+        let backend = SystemOneBackend::workers_ai(account_id, format!("@cf/cloudflare/{model}"));
+        Self {
+            backend: Slot::SystemOne(backend),
+            model: model.into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::CloudflareList,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// OpenAI's `gpt-6-luna` on the Decisions API (`POST /v1/decisions`,
+    /// public beta), key from `OPENAI_API_KEY` at call time (or
+    /// [`with_api_key`](Self::with_api_key)). See [`OpenAiDecisionBackend`]
+    /// for how questions map onto the API; a question OpenAI refuses fails
+    /// the call with [`DecisionError::Refused`] (its usage still recorded),
+    /// so the tool gate and the input guard fail closed — and a fallback
+    /// chain ([`or`](Self::or)) stops there rather than ask another model. Priced from the process-wide price table by
+    /// the model id the response reports, while requests go to
+    /// `api.openai.com` — **unpriced until the process opts in**
+    /// ([`prices::enable_bundled`](crate::provider::prices::enable_bundled):
+    /// $0.10 per million input tokens, output and caching free; OpenAI's
+    /// regional-processing and long-context multipliers are not modelled).
+    ///
+    /// Another model id: [`with_model`](Self::with_model) (same endpoint).
+    /// Another base URL, a fixed key or a `safety_identifier`: configure an
+    /// [`OpenAiDecisionBackend`] and use
+    /// [`from_openai_backend`](Self::from_openai_backend).
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), agent::decision::DecisionError> {
+    /// use agent::decision::DecisionModel;
+    /// let luna = DecisionModel::gpt_6_luna();
+    /// let urgent = luna.noul("Checkout fails for every customer.", "Is this urgent?").await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Tested against mock servers only; never run against the live API.
+    pub fn gpt_6_luna() -> Self {
+        Self::from_openai_backend(OpenAiDecisionBackend::new(), "gpt-6-luna")
+    }
+
+    /// A model on OpenAI's Decisions API through a backend you configured
+    /// (base URL, key, retry, `safety_identifier`), asking for `model`.
+    /// Keeps the preset conveniences: [`with_api_key`](Self::with_api_key)
+    /// and [`with_retry`](Self::with_retry) apply, and the list price
+    /// applies while the host is `api.openai.com` (once pricing is enabled).
+    pub fn from_openai_backend(backend: OpenAiDecisionBackend, model: impl Into<String>) -> Self {
+        Self {
+            backend: Slot::OpenAi(backend),
+            model: model.into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::OpenAiDecisionsList,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// A self-hosted SystemOne-compatible server (JevK5, ...) at `base_url`:
+    /// no key, [`local`](Capabilities::local) (the state stays with you),
+    /// costs reported as $0. Model id `jev-latest` until
+    /// [`with_model`](Self::with_model).
+    pub fn local(base_url: impl Into<String>) -> Self {
+        let backend = SystemOneBackend::new(base_url)
+            .with_capabilities(Capabilities::new(QuestionKind::all()).with_local(true));
+        Self {
+            backend: Slot::SystemOne(backend),
+            model: "jev-latest".into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::Fixed(CostConfig::new(0.0, 0.0)),
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Any backend — including a [`SystemOneBackend`] you configured —
+    /// asking for `model`. Unpriced until [`with_cost`](Self::with_cost).
+    pub fn from_backend(backend: impl DecisionBackend + 'static, model: impl Into<String>) -> Self {
+        Self::from_arc(Arc::new(backend), model)
+    }
+
+    /// [`from_backend`](Self::from_backend) for a backend you already hold
+    /// behind an `Arc` (shared with other handles, or chosen at runtime as
+    /// `Arc<dyn DecisionBackend>`). Unpriced until
+    /// [`with_cost`](Self::with_cost).
+    pub fn from_arc(backend: Arc<dyn DecisionBackend>, model: impl Into<String>) -> Self {
+        Self {
+            backend: Slot::Custom(backend),
+            model: model.into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing: Pricing::Unpriced,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Any OpenAI-compatible `/chat/completions` server that returns
+    /// logprobs — llama.cpp's `llama-server`, vLLM, SGLang, LM Studio, or a
+    /// hosted API — asking for `model`. Every question becomes a one-token
+    /// completion whose label probabilities are read from `top_logprobs`
+    /// (see [`LogprobBackend`]).
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), agent::decision::DecisionError> {
+    /// use agent::decision::DecisionModel;
+    /// // llama-server on this machine: local, $0, no key.
+    /// // A non-thinking instruct model: the answer must be the first token.
+    /// let model = DecisionModel::logprobs("http://localhost:8080", "llama-3.1-8b-instruct");
+    /// let urgent = model.noul("Help! Payouts failing for 3 days.", "Is this urgent?").await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// - **Thinking must be off**: a reasoning model's first token is
+    ///   `<think>`, and such responses are rejected as `BadResponse`. See
+    ///   [`LogprobBackend::with_thinking_disabled`] and
+    ///   [`from_logprob_backend`](Self::from_logprob_backend).
+    /// - **No key** unless [`with_api_key`](Self::with_api_key); no
+    ///   environment variable is read.
+    /// - **Local and $0** when the host is loopback (`localhost`,
+    ///   `127.0.0.0/8`, `::1`); any other host is not local and **unpriced**
+    ///   until [`with_cost`](Self::with_cost). Usage is the sum of each
+    ///   completion's `prompt_tokens` / `completion_tokens`.
+    /// - **Calibration is approximate** compared with a trained decision
+    ///   model: measure it with [`calibrate`](crate::decision::calibrate()) and
+    ///   correct it with [`LogprobBackend::with_temperature`].
+    /// - Choice is limited to 20 options (OpenAI's `top_logprobs` cap);
+    ///   [`LogprobBackend::with_max_choice_options`] raises it to 26 for
+    ///   servers that allow more.
+    pub fn logprobs(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::from_logprob_backend(LogprobBackend::new(base_url), model)
+    }
+
+    /// A [`logprobs`](Self::logprobs) model over a [`LogprobBackend`] you
+    /// configured — temperature, Choice limit, `top_logprobs`, minimum label
+    /// mass, thinking off. Keeps the logprobs conveniences:
+    /// [`with_api_key`](Self::with_api_key) and
+    /// [`with_retry`](Self::with_retry) apply, and a loopback host is $0.
+    ///
+    /// ```
+    /// use agent::decision::{DecisionModel, LogprobBackend};
+    /// let backend = LogprobBackend::new("http://localhost:8080")
+    ///     .with_thinking_disabled()
+    ///     .with_temperature(1.4); // e.g. from `calibrate`
+    /// let model = DecisionModel::from_logprob_backend(backend, "qwen3-8b");
+    /// ```
+    pub fn from_logprob_backend(backend: LogprobBackend, model: impl Into<String>) -> Self {
+        let pricing = if backend.is_local() {
+            Pricing::Fixed(CostConfig::new(0.0, 0.0))
+        } else {
+            Pricing::Unpriced
+        };
+        Self {
+            backend: Slot::Logprobs(backend),
+            model: model.into(),
+            timeout: DEFAULT_TIMEOUT,
+            pricing,
+            attempt_timeout: None,
+            fallbacks: Vec::new(),
+        }
+    }
+
+    /// Ask for this model id or alias — pin a version such as `jev-1.13.0`
+    /// once you have tuned thresholds against it.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Overall time limit for one call, retries included (default 30 s).
+    /// With fallbacks ([`or`](Self::or)) it is **one budget for the whole
+    /// chain**: a fallback gets only what is left.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Limit each attempt of this model to `timeout`, inside the overall
+    /// [`with_timeout`](Self::with_timeout) budget — so in a fallback chain
+    /// a slow primary (or one retrying a rate limit) leaves time for the
+    /// fallback. When an attempt hits its own limit the chain moves on; when
+    /// the overall budget runs out the call fails with
+    /// [`DecisionError::Timeout`]. Default: none (an attempt may use the rest
+    /// of the budget).
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// use agent::decision::DecisionModel;
+    /// let model = DecisionModel::jev()
+    ///     .with_attempt_timeout(Duration::from_secs(2))
+    ///     .or(DecisionModel::local("http://localhost:8000"));
+    /// ```
+    pub fn with_attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.attempt_timeout = Some(timeout);
+        self
+    }
+
+    /// Fall back to `fallback` when this model fails. Chainable —
+    /// `a.or(b).or(c)` tries `a`, then `b`, then `c` — and `fallback`'s own
+    /// fallbacks are appended after it.
+    ///
+    /// ```
+    /// use agent::decision::DecisionModel;
+    /// // Hosted Jev; the local server when TypeSafe is down, rate limited,
+    /// // or TYPESAFE_API_KEY is unset.
+    /// let model = DecisionModel::jev().or(DecisionModel::local("http://localhost:8000"));
+    /// ```
+    ///
+    /// - **Each member asks for its own model id** (the one it was built
+    ///   with), not the primary's.
+    /// - **Falls back on every error a member returns** — outages, rate
+    ///   limits, missing keys, unusable answers, an unsupported question
+    ///   kind, a member's own timeout, and a member's `Invalid` too (a 422 is
+    ///   that server's own limit; another may accept the request) —
+    ///   **except a refusal**: a member's [`DecisionError::Refused`] ends the
+    ///   chain and is returned as is. A model declining to judge is an
+    ///   answer about the input, not an outage; asking the next model would
+    ///   turn it into a yes or a no (so `gpt_6_luna().or(jev())` never asks
+    ///   Jev what OpenAI declined; the tool gate denies on it, and the input
+    ///   guard rejects unless built `with_fail_open`).
+    /// - **Each member is validated against its own capabilities** before it
+    ///   is tried. A request structurally invalid everywhere (no questions, a
+    ///   one-option Choice, ...) fails with `Invalid` at once, nothing sent;
+    ///   one that only exceeds a member's limits (too many options or levels,
+    ///   a question kind it lacks, its token limits) skips that member
+    ///   without sending anything.
+    /// - **One overall timeout** — this handle's
+    ///   [`with_timeout`](Self::with_timeout) — covers the whole chain; the
+    ///   members' own `with_timeout` is ignored, their
+    ///   [`with_attempt_timeout`](Self::with_attempt_timeout) is not. The tool
+    ///   gate's (5 s), the input guard's (3 s) and the advisory's (2 s) time
+    ///   limits replace it the same way, so the gate and the guard stay
+    ///   fail-closed within their budgets.
+    /// - **When every member fails**, the error is
+    ///   [`DecisionError::AllFailed`], listing each member as a
+    ///   [`FallbackAttempt`] in order — or [`DecisionError::Timeout`] when
+    ///   the overall budget ran out.
+    /// - [`Evaluation::model`] names the member that answered; each member
+    ///   prices its own answers. Every attempt sent is recorded in
+    ///   [`SessionStats::decision`](crate::SessionStats::decision) (a primary
+    ///   failure and a fallback success are two requests, one failure);
+    ///   skipped members are not.
+    /// - [`model`](Self::model), [`capabilities`](Self::capabilities) and
+    ///   the builders (`with_api_key`, `with_retry`, `with_cost`, ...) are the
+    ///   **primary's**: configure each member before chaining it.
+    pub fn or(mut self, fallback: DecisionModel) -> Self {
+        let mut fallback = fallback;
+        let rest = std::mem::take(&mut fallback.fallbacks);
+        self.fallbacks.push(fallback);
+        self.fallbacks.extend(rest);
+        self
+    }
+
+    /// The model ids of the fallbacks, in the order they are tried.
+    pub fn fallback_models(&self) -> impl Iterator<Item = &str> + '_ {
+        self.fallbacks.iter().map(|f| f.model.as_str())
+    }
+
+    /// Send this API key instead of reading the preset's environment
+    /// variable (for [`logprobs`](Self::logprobs): send one at all). Only
+    /// meaningful for the presets; ignored (with a warning) for
+    /// [`from_backend`](Self::from_backend) models.
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        match self.backend {
+            Slot::SystemOne(b) => self.backend = Slot::SystemOne(b.with_api_key(key)),
+            Slot::Logprobs(b) => self.backend = Slot::Logprobs(b.with_api_key(key)),
+            Slot::OpenAi(b) => self.backend = Slot::OpenAi(b.with_api_key(key)),
+            Slot::Custom(_) => {
+                tracing::warn!(
+                    "DecisionModel::with_api_key ignored: custom backends own their keys"
+                )
+            }
+        }
+        self
+    }
+
+    /// Retry policy for rate limits and overload (presets only).
+    pub fn with_retry(mut self, retry: crate::retry::RetryConfig) -> Self {
+        match self.backend {
+            Slot::SystemOne(b) => self.backend = Slot::SystemOne(b.with_retry(retry)),
+            Slot::Logprobs(b) => self.backend = Slot::Logprobs(b.with_retry(retry)),
+            Slot::OpenAi(b) => self.backend = Slot::OpenAi(b.with_retry(retry)),
+            Slot::Custom(_) => {
+                tracing::warn!(
+                    "DecisionModel::with_retry ignored: custom backends own their retries"
+                )
+            }
+        }
+        self
+    }
+
+    /// Price every evaluation at these rates (`None` = unpriced), instead of
+    /// the preset's pricing.
+    pub fn with_cost(mut self, cost: Option<CostConfig>) -> Self {
+        self.pricing = match cost {
+            Some(c) => Pricing::Fixed(c),
+            None => Pricing::Unpriced,
+        };
+        self
+    }
+
+    /// The model id or alias requests ask for — the primary's, when there
+    /// are fallbacks ([`or`](Self::or)).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The configured overall timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// What the backend can answer — the primary's, when there are
+    /// fallbacks ([`or`](Self::or)).
+    pub fn capabilities(&self) -> Capabilities {
+        self.backend.get().capabilities()
+    }
+
+    /// The primary's capabilities with the strictest token limits of the
+    /// whole chain: a state sized to these is never skipped as too large by
+    /// any member that is tried.
+    pub(crate) fn chain_capabilities(&self) -> Capabilities {
+        let strictest = |a: Option<usize>, b: Option<usize>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let mut caps = self.capabilities();
+        for member in &self.fallbacks {
+            let c = member.capabilities();
+            caps.max_request_tokens = strictest(caps.max_request_tokens, c.max_request_tokens);
+            caps.max_state_and_question_tokens = strictest(
+                caps.max_state_and_question_tokens,
+                c.max_state_and_question_tokens,
+            );
+        }
+        caps
+    }
+
+    /// The price of `usage` on the model that reported it.
+    pub(crate) fn cost_usd(&self, model: &str, usage: &DecisionUsage) -> Option<f64> {
+        let cost = match &self.pricing {
+            Pricing::TypeSafeList => {
+                let on_typesafe =
+                    matches!(&self.backend, Slot::SystemOne(b) if b.is_typesafe_host());
+                if !on_typesafe {
+                    return None;
+                }
+                crate::provider::prices::global::resolved_cost(TYPESAFE_PRICE_PROVIDER, model)?
+            }
+            Pricing::CloudflareList => {
+                let on_cloudflare =
+                    matches!(&self.backend, Slot::SystemOne(b) if b.is_cloudflare_host());
+                if !on_cloudflare {
+                    return None;
+                }
+                // The model may report itself by its catalog path.
+                let id = model.strip_prefix("@cf/cloudflare/").unwrap_or(model);
+                let cost =
+                    crate::provider::prices::global::resolved_cost(CLOUDFLARE_PRICE_PROVIDER, id);
+                // Unpriced is the default; an unlisted id is news only once
+                // the process opted in to prices.
+                if cost.is_none()
+                    && crate::provider::prices::global::pricing_enabled()
+                    && warn_once(format!("unlisted:{CLOUDFLARE_PRICE_PROVIDER}/{id}"))
+                {
+                    tracing::warn!(
+                        model = %id,
+                        "no price for {CLOUDFLARE_PRICE_PROVIDER}/{id} in the price table; \
+                         its evaluations are unpriced"
+                    );
+                }
+                cost?
+            }
+            Pricing::OpenAiDecisionsList => {
+                let on_openai = matches!(&self.backend, Slot::OpenAi(b) if b.is_openai_host());
+                if !on_openai {
+                    return None;
+                }
+                let cost = crate::provider::prices::global::resolved_cost(
+                    OPENAI_DECISIONS_PRICE_PROVIDER,
+                    model,
+                );
+                if cost.is_none()
+                    && crate::provider::prices::global::pricing_enabled()
+                    && warn_once(format!(
+                        "unlisted:{OPENAI_DECISIONS_PRICE_PROVIDER}/{model}"
+                    ))
+                {
+                    tracing::warn!(
+                        model = %model,
+                        "no price for {OPENAI_DECISIONS_PRICE_PROVIDER}/{model} in the price \
+                         table; its evaluations are unpriced"
+                    );
+                }
+                cost?
+            }
+            Pricing::Fixed(c) => c.clone(),
+            Pricing::Unpriced => return None,
+        };
+        Some(cost.cost_usd(&usage.to_usage()))
+    }
+
+    /// Start a batched request about `state` (a string, or JSON via
+    /// `serde_json::json!`).
+    pub fn ask(&self, state: impl Into<Value>) -> Ask<'_> {
+        Ask {
+            model: self,
+            state: state.into(),
+            questions: Vec::new(),
+        }
+    }
+
+    /// Ask one yes/no question.
+    pub async fn noul(
+        &self,
+        state: impl Into<Value>,
+        instructions: impl Into<Value>,
+    ) -> Result<NoulAnswer, DecisionError> {
+        let eval = self.ask(state).noul("q", instructions).send().await?;
+        eval.noul("q")
+            .cloned()
+            .ok_or_else(|| DecisionError::BadResponse("no noul answer".into()))
+    }
+
+    /// Pick one of `options`.
+    pub async fn choice<I, S>(
+        &self,
+        state: impl Into<Value>,
+        instructions: impl Into<Value>,
+        options: I,
+    ) -> Result<ChoiceAnswer, DecisionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let eval = self
+            .ask(state)
+            .choice("q", instructions, options)
+            .send()
+            .await?;
+        eval.choice("q")
+            .cloned()
+            .ok_or_else(|| DecisionError::BadResponse("no choice answer".into()))
+    }
+
+    /// Rate on `levels`, lowest first.
+    pub async fn score<I, S>(
+        &self,
+        state: impl Into<Value>,
+        instructions: impl Into<Value>,
+        levels: I,
+    ) -> Result<ScoreAnswer, DecisionError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Value>,
+    {
+        let eval = self
+            .ask(state)
+            .score("q", instructions, levels)
+            .send()
+            .await?;
+        eval.score("q")
+            .cloned()
+            .ok_or_else(|| DecisionError::BadResponse("no score answer".into()))
+    }
+
+    /// Evaluate `questions` about `state` in one call (split per question when
+    /// the backend does not batch).
+    pub async fn evaluate(
+        &self,
+        state: impl Into<Value>,
+        questions: Vec<(String, Question)>,
+    ) -> Result<Evaluation, DecisionError> {
+        let mut request = Request::new(self.model.clone(), state);
+        request.questions = questions;
+        self.evaluate_request(request).await
+    }
+
+    /// Evaluate a prepared [`Request`] (its `model` is used as is).
+    ///
+    /// Validates the request against the backend's [`Capabilities`], applies
+    /// the timeout, validates every answer (see [`DecisionBackend`]), and
+    /// prices the result. Inside an agent run, the attempt and its spend are
+    /// recorded in the run's [`SessionStats::decision`](crate::SessionStats::decision).
+    ///
+    /// With fallbacks ([`or`](Self::or)), each member in turn — see `or` for
+    /// the rules.
+    pub async fn evaluate_request(&self, request: Request) -> Result<Evaluation, DecisionError> {
+        if !self.fallbacks.is_empty() {
+            return self.evaluate_chain(request).await;
+        }
+        let result = self
+            .evaluate_unrecorded(request, self.attempt_limit(self.timeout))
+            .await;
+        record_attempt(&result);
+        result
+    }
+
+    /// The time one attempt may take when `remaining` is left.
+    fn attempt_limit(&self, remaining: Duration) -> Duration {
+        self.attempt_timeout.map_or(remaining, |t| t.min(remaining))
+    }
+
+    /// Try the primary, then each fallback, within one overall budget.
+    async fn evaluate_chain(&self, request: Request) -> Result<Evaluation, DecisionError> {
+        // Invalid for every backend: fail now, like a single model would.
+        if let Err(e) = request.validate(&Capabilities::unlimited()) {
+            let result = Err(e);
+            record_attempt(&result);
+            return result;
+        }
+        let deadline = crate::rt::Instant::now() + self.timeout;
+        let mut attempts: Vec<FallbackAttempt> = Vec::new();
+        let mut sent = false;
+        let members = std::iter::once(self).chain(self.fallbacks.iter());
+        for (i, member) in members.enumerate() {
+            let mut req = request.clone();
+            if i > 0 {
+                req.model = member.model.clone();
+            }
+            if let Err(e) = req.validate(&member.backend.get().capabilities()) {
+                tracing::debug!(model = %req.model, "decision fallback: skipped a model: {e}");
+                attempts.push(FallbackAttempt::new(req.model, e, false));
+                continue;
+            }
+            let now = crate::rt::Instant::now();
+            if now >= deadline {
+                let result = Err(DecisionError::Timeout(self.timeout));
+                if !sent {
+                    record_attempt(&result);
+                }
+                return result;
+            }
+            let limit = member.attempt_limit(deadline - now);
+            let model = req.model.clone();
+            let result = member.evaluate_unrecorded(req, limit).await;
+            sent = true;
+            record_attempt(&result);
+            match result {
+                Ok(eval) => return Ok(eval),
+                // A refusal is the chain's answer: never ask another model.
+                Err(e) if e.is_refusal() => return Err(e),
+                // The clock, not the error kind, says whether the overall
+                // budget is spent: a backend may report a timeout of its own.
+                Err(_) if crate::rt::Instant::now() >= deadline => {
+                    return Err(DecisionError::Timeout(self.timeout))
+                }
+                // Every other error falls through — `Invalid` included: a
+                // 422 is that server's limit, not necessarily the next one's.
+                Err(e) => {
+                    tracing::warn!(model = %model, "decision model failed; trying its fallback: {e}");
+                    attempts.push(FallbackAttempt::new(model, e, true));
+                }
+            }
+        }
+        let result = Err(DecisionError::AllFailed { attempts });
+        if !sent {
+            record_attempt(&result);
+        }
+        result
+    }
+
+    /// The cost of `eval` under this handle's pricing: an unpriced handle
+    /// keeps whatever the backend reported; a priced one computes it from the
+    /// reported usage, and is unpriced when the backend reported none.
+    fn price(&self, eval: &Evaluation) -> Option<f64> {
+        match &self.pricing {
+            Pricing::Unpriced => return eval.cost_usd,
+            // Free (e.g. `local()`): $0 whatever the usage — missing usage
+            // cannot make a free model's cost unknown.
+            Pricing::Fixed(c) if is_free(c) => return Some(0.0),
+            _ => {}
+        }
+        if !eval.usage_reported {
+            if warn_once(format!("no-usage:{}", eval.model)) {
+                tracing::warn!(
+                    model = %eval.model,
+                    "decision backend reported no usage; its evaluations are unpriced"
+                );
+            }
+            return None;
+        }
+        self.cost_usd(&eval.model, &eval.usage)
+    }
+
+    /// A non-batching backend: one request per question, up to `concurrency`
+    /// in flight, answers in request order. Every completed request adds its
+    /// usage to `billed` (even if its answer is then rejected). After the
+    /// first failure no new request starts, but those in flight are awaited,
+    /// so their spend is recorded too; the error of the earliest failed
+    /// question is returned.
+    async fn evaluate_singles(
+        &self,
+        backend: &Slot,
+        request: &Request,
+        concurrency: usize,
+        billed: &std::sync::Mutex<Option<Evaluation>>,
+    ) -> Result<Vec<Evaluation>, DecisionError> {
+        use futures::StreamExt;
+        // `Send` where work can move between threads; wasm32 has one thread
+        // and its host futures are not `Send`.
+        #[cfg(not(target_arch = "wasm32"))]
+        type Single<'a> = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = (usize, Result<Evaluation, DecisionError>)>
+                    + Send
+                    + 'a,
+            >,
+        >;
+        #[cfg(target_arch = "wasm32")]
+        type Single<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (usize, Result<Evaluation, DecisionError>)> + 'a>,
+        >;
+        // Built in a loop, not a closure: a closure over borrowed questions
+        // trips the `Send` check of `async_trait`-boxed callers.
+        let mut pending: Vec<Single<'_>> = Vec::with_capacity(request.questions.len());
+        for (i, (id, q)) in request.questions.iter().enumerate() {
+            pending.push(Box::pin(async move {
+                let single = Request {
+                    model: request.model.clone(),
+                    state: request.state.clone(),
+                    questions: vec![(id.clone(), q.clone())],
+                };
+                let result = match backend.evaluate_billed(&single, billed).await {
+                    Ok(mut eval) => {
+                        add_billed(billed, &eval);
+                        check_complete(&single, &mut eval).map(|()| eval)
+                    }
+                    Err(e) => Err(e),
+                };
+                (i, result)
+            }));
+        }
+        let mut queue = pending.into_iter();
+        let mut running = futures::stream::FuturesUnordered::new();
+        for next in queue.by_ref().take(concurrency.max(1)) {
+            running.push(next);
+        }
+        let mut done: Vec<Option<Evaluation>> = request.questions.iter().map(|_| None).collect();
+        let mut failed: Option<(usize, DecisionError)> = None;
+        while let Some((i, result)) = running.next().await {
+            match result {
+                Ok(eval) => done[i] = Some(eval),
+                Err(e) => {
+                    let earlier = match &failed {
+                        Some((j, _)) => i < *j,
+                        None => true,
+                    };
+                    if earlier {
+                        failed = Some((i, e));
+                    }
+                }
+            }
+            if failed.is_none() {
+                if let Some(next) = queue.next() {
+                    running.push(next);
+                }
+            }
+        }
+        if let Some((_, e)) = failed {
+            return Err(e);
+        }
+        Ok(done.into_iter().flatten().collect())
+    }
+
+    /// One attempt on this model's own backend, within `limit`.
+    async fn evaluate_unrecorded(
+        &self,
+        request: Request,
+        limit: Duration,
+    ) -> Result<Evaluation, DecisionError> {
+        let backend = &self.backend;
+        let caps = backend.get().capabilities();
+        request.validate(&caps)?;
+
+        let span = tracing::debug_span!(
+            "decision",
+            model = %request.model,
+            questions = request.questions.len(),
+            tokens_in = tracing::field::Empty,
+            cost_usd = tracing::field::Empty,
+        );
+        // What a failed request was billed for — the questions a non-batching
+        // request answered so far, a response that arrived but could not be
+        // used — kept outside the future so a timeout (which drops the
+        // future) or a later failure still records it.
+        let billed: std::sync::Mutex<Option<Evaluation>> = std::sync::Mutex::new(None);
+        let work = async {
+            if caps.batching || request.questions.len() == 1 {
+                let mut eval = backend.evaluate_billed(&request, &billed).await?;
+                // Answered, so billed, even when the answers are unusable.
+                check_complete(&request, &mut eval).inspect_err(|_| add_billed(&billed, &eval))?;
+                Ok(eval)
+            } else {
+                let answers = self
+                    .evaluate_singles(backend, &request, caps.max_concurrent_requests, &billed)
+                    .await?;
+                let mut merged: Option<Evaluation> = None;
+                for eval in answers {
+                    merged = Some(match merged {
+                        None => eval,
+                        Some(mut m) => {
+                            m.usage.input_tokens += eval.usage.input_tokens;
+                            m.usage.output_tokens += eval.usage.output_tokens;
+                            m.usage_reported &= eval.usage_reported;
+                            m.cost_usd = match (m.cost_usd, eval.cost_usd) {
+                                (Some(a), Some(b)) => Some(a + b),
+                                _ => None,
+                            };
+                            // `check_complete` left only the asked-for answer.
+                            m.answers.extend(eval.answers);
+                            m
+                        }
+                    });
+                }
+                merged.ok_or_else(|| DecisionError::Invalid("questions: empty".into()))
+            }
+        };
+        let result = {
+            use tracing::Instrument;
+            crate::rt::timeout(limit, work.instrument(span.clone())).await
+        };
+        let result = match result {
+            Ok(inner) => inner,
+            Err(_) => Err(DecisionError::Timeout(limit)),
+        };
+        if result.is_err() {
+            // A failed or timed-out request: record what it was billed for
+            // (unpriced when that is unknown, never $0).
+            let done = billed.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(done) = done {
+                let cost = self.price(&done);
+                crate::agent_loop::record_decision(|stats| {
+                    stats.record_billed(done.usage.input_tokens, done.usage.output_tokens, cost)
+                });
+            }
+        }
+        let mut eval = result?;
+        eval.cost_usd = self.price(&eval);
+        span.record("tokens_in", eval.usage.input_tokens);
+        if let Some(c) = eval.cost_usd {
+            span.record("cost_usd", c);
+        }
+        Ok(eval)
+    }
+}
+
+/// What a response that was answered but could not be used was billed
+/// for: no answers, `usage` as reported (`reported: false` = unknown, so
+/// the spend is unpriced).
+pub(crate) fn billed_only(model: &str, usage: DecisionUsage, reported: bool) -> Evaluation {
+    let mut eval = Evaluation::new(model, usage);
+    eval.usage_reported = reported;
+    eval
+}
+
+/// Add what `eval` was billed to the running total of a failed request.
+pub(crate) fn add_billed(billed: &std::sync::Mutex<Option<Evaluation>>, eval: &Evaluation) {
+    let mut total = billed.lock().unwrap_or_else(|e| e.into_inner());
+    let step = Evaluation {
+        answers: Vec::new(),
+        ..eval.clone()
+    };
+    *total = Some(match total.take() {
+        None => step,
+        Some(mut t) => {
+            t.usage.input_tokens += step.usage.input_tokens;
+            t.usage.output_tokens += step.usage.output_tokens;
+            t.usage_reported &= step.usage_reported;
+            t.cost_usd = match (t.cost_usd, step.cost_usd) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            t
+        }
+    });
+}
+
+/// Record one attempt's outcome in the enclosing run's decision stats.
+fn record_attempt(result: &Result<Evaluation, DecisionError>) {
+    crate::agent_loop::record_decision(|stats| match result {
+        Ok(eval) => stats.record_success(
+            eval.usage.input_tokens,
+            eval.usage.output_tokens,
+            eval.cost_usd,
+        ),
+        Err(e) => stats.record_failure(matches!(e, DecisionError::Timeout(_))),
+    });
+}
+
+/// Whether every rate is zero (a model priced as free).
+fn is_free(c: &CostConfig) -> bool {
+    c.input_per_million == 0.0
+        && c.output_per_million == 0.0
+        && c.cache_read_per_million == 0.0
+        && c.cache_write_per_million == 0.0
+        && c.context_tiers.iter().all(|t| {
+            t.input_per_million == 0.0
+                && t.output_per_million == 0.0
+                && t.cache_read_per_million == 0.0
+                && t.cache_write_per_million == 0.0
+        })
+}
+
+/// Whether `key` is new to this process: each warning that would repeat on
+/// every evaluation (no usage, an unlisted price) is logged once per model,
+/// and each deprecated use (`deprecated:` keys) once per process.
+pub(crate) fn warn_once(key: String) -> bool {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(key)
+}
+
+/// Every question must have a valid answer of its own type, and nothing
+/// else survives: answers nobody asked for are dropped (so a backend cannot
+/// smuggle one in to overwrite a validated answer when results are merged),
+/// and the rest are put in request order. The one check every backend's
+/// output passes through.
+fn check_complete(request: &Request, eval: &mut Evaluation) -> Result<(), DecisionError> {
+    let mut ordered = Vec::with_capacity(request.questions.len());
+    for (id, q) in &request.questions {
+        let Some(at) = eval.answers.iter().position(|(k, _)| k == id) else {
+            return Err(DecisionError::BadResponse(format!("answers.{id}: missing")));
+        };
+        let (key, answer) = eval.answers.swap_remove(at);
+        answer.validate(id, q)?;
+        ordered.push((key, answer));
+    }
+    eval.answers = ordered;
+    Ok(())
+}
+
+/// A batched request under construction; see [`DecisionModel::ask`].
+#[must_use = "a request does nothing until .send().await"]
+pub struct Ask<'a> {
+    model: &'a DecisionModel,
+    state: Value,
+    questions: Vec<(String, Question)>,
+}
+
+impl Ask<'_> {
+    /// Add a yes/no question under `id`.
+    pub fn noul(self, id: impl Into<String>, instructions: impl Into<Value>) -> Self {
+        self.question(id, Question::noul(instructions))
+    }
+
+    /// Add a choice under `id`.
+    pub fn choice<I, S>(
+        self,
+        id: impl Into<String>,
+        instructions: impl Into<Value>,
+        options: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.question(id, Question::choice(instructions, options))
+    }
+
+    /// Add a score under `id`.
+    pub fn score<I, S>(
+        self,
+        id: impl Into<String>,
+        instructions: impl Into<Value>,
+        levels: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Value>,
+    {
+        self.question(id, Question::score(instructions, levels))
+    }
+
+    /// Add any [`Question`] under `id`.
+    pub fn question(mut self, id: impl Into<String>, question: Question) -> Self {
+        self.questions.push((id.into(), question));
+        self
+    }
+
+    /// Send the request.
+    pub async fn send(self) -> Result<Evaluation, DecisionError> {
+        self.model.evaluate(self.state, self.questions).await
+    }
+}
+
+/// The decision features an agent enabled, as extensions (#241): the
+/// advisor (if advisory is enabled), then the gate. They are appended after
+/// the agent's own extensions, so the gate judges the final, possibly
+/// modified call, after every middleware and extension; a fail-closed gate
+/// can only deny, never allow what an earlier hook denied.
+pub(crate) fn wire(
+    advisory: Option<&Advisory>,
+    gate: Option<&ToolGate>,
+    skills: &crate::skills::SkillSet,
+) -> Vec<Arc<dyn crate::Extension>> {
+    let mut extensions: Vec<Arc<dyn crate::Extension>> = Vec::new();
+    if let Some(a) = advisory {
+        extensions.push(Arc::new(advisory::AdvisorExtension::new(
+            advisory::Advisor::new(a.clone(), skills),
+        )));
+    }
+    if let Some(g) = gate {
+        extensions.push(Arc::new(g.clone()));
+    }
+    extensions
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+
+    #[test]
+    fn clef_prices_by_model_only_on_cloudflare() {
+        crate::provider::prices::enable_bundled();
+        let usage = DecisionUsage::new(2_000_000, 500);
+        let clef = DecisionModel::clef("acct");
+        let cost = clef.cost_usd("clef", &usage).unwrap();
+        assert!((cost - 0.48).abs() < 1e-12, "{cost}");
+        // Reported by its catalog path: the same price.
+        let cost = clef.cost_usd("@cf/cloudflare/clef", &usage).unwrap();
+        assert!((cost - 0.48).abs() < 1e-12, "{cost}");
+        let flash = DecisionModel::clef_flash("acct");
+        let cost = flash.cost_usd("clef-flash", &usage).unwrap();
+        assert!((cost - 0.18).abs() < 1e-12, "{cost}");
+        assert_eq!(clef.cost_usd("clef-9", &usage), None, "unlisted unpriced");
+
+        // Any other host is unpriced: its bill is not Cloudflare's list price.
+        let proxied = DecisionModel {
+            backend: Slot::SystemOne(
+                SystemOneBackend::workers_ai("acct", "x")
+                    .with_endpoint_url("https://proxy.example/ai/run/@cf/cloudflare/clef"),
+            ),
+            ..DecisionModel::clef("acct")
+        };
+        assert_eq!(proxied.cost_usd("clef", &usage), None);
+    }
+
+    #[test]
+    fn gpt_6_luna_prices_by_reported_model_only_on_openai() {
+        crate::provider::prices::enable_bundled();
+        let usage = DecisionUsage::new(2_000_000, 500);
+        let luna = DecisionModel::gpt_6_luna();
+        let cost = luna.cost_usd("gpt-6-luna", &usage).unwrap();
+        // $0.10 per million input tokens; output free.
+        assert!((cost - 0.2).abs() < 1e-12, "{cost}");
+        assert_eq!(luna.cost_usd("gpt-6-luna-x", &usage), None, "unlisted");
+        // Not the chat model's rate: its own price key.
+        assert_ne!(
+            crate::provider::prices::global::resolved_cost("openai", "gpt-6-luna"),
+            crate::provider::prices::global::resolved_cost(
+                OPENAI_DECISIONS_PRICE_PROVIDER,
+                "gpt-6-luna"
+            )
+        );
+        let proxied = DecisionModel::from_openai_backend(
+            OpenAiDecisionBackend::new().with_base_url("https://proxy.example/v1"),
+            "gpt-6-luna",
+        );
+        assert_eq!(proxied.cost_usd("gpt-6-luna", &usage), None);
+    }
+
+    #[test]
+    fn jev_prices_by_reported_version_only_on_typesafe() {
+        crate::provider::prices::enable_bundled();
+        let usage = DecisionUsage::new(2_000_000, 500);
+        let jev = DecisionModel {
+            backend: Slot::SystemOne(
+                SystemOneBackend::typesafe().with_base_url("https://api.typesafe.ai"),
+            ),
+            ..DecisionModel::jev()
+        };
+        let cost = jev.cost_usd("jev-1.13.0", &usage).unwrap();
+        assert!((cost - 0.084).abs() < 1e-12, "{cost}");
+        assert_eq!(jev.cost_usd("jev-latest", &usage), None, "aliases unpriced");
+        assert_eq!(jev.cost_usd("jev-9.9.9", &usage), None, "unlisted unpriced");
+
+        // The same pricing pointed at another host is unpriced.
+        let proxied = DecisionModel {
+            backend: Slot::SystemOne(
+                SystemOneBackend::typesafe().with_base_url("https://proxy.example"),
+            ),
+            ..DecisionModel::jev()
+        };
+        assert_eq!(proxied.cost_usd("jev-1.13.0", &usage), None);
+
+        assert_eq!(
+            DecisionModel::jev_opencode().cost_usd("jev-1.13.0", &usage),
+            None
+        );
+        assert_eq!(
+            DecisionModel::local("http://localhost:1").cost_usd("x", &usage),
+            Some(0.0)
+        );
+        let mock = DecisionModel::from_backend(MockBackend::neutral(), "m");
+        assert_eq!(mock.cost_usd("m", &usage), None, "from_backend is unpriced");
+        assert_eq!(
+            mock.with_cost(Some(CostConfig::new(1.0, 0.0)))
+                .cost_usd("m", &usage),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn logprobs_are_free_only_on_loopback() {
+        let usage = DecisionUsage::new(2_000_000, 500);
+        for local in [
+            "http://localhost:8080",
+            "http://127.0.0.1:1/v1",
+            "http://[::1]:9",
+        ] {
+            let m = DecisionModel::logprobs(local, "m");
+            assert!(m.capabilities().local, "{local}");
+            assert_eq!(m.cost_usd("m", &usage), Some(0.0), "{local}");
+        }
+        for remote in [
+            "https://api.openai.com/v1",
+            "http://10.1.2.3:8000",
+            "http://gpu-box:8080",
+        ] {
+            let m = DecisionModel::logprobs(remote, "m");
+            assert!(!m.capabilities().local, "{remote}");
+            assert_eq!(m.cost_usd("m", &usage), None, "{remote}: unpriced");
+            assert_eq!(
+                m.with_cost(Some(CostConfig::new(1.0, 0.0)))
+                    .cost_usd("m", &usage),
+                Some(2.0)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn limited(request: Option<usize>, state: Option<usize>) -> DecisionModel {
+        DecisionModel::from_backend(
+            MockBackend::new().with_capabilities(
+                Capabilities::new(QuestionKind::all()).with_token_limits(request, state),
+            ),
+            "m",
+        )
+    }
+
+    fn limits(m: &DecisionModel) -> (Option<usize>, Option<usize>) {
+        let c = m.chain_capabilities();
+        (c.max_request_tokens, c.max_state_and_question_tokens)
+    }
+
+    #[test]
+    fn chain_capabilities_take_the_strictest_limit_of_each_kind() {
+        // Alone: the model's own.
+        assert_eq!(limits(&limited(Some(10), None)), (Some(10), None));
+        // A limit beats no limit, either way round.
+        assert_eq!(
+            limits(&limited(None, None).or(limited(Some(64), Some(32)))),
+            (Some(64), Some(32))
+        );
+        assert_eq!(
+            limits(&limited(Some(64), Some(32)).or(limited(None, None))),
+            (Some(64), Some(32))
+        );
+        // Both limited: the smaller, per kind, across three members.
+        let chain = limited(Some(64), Some(40))
+            .or(limited(Some(100), Some(8)))
+            .or(limited(Some(20), None));
+        assert_eq!(limits(&chain), (Some(20), Some(8)));
+    }
+}

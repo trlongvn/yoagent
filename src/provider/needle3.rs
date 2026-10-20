@@ -427,13 +427,11 @@ impl StreamProvider for Needle3Provider {
         // `generate_with` already hands decoded text (not raw SentencePiece
         // pieces), so concatenation is exact.
         let (thinking, call_text) = split_think(&completion.text);
-        if surface_reasoning {
-            if !thinking.is_empty() {
-                let _ = tx.send(StreamEvent::ThinkingDelta {
-                    content_index: 0,
-                    delta: thinking.to_owned(),
-                });
-            }
+        if surface_reasoning && !thinking.is_empty() {
+            let _ = tx.send(StreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta: thinking.to_owned(),
+            });
         }
         if !call_text.is_empty() {
             let _ = tx.send(StreamEvent::TextDelta {
@@ -636,7 +634,10 @@ mod tests {
     fn parse_call_rejects_a_bare_object() {
         // Needle's grammar emits `[{…}]`, so a bare object is not a shape the
         // engine can produce — it must be rejected, not guessed at.
-        assert_eq!(parse_call(r#"{"name":"get_weather","arguments":{}}"#).len(), 0);
+        assert_eq!(
+            parse_call(r#"{"name":"get_weather","arguments":{}}"#).len(),
+            0
+        );
     }
 
     #[test]

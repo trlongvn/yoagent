@@ -19,7 +19,7 @@ User prompt → LLM call → Tool execution → LLM call → ... → Final respo
 │  │  • Check steering messages          │     │
 │  │  • Check execution limits           │     │
 │  │  • Compact context (if configured)  │     │
-│  │  • Stream LLM response              │     │
+│  │  • Stream LLM response (with retry) │     │
 │  │  • Extract tool calls               │     │
 │  │  • Execute tools (with steering)    │     │
 │  │  • Emit TurnEnd                     │     │
@@ -67,7 +67,10 @@ Requires that the last message in context is **not** an assistant message.
 
 ## AgentLoopConfig
 
+Build it with `AgentLoopConfig::new(provider, model)`, which sets every other field to its default, then set the fields you need. The struct is `#[non_exhaustive]`: it cannot be built as a struct literal outside the crate, so new fields can be added without breaking callers.
+
 ```rust
+#[non_exhaustive]
 pub struct AgentLoopConfig {
     pub provider: Arc<dyn StreamProvider>,
     pub model: String,
@@ -81,16 +84,23 @@ pub struct AgentLoopConfig {
     pub get_steering_messages: Option<GetMessagesFn>,
     pub get_follow_up_messages: Option<GetMessagesFn>,
     pub context_config: Option<ContextConfig>,
+    pub compaction_strategy: Option<Arc<dyn CompactionStrategy>>,
     pub execution_limits: Option<ExecutionLimits>,
     pub cache_config: CacheConfig,
+    pub tool_output_sink: Option<SharedState>,
     pub tool_execution: ToolExecutionStrategy,
+    pub tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
+    pub output_schema: Option<OutputSchema>,
     pub retry_config: RetryConfig,
     pub before_turn: Option<BeforeTurnFn>,
     pub after_turn: Option<AfterTurnFn>,
     pub on_error: Option<OnErrorFn>,
     pub input_filters: Vec<Arc<dyn InputFilter>>,
-    pub compaction_strategy: Option<Arc<dyn CompactionStrategy>>,
     pub turn_delay: Option<Duration>,
+    pub extensions: Vec<Arc<dyn Extension>>,
+    pub tree_extensions: Vec<Arc<dyn Extension>>,
+    pub max_stop_continues: usize,
+    pub run_label: Option<String>,
 }
 ```
 
@@ -99,7 +109,7 @@ pub struct AgentLoopConfig {
 | `provider` | The `StreamProvider` implementation to use |
 | `model` | Model identifier (e.g., `"claude-sonnet-5"`) |
 | `api_key` | API key for the provider |
-| `thinking_level` | `Off`, `Minimal`, `Low`, `Medium`, `High` |
+| `thinking_level` | `Off`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max` |
 | `model_config` | Optional `ModelConfig` for multi-provider support (base URL, headers, compat flags) |
 | `convert_to_llm` | Custom `AgentMessage[] → Message[]` conversion |
 | `transform_context` | Pre-processing hook for context pruning |
@@ -108,11 +118,14 @@ pub struct AgentLoopConfig {
 | `context_config` | Token budget and compaction settings. Auto-derived from `model_config.context_window` (80%) when not set |
 | `execution_limits` | Max turns, tokens, duration |
 | `cache_config` | Prompt caching behavior (see [Prompt Caching](prompt-caching.md)) |
+| `tool_output_sink` | `SharedState` that receives the full text of tool output truncated on append (see [Retrievable tool output](context-management.md#retrievable-tool-output)) |
 | `tool_execution` | Parallel, Sequential, or Batched (see [Tools](tools.md#execution-strategies)) |
+| `tool_middleware` | Approve/deny/modify chain run before every tool call (see [Tool Middleware](tools.md#permissions-tool-middleware)) |
+| `output_schema` | JSON schema for a structured reply; `Agent::prompt_structured` sets it per call (see [Structured Outputs](structured-outputs.md)) |
 | `retry_config` | Retry behavior for transient errors (see [Retry](retry.md)) |
 | `before_turn` | Called before each LLM call; return `false` to abort (see [Callbacks](callbacks.md)) |
 | `after_turn` | Called after each turn with messages and usage (see [Callbacks](callbacks.md)) |
-| `on_error` | Called on `StopReason::Error` with the error string (see [Callbacks](callbacks.md)) |
+| `on_error` | Called when a turn ends with `StopReason::Error`, with the error string; not on cancellation (`Aborted`) or for retried attempts (see [Callbacks](callbacks.md)) |
 | `input_filters` | Input filters applied to user messages before the LLM call (see [Tools](tools.md)) |
 | `compaction_strategy` | Custom compaction strategy (see [Custom Compaction](#custom-compaction) below) |
 | `turn_delay` | Optional inter-turn delay to throttle API calls. Skips the first turn. Useful for rate-limit-sensitive providers (e.g., OAuth tokens with low RPM caps) |
@@ -212,17 +225,15 @@ Only the drain is atomic — the edit round trip is not:
 When using `agent_loop()` directly, steering and follow-ups are provided via callback functions:
 
 ```rust
-let config = AgentLoopConfig {
-    get_steering_messages: Some(Box::new(|| {
-        // Return Vec<AgentMessage> — checked between tool calls
-        vec![]
-    })),
-    get_follow_up_messages: Some(Box::new(|| {
-        // Return Vec<AgentMessage> — checked when agent would stop
-        vec![]
-    })),
-    // ...
-};
+let mut config = AgentLoopConfig::new(provider, "model");
+config.get_steering_messages = Some(Box::new(|| {
+    // Return Vec<AgentMessage> — checked between tool calls
+    vec![]
+}));
+config.get_follow_up_messages = Some(Box::new(|| {
+    // Return Vec<AgentMessage> — checked when agent would stop
+    vec![]
+}));
 ```
 
 ## Custom Compaction
@@ -303,8 +314,8 @@ impl CompactionStrategy for SemanticPointerCompaction {
         // Insert a marker after the first kept messages
         let mut result = compacted;
         let insert_at = config.keep_first.min(result.len());
-        result.insert(insert_at, AgentMessage::Extension(
-            ExtensionMessage::new("compaction_marker", serde_json::json!({
+        result.insert(insert_at, AgentMessage::Custom(
+            CustomMessage::new("compaction_marker", serde_json::json!({
                 "dropped": dropped_count,
                 "note": format!("{} earlier messages were compacted", dropped_count),
             }))

@@ -10,19 +10,16 @@ async fn main() {
     println!("probe: press keys; Ctrl+C to quit");
     loop {
         if event::poll(Duration::from_millis(100)).unwrap() {
-            match event::read().unwrap() {
-                Event::Key(k) => {
-                    let code = format!("{:?}", k.code);
-                    println!("KEY: code={} mods={:?}", code, k.modifiers);
-                    io::stdout().flush().unwrap();
-                    if k.code == KeyCode::Char('c')
-                        && k.modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        break;
-                    }
+            if let Event::Key(k) = event::read().unwrap() {
+                let code = format!("{:?}", k.code);
+                println!("KEY: code={} mods={:?}", code, k.modifiers);
+                io::stdout().flush().unwrap();
+                if k.code == KeyCode::Char('c')
+                    && k.modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    break;
                 }
-                _ => {}
             }
         }
     }

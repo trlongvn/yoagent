@@ -1,12 +1,12 @@
 # OpenAI Compatible Provider
 
-`OpenAiCompatProvider` implements the OpenAI Chat Completions API. One implementation covers OpenAI, xAI, Groq, Cerebras, OpenRouter, Mistral, DeepSeek, MiniMax, Z.ai, Qwen, Ollama, and any other compatible API.
+`OpenAiCompatProvider` implements the OpenAI Chat Completions API. One implementation covers OpenAI, xAI, Groq, Cerebras, OpenRouter, Mistral, DeepSeek, MiniMax, Meta (Muse Spark), Z.ai, Qwen, Ollama, and any other compatible API.
 
 For the first-class `ModelConfig::*` constructors and default model metadata, see [Model Presets](model-presets.md).
 
 ## Usage
 
-Requires a `ModelConfig` with `compat` flags set in `StreamConfig.model_config`:
+Requires `StreamConfig.model_config`; its `compat` flags are optional (`None` uses `OpenAiCompat::default()`):
 
 ```rust
 use agent::provider::ModelConfig;
@@ -29,21 +29,29 @@ pub struct OpenAiCompat {
     pub requires_tool_result_name: bool,
     pub requires_assistant_after_tool_result: bool,
     pub thinking_format: ThinkingFormat,        // OpenAi, Xai, or Qwen
+    pub supports_prompt_cache_key: bool,
+    pub replays_reasoning_content: bool,
+    pub encrypted_reasoning: bool,              // Responses / Azure only; opt-in, see openai-responses.md
+    pub max_reasoning_effort: ReasoningEffortCeiling, // High (default), XHigh, Max
 }
 ```
+
+`OpenAiCompat` is `#[non_exhaustive]`: start from a preset or
+`Default::default()` and set fields.
 
 ## Provider Presets
 
 | Provider | Constructor | Key Differences |
 |----------|-------------|-----------------|
 | OpenAI | `OpenAiCompat::openai()` | `developer` role, `max_completion_tokens`, `store`, `reasoning_effort` |
-| xAI (Grok) | `OpenAiCompat::xai()` | `reasoning` field for thinking (not `reasoning_content`) |
+| xAI (Grok) | `OpenAiCompat::xai()` | `reasoning` field for thinking (not `reasoning_content`); effort ceiling `xhigh` |
 | Groq | `OpenAiCompat::groq()` | Standard defaults |
 | Cerebras | `OpenAiCompat::cerebras()` | Standard defaults |
 | OpenRouter | `OpenAiCompat::openrouter()` | `max_completion_tokens` |
 | Mistral | `OpenAiCompat::mistral()` | `max_tokens` field |
 | DeepSeek | `OpenAiCompat::deepseek()` | `max_tokens`, `thinking`, `reasoning_effort`, 1M context window |
 | MiniMax | `OpenAiCompat::minimax()` | Standard defaults, 1M context window |
+| Meta (Muse Spark) | `OpenAiCompat::meta()` | `max_completion_tokens`, `reasoning_effort`, streaming usage |
 | Z.ai (Zhipu) | `OpenAiCompat::zai()` | Standard defaults |
 | Qwen | `OpenAiCompat::qwen()` | Qwen reasoning content format, `max_tokens`, streaming usage |
 | Ollama | `OpenAiCompat::ollama()` | Inserts an empty assistant message after tool result runs |
@@ -83,6 +91,53 @@ let config = ModelConfig::openai_compat(
 ```
 
 ## Thinking/Reasoning
+
+With `supports_reasoning_effort`, `ThinkingLevel` becomes `reasoning_effort`.
+How far up the ladder it goes is the model's declared
+`max_reasoning_effort` (a `ReasoningEffortCeiling`):
+
+| Level | Ceiling `High` (default) | Ceiling `XHigh` | Ceiling `Max` | DeepSeek-style (`supports_thinking_control`) |
+|-------|------|------|------|------|
+| `Off` | omitted¹ | omitted¹ | omitted¹ | omitted; `thinking: disabled` |
+| `Minimal`, `Low` | `low` | `low` | `low` | `low` |
+| `Medium` | `medium` | `medium` | `medium` | `medium` (DeepSeek rounds it up to `high`) |
+| `High` | `high` | `high` | `high` | `high` |
+| `XHigh` | `high` (clamped) | `xhigh` | `xhigh` | `high` (clamped) |
+| `Max` | `high` (clamped) | `xhigh` (clamped) | `max` | `max` |
+
+¹ Omitting the effort does not turn reasoning off on an OpenAI reasoning
+model — it runs at the model's default, `medium` — and xAI's Grok cannot
+disable reasoning at all (default `high`). The crate never sends OpenAI's
+`none` rung, which several models (GPT-6 Astra, gpt-5, the o-series) reject
+with HTTP 400. A clamped `XHigh`/`Max` is logged once per process with
+`tracing::warn!`.
+
+A model rejects an effort string it does not know rather than rounding it,
+which is why the ceiling is declared per model and never guessed from the id.
+Per OpenAI's model pages and Azure's reasoning guide (2026-09-25): `max` exists
+on GPT-5.6 and GPT-6; `xhigh` on those plus GPT-5.5, GPT-5.4, gpt-5.2 and
+gpt-5.1-codex-max; gpt-5 and gpt-5.1 top out at `high`. The `gpt_5_5()`
+preset declares `XHigh`; `OpenAiCompat::xai()` declares `XHigh`, because xAI treats `xhigh`
+as `high` on Grok models without the rung instead of rejecting it. For a
+model with no preset:
+
+```rust
+use agent::provider::{ModelConfig, ReasoningEffortCeiling};
+
+let mut config = ModelConfig::openai("gpt-5.4", "GPT-5.4");
+let compat = config.compat.as_mut().unwrap();
+compat.max_reasoning_effort = ReasoningEffortCeiling::XHigh;
+```
+
+The DeepSeek-style column needs both `supports_thinking_control` and
+`supports_reasoning_effort`, and ignores `max_reasoning_effort`. DeepSeek's `reasoning_effort` accepts
+`low`/`high`/`max`
+([DeepSeek thinking-mode docs](https://api-docs.deepseek.com/guides/thinking_mode)).
+DeepSeek itself maps a requested `xhigh` to `high`, so this crate sends `XHigh`
+as `high` there too and only `Max` selects DeepSeek's `max` rung.
+
+The OpenAI Responses and Azure OpenAI providers apply the same ceiling
+columns, read from `ModelConfig::compat`.
 
 The `ThinkingFormat` enum controls how reasoning content is parsed from streams:
 
@@ -180,6 +235,21 @@ agent has no built-in credential refresh — `api_key` is static for the life of
 provider (`Authorization: Bearer {api_key}`). For anything longer than a single short
 turn, **you** must exchange and refresh the token yourself and rebuild the agent's config
 with a fresh token before it expires; otherwise long runs will fail with `401`.
+
+## Stop reasons
+
+`finish_reason` maps to `StopReason`: `stop` → `Stop`, `length` → `Length`,
+`tool_calls` → `ToolUse`, and `content_filter` → `Refusal`, with the
+assistant message's `error_message` set to say the content filter stopped the
+response. A turn that carries tool calls is reported as `ToolUse` unless it
+ended on `length` or `content_filter`. A usage token count sent as explicit
+`null` reads as 0 instead of dropping the chunk.
+
+A failure reported inside the stream is an error, not a finished answer: a
+chunk with an `error` object (OpenRouter and other gateways send one, with a
+string or numeric `code`) and `finish_reason: "error"` both fail the turn. A
+rate limit or overload among them (`rate_limit_exceeded`, a numeric 503/529,
+…) is retried; anything else is final.
 
 ## Auth
 

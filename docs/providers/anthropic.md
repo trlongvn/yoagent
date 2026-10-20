@@ -14,42 +14,129 @@ let agent = Agent::from_config(ModelConfig::anthropic("claude-sonnet-5", "Claude
 
 ### Streaming SSE
 
-Uses `reqwest-eventsource` to parse Anthropic's SSE stream. Events handled:
+Uses `reqwest-eventsource` to parse Anthropic's SSE stream, with the library's
+own reconnect disabled: a dropped stream is a `ProviderError`, and the agent
+loop decides whether to retry, so a completion request is never re-sent behind
+its back. Events handled:
 
 - `message_start` — Input token usage, cache stats
-- `content_block_start` — Text, thinking, or tool_use block
+- `content_block_start` — Text, thinking, `redacted_thinking`, or tool_use block
 - `content_block_delta` — Text, thinking, input JSON, or signature deltas
 - `content_block_stop` — Block complete
 - `message_delta` — Stop reason, output usage
 - `message_stop` — Stream complete
 
+Blocks are kept in the order the API sends them, each at its own position in
+`Content`. A block type this provider does not surface (server-side tool
+blocks, `fallback`, anything added to the API later) is skipped with one
+warning per type that names it; it leaves no placeholder, and the blocks after
+it keep their deltas. An unknown delta type is dropped the same way.
+
 ### Thinking
 
 Set `thinking_level` to enable thinking. By default the provider sends
 **adaptive thinking** (`thinking: {"type": "adaptive"}`), which the current
-model generation requires (Claude Fable 5, Opus 5, Opus 4.7/4.8, Sonnet 5
-reject budget-based thinking with a 400). The level maps to an `output_config.effort`
-hint:
+model generation requires (Claude Fable 5/5.1, Opus 5.5, Opus 5, Opus 4.7/4.8,
+Sonnet 5 reject budget-based thinking with a 400). The level maps to an
+`output_config.effort` hint:
 
 | Level | Effort |
 |-------|--------|
 | `Minimal`, `Low` | `low` |
 | `Medium` | `medium` |
 | `High` | `high` |
+| `XHigh` | `xhigh` |
+| `Max` | `max` |
 
-For pre-4.6 models, opt into legacy budget-based thinking via
-`AnthropicCompat::legacy()`:
+Effort is passed through, not clamped: the ladder varies by model and the
+crate has no per-model table of it. `xhigh` arrived with Opus 4.7, so Opus 4.6
+and Sonnet 4.6 accept `max` but reject `xhigh`.
+
+**`ThinkingLevel::Off` does not always mean no thinking.** `Off` omits the
+`thinking` field; it never sends `{"type": "disabled"}`. On Claude Opus 5.5 and
+Fable 5.1 thinking is always on and cannot be disabled (the API rejects
+`disabled` and budget-based thinking), so an `Off` request still thinks at the
+model's default effort: `medium` on Opus 5.5, `high` on Fable 5.1. Opus 5 also
+thinks whenever the field is absent. The thinking tokens count against
+`max_tokens` and bill as output. To think less, pick a low level (`Low` sends
+`effort: low`) rather than `Off`.
+
+Pre-4.6 models (Sonnet 4.5, Opus 4.5, Haiku 4.5 and earlier Claude 4) accept
+only budget-based thinking and reject `{"type": "adaptive"}` with a 400.
+`ModelConfig::claude_haiku_4_5()` selects it, and so does a bare
+`ModelConfig::anthropic(id, ..)` for any pre-4.6 Claude id: it infers the
+options from the id (`AnthropicCompat::for_claude_id`). If you set
+`config.anthropic` yourself, start from that rather than
+`AnthropicCompat::legacy()`, which also turns native structured outputs off:
 
 ```rust
 let mut config = ModelConfig::anthropic("claude-sonnet-4-5", "Claude Sonnet 4.5");
-config.anthropic = Some(AnthropicCompat::legacy());
+// Already inferred; to change one option, keep the rest:
+config.anthropic = Some(AnthropicCompat::for_claude_id("claude-sonnet-4-5").with_bearer_auth(true));
 ```
 
 Legacy budgets: `Minimal`/`Low` 1,024 (the API minimum), `Medium` 2,048,
-`High` 8,192. `max_tokens` is automatically raised above the budget when
-needed.
+`High` 8,192, `XHigh` 16,384, `Max` 30,720. On this provider `max_tokens` is
+automatically raised to budget + 1,024 when needed (`Max` stops at 30,720 so
+that budget + 1,024 still fits Opus 4/4.1's 32,000-token output ceiling).
+Bedrock uses the same budgets but does **not** raise `max_tokens`: there the
+caller must set `max_tokens` above the budget (for `Max`, above 30,720).
 
 Thinking content is streamed as `Content::Thinking` with a cryptographic `signature` for verification.
+
+When the API safety-redacts reasoning it returns a `redacted_thinking` block
+instead: no text, an opaque encrypted `data` string that arrives whole in
+`content_block_start` (there is no delta type for it). It is kept as a
+`Content::Thinking` with empty `thinking`, `redacted: Some(data)` and
+`redacted_protocol: Some(ApiProtocol::AnthropicMessages)`, and sent back as
+`{"type": "redacted_thinking", "data": ...}`, unmodified and in its original
+position — within a tool-use turn the API rejects thinking blocks, redacted
+ones included, that were dropped, reordered or edited. Redacted reasoning from
+another API (Amazon Bedrock's `redactedContent`), or of unknown origin (a
+session saved before the protocol was recorded), is skipped with a warning.
+
+### Structured Outputs
+
+`Agent::prompt_structured` has two paths on this provider, selected by
+`AnthropicCompat::native_structured_output`:
+
+- **Native** (flag on, which every `ModelConfig::claude_*` preset sets, and
+  `ModelConfig::anthropic` infers for Claude ids from 4.5): the
+  schema is sent as `output_config.format = {"type": "json_schema", "schema": ...}`,
+  in the same `output_config` object as the thinking `effort`. No tool is
+  added or forced, thinking stays as requested, and the reply's text block is
+  the JSON. Required on Claude Fable 5.1 and Opus 5.5, which reject forced
+  `tool_choice` (`any` / `tool`) with a 400.
+- **Tool-forcing** (flag off: Claude ids before 4.5, non-Claude ids, and
+  `AnthropicCompat::default()`): a
+  synthetic tool built from the schema is appended and forced with
+  `tool_choice`, thinking is dropped for that request, and the agent loop
+  unwraps the forced call into text. On the native path nothing is unwrapped:
+  a call to a tool named after the schema is a real tool call and executes.
+
+`AnthropicCompat::default()` leaves the flag off, as does
+`ModelConfig::anthropic` for a non-Claude id, because gateways that speak the
+Messages protocol may not accept `output_config.format`. See
+[Structured Outputs](../concepts/structured-outputs.md) for the schema rules.
+
+### Claude Opus 5.5
+
+`ModelConfig::claude_opus_5_5()` is not a drop-in replacement for Opus 5. The
+API rejects, with a 400:
+
+- `thinking: {"type": "disabled"}` and budget-based thinking. Thinking is
+  always on (see above).
+- forced `tool_choice` (`any` / `tool`). The preset uses native structured
+  outputs, so `prompt_structured` works; nothing else in the crate forces a
+  tool.
+- `temperature`, `top_p` or `top_k` other than the default. Leave
+  `StreamConfig::temperature` unset.
+
+Thinking blocks are tied to the model and the conversation prefix. The
+provider sends them back unmodified, which the API requires, but switching a
+session to or from Opus 5.5 with `Agent::set_model` carries blocks the other
+model cannot read. Opus 5.5 reads Opus 5 and earlier Opus, Sonnet and Haiku
+thinking, but not Fable's.
 
 ### Stop Reasons
 
@@ -92,12 +179,17 @@ request.
 
 ### Cache Control
 
-Automatic prompt caching via `cache_control` markers:
+Up to three `cache_control: {"type": "ephemeral"}` breakpoints, controlled by
+`CacheConfig` (default `CacheStrategy::Auto` places all three):
 
-- **System prompt**: Always cached with `{"type": "ephemeral"}`
-- **Second-to-last message**: Gets `cache_control` on its last content block, creating a cache breakpoint
+- **System prompt**
+- **Last tool definition**
+- **The last block of the latest earlier message with non-empty content**
+  (normally the second-to-last message)
 
-This means on repeated calls, only the latest message is processed at full price.
+`enabled: false` or `CacheStrategy::Disabled` places none; `Manual` picks them
+individually. On repeated calls only the newest message is processed at full
+price. See [Prompt Caching](../concepts/prompt-caching.md).
 
 ## Configuration
 
@@ -105,7 +197,7 @@ This means on repeated calls, only the latest message is processed at full price
 |---------|-------|
 | API URL | `{base_url}/messages` (default `https://api.anthropic.com/v1/messages`) |
 | API Version | `2023-06-01` |
-| Auth Header | `x-api-key` (or `Authorization: Bearer` with `AnthropicCompat { bearer_auth: true }` / a custom `authorization` header in `ModelConfig.headers`) |
+| Auth Header | `x-api-key` (or `Authorization: Bearer` with `AnthropicCompat::bearer_auth` set / a custom `authorization` header in `ModelConfig.headers`) |
 | Default Max Tokens | request `max_tokens`, else `ModelConfig.max_tokens`, else 8,192 |
 
 Setting `ModelConfig.base_url` retargets the provider at any gateway that
@@ -117,3 +209,7 @@ speaks the Anthropic Messages protocol (e.g. OpenCode Zen/Go — see
 | Variable | Purpose |
 |----------|---------|
 | `ANTHROPIC_API_KEY` | API key |
+
+Read by `Agent::from_config`; `with_api_key` overrides it. On wasm32 there are
+no environment variables, so pass the key with `with_api_key` (see
+[API keys](overview.md#api-keys)).

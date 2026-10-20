@@ -2,19 +2,20 @@
 //! steering/follow-up queues, and abort support.
 
 use crate::agent_loop::{
-    agent_loop, agent_loop_continue, AfterTurnFn, AgentLoopConfig, BeforeTurnFn, OnErrorFn,
-    PrepareContextFn,
+    agent_loop_continue_with_stats, agent_loop_with_stats, AfterTurnFn, AgentLoopConfig,
+    BeforeTurnFn, OnErrorFn, PrepareContextFn,
 };
 use crate::context::{CompactionStrategy, ContextConfig, ExecutionLimits};
-use crate::mcp::{McpClient, McpError, McpToolAdapter};
+use crate::mcp::{HttpTransport, McpClient, McpError, McpToolAdapter};
 use crate::provider::{ModelConfig, StreamProvider};
+use crate::rt::JoinHandle;
 use crate::types::*;
+#[cfg(feature = "native")]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Queue mode for steering and follow-up messages
@@ -38,6 +39,9 @@ pub struct Agent {
     model_config: Option<ModelConfig>,
     messages: Vec<AgentMessage>,
     tools: Vec<Box<dyn AgentTool>>,
+    // Consulted at the start of every run; their tools are appended after
+    // `tools` for that run only (see `tool_source`).
+    tool_sources: Vec<Arc<dyn crate::tool_source::ToolSource>>,
     provider: Arc<dyn StreamProvider>,
     /// Whether `provider` was supplied explicitly by the caller (`new` /
     /// `from_provider`) rather than resolved from a registry (`from_config`).
@@ -79,6 +83,26 @@ pub struct Agent {
 
     // Tool middleware (permissions/policy hooks)
     tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
+    extensions: Vec<Arc<dyn crate::Extension>>,
+    tree_extensions: Vec<Arc<dyn crate::Extension>>,
+    max_stop_continues: usize,
+    run_label: Option<String>,
+    inherited_extensions: Vec<Arc<dyn crate::Extension>>,
+    depth: usize,
+    delegated_by: Option<String>,
+    parent_run_id: Option<String>,
+
+    // Per-turn hooks (transient notes on the latest user turn)
+    turn_hooks: Vec<Arc<dyn TurnHook>>,
+
+    // Decision model integration (feature `decision`): the skills it may
+    // hint at, the advisory settings, and whether the tool gate is on.
+    #[cfg(feature = "decision")]
+    skills: crate::skills::SkillSet,
+    #[cfg(feature = "decision")]
+    decision: Option<crate::decision::Advisory>,
+    #[cfg(feature = "decision")]
+    tool_gate: Option<crate::decision::ToolGate>,
 
     // Custom compaction strategy
     compaction_strategy: Option<Arc<dyn CompactionStrategy>>,
@@ -89,7 +113,14 @@ pub struct Agent {
 
     // Pending completion from a spawned agent loop
     #[allow(clippy::type_complexity)]
-    pending_completion: Option<JoinHandle<(Vec<Box<dyn AgentTool>>, Vec<AgentMessage>)>>,
+    pending_completion:
+        Option<JoinHandle<(Vec<Box<dyn AgentTool>>, Vec<AgentMessage>, SessionStats)>>,
+
+    // Everything this agent's runs spent since construction or `reset`: its
+    // own turns plus, in `sub_agents`, what they delegated. Accumulated from
+    // each run's `SessionStats`, never derived from history (see
+    // `total_cost_usd`).
+    spend: SessionStats,
 }
 
 /// Error building an [`Agent`] from a [`ModelConfig`] and a registry.
@@ -117,8 +148,12 @@ pub enum StructuredPromptError {
     #[error("model returned no output to parse")]
     NoOutput,
     /// The provider call itself failed (auth, network, rate limits, a
-    /// schema-induced 400, ...). Retrying the parse is pointless; the message
-    /// carries the underlying provider error.
+    /// schema-induced 400, ...), or the response ended as
+    /// [`StopReason::Refusal`] — the model declined, or a content filter
+    /// stopped it. Retrying the parse is pointless; the message carries the
+    /// underlying provider error or the refusal explanation (the assistant
+    /// message's `error_message`, which includes the model's refusal text
+    /// when it gave one).
     #[error("provider error during structured prompt: {message}")]
     Provider { message: String },
     /// The model's output did not deserialize into the requested type.
@@ -131,6 +166,12 @@ pub enum StructuredPromptError {
     },
 }
 
+/// What a run starts from: new prompt messages, or the current history.
+enum RunInput {
+    Prompt(Vec<AgentMessage>),
+    Continue,
+}
+
 impl Agent {
     /// Construct from an explicit provider, then configure with
     /// [`with_model`](Self::with_model) / [`with_api_key`](Self::with_api_key).
@@ -139,6 +180,7 @@ impl Agent {
     /// from one `ModelConfig`) or [`from_provider`](Self::from_provider) for a
     /// custom provider; both avoid the provider↔config mismatch this
     /// constructor allows.
+    #[doc(hidden)]
     #[deprecated(
         since = "0.10.0",
         note = "use Agent::from_config(config) — provider + env key resolved \
@@ -207,6 +249,40 @@ impl Agent {
         Self::with_provider_arc(Arc::new(provider)).configured_for(config)
     }
 
+    /// Re-price this agent's model config against the process-wide price
+    /// table now — [`ModelConfig::reprice`] on the stored config. For an
+    /// agent built before
+    /// [`prices::enable_bundled`](crate::provider::prices::enable_bundled),
+    /// `prices::enable_live`,
+    /// [`global::install_override`](crate::provider::prices::global::install_override)
+    /// or [`global::install_fetched`](crate::provider::prices::global::install_fetched):
+    /// constructors resolve prices when they run, so either install prices
+    /// before building the config, or call this afterwards.
+    ///
+    /// Same rules as [`ModelConfig::reprice`]: it applies only to a config a
+    /// first-party pricing constructor built, may set the cost to `None`, and
+    /// replaces a cost you set yourself. Affects runs started after this
+    /// call; a run already in flight keeps the rates it started with.
+    /// [`session_cost_usd`](Self::session_cost_usd) prices the whole history
+    /// at the current rates, so it changes immediately.
+    ///
+    /// Also re-prices the compaction strategy's own model
+    /// ([`CompactionStrategy::reprice`]: an
+    /// [`LlmCompaction`](crate::LlmCompaction)'s summarizer), from its next
+    /// request on. Not reached: decision models (priced when built) and the
+    /// models of [`SubAgentTool`](crate::SubAgentTool)s, which are shared
+    /// and immutable once registered — call
+    /// [`SubAgentTool::reprice`](crate::SubAgentTool::reprice) before
+    /// registering one.
+    pub fn reprice(&mut self) {
+        if let Some(config) = self.model_config.take() {
+            self.model_config = Some(config.reprice());
+        }
+        if let Some(strategy) = &self.compaction_strategy {
+            strategy.reprice();
+        }
+    }
+
     /// Switch the model mid-session, re-resolving the environment API key from
     /// the new config's provider (an explicit key set via
     /// [`with_api_key`](Self::with_api_key) is preserved, since the key is
@@ -215,8 +291,8 @@ impl Agent {
     /// Provider handling depends on how the agent was built:
     /// - Built with [`from_config`](Self::from_config): the built-in provider
     ///   for the new protocol is selected from the default registry.
-    /// - Built with an **explicit** provider ([`from_provider`](Self::from_provider)
-    ///   or [`new`](Self::new)): that provider is **kept** — it is never
+    /// - Built with an **explicit** provider ([`from_provider`](Self::from_provider),
+    ///   or the deprecated `new`): that provider is **kept** — it is never
     ///   silently replaced — and a warning is logged if it may not serve the
     ///   new protocol. Reconstruct with `from_provider` to change providers.
     pub fn set_model(&mut self, config: ModelConfig) {
@@ -262,6 +338,7 @@ impl Agent {
             model_config: None,
             messages: Vec::new(),
             tools: Vec::new(),
+            tool_sources: Vec::new(),
             provider,
             // Explicit by default (new / from_provider); from_config_with
             // flips this to false after resolving from the registry.
@@ -283,10 +360,26 @@ impl Agent {
             prepare_context: None,
             input_filters: Vec::new(),
             tool_middleware: Vec::new(),
+            extensions: Vec::new(),
+            tree_extensions: Vec::new(),
+            max_stop_continues: crate::extension::DEFAULT_MAX_STOP_CONTINUES,
+            run_label: None,
+            inherited_extensions: Vec::new(),
+            depth: 0,
+            delegated_by: None,
+            parent_run_id: None,
+            turn_hooks: Vec::new(),
+            #[cfg(feature = "decision")]
+            skills: crate::skills::SkillSet::empty(),
+            #[cfg(feature = "decision")]
+            decision: None,
+            #[cfg(feature = "decision")]
+            tool_gate: None,
             compaction_strategy: None,
             cancel: None,
             is_streaming: false,
             pending_completion: None,
+            spend: SessionStats::default(),
         }
     }
 
@@ -297,6 +390,7 @@ impl Agent {
         self
     }
 
+    #[doc(hidden)]
     #[deprecated(
         since = "0.10.0",
         note = "the model id now comes from the ModelConfig passed to \
@@ -322,6 +416,25 @@ impl Agent {
         self
     }
 
+    /// Add a [`ToolSource`](crate::ToolSource): tools resolved at the start
+    /// of every run (each `prompt*` and `continue_loop*` call) and offered
+    /// alongside this agent's own tools for that run only.
+    ///
+    /// For tool sets that change while the agent lives — plugins loaded and
+    /// unloaded, an MCP server that reconnects. Several sources may be
+    /// added; they are consulted in installation order. On a name
+    /// collision the agent's own tools win, then earlier sources; each
+    /// dropped duplicate is logged. See [`tool_source`](crate::tool_source)
+    /// for the full contract.
+    pub fn with_tool_source(
+        mut self,
+        source: impl crate::tool_source::ToolSource + 'static,
+    ) -> Self {
+        self.tool_sources.push(Arc::new(source));
+        self
+    }
+
+    #[doc(hidden)]
     #[deprecated(
         since = "0.10.0",
         note = "pass the ModelConfig to Agent::from_config(config) or \
@@ -358,14 +471,34 @@ impl Agent {
     /// later `with_tools` (which replaces the vector) can desynchronise the
     /// tool from the sink. A marker naming a tool the model cannot see is the
     /// failure this ordering prevents.
-    fn take_tools(&mut self) -> Vec<Box<dyn AgentTool>> {
+    ///
+    /// `sourced` are this run's [`ToolSource`](crate::ToolSource) tools
+    /// (see [`collect_sourced_tools`](Self::collect_sourced_tools)); they are
+    /// appended after the static ones, which win a name collision. Returns
+    /// the list and how many leading entries are the agent's own — the run's
+    /// list is truncated back to that length before it is stored again, so
+    /// sourced tools never outlive their run.
+    fn take_tools(&mut self, sourced: Vec<Arc<dyn AgentTool>>) -> (Vec<Box<dyn AgentTool>>, usize) {
         let mut tools = std::mem::take(&mut self.tools);
         if let Some(state) = &self.shared_state {
             if !tools.iter().any(|t| t.name() == "shared_state") {
                 tools.push(Box::new(crate::tools::SharedStateTool::new(state.clone())));
             }
         }
-        tools
+        let own = tools.len();
+        crate::tool_source::merge(&mut tools, sourced);
+        (tools, own)
+    }
+
+    /// Ask every [`ToolSource`](crate::ToolSource) for this run's tools.
+    ///
+    /// Awaited before any agent state is touched, so a caller that drops the
+    /// prompt future here leaves the agent as it was.
+    async fn collect_sourced_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        if self.tool_sources.is_empty() {
+            return Vec::new();
+        }
+        crate::tool_source::collect(&self.tool_sources).await
     }
 
     /// Attach a shared key-value store.
@@ -411,6 +544,8 @@ impl Agent {
     /// when it decides a skill is relevant.
     pub fn with_skills(mut self, skills: crate::skills::SkillSet) -> Self {
         let prompt_fragment = skills.format_for_prompt();
+        #[cfg(feature = "decision")]
+        self.skills.merge(skills);
         if !prompt_fragment.is_empty() {
             if self.system_prompt.is_empty() {
                 self.system_prompt = prompt_fragment;
@@ -484,6 +619,181 @@ impl Agent {
     /// Add an input filter. Filters run in order on user messages before the LLM call.
     pub fn with_input_filter(mut self, filter: impl InputFilter + 'static) -> Self {
         self.input_filters.push(Arc::new(filter));
+        self
+    }
+
+    /// Add an input filter that awaits (a moderation API, a classifier). It
+    /// runs in the same list and order as [`with_input_filter`](Self::with_input_filter)
+    /// filters, with the same [`FilterResult`] semantics.
+    pub fn with_async_input_filter(mut self, filter: impl AsyncInputFilter + 'static) -> Self {
+        self.input_filters.push(Arc::new(AsyncFilter::new(filter)));
+        self
+    }
+
+    /// Add a [`TurnHook`]: awaited before every LLM request, it may append
+    /// one note to that request's latest user turn (never to the system
+    /// prompt, never stored in history).
+    pub fn with_turn_hook(mut self, hook: impl TurnHook + 'static) -> Self {
+        self.turn_hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// Attach a decision model, enabling the **advisory** features only —
+    /// they can never block anything. **They need skills or many tools:**
+    /// with no skills and fewer than 40 tools this does nothing and sends
+    /// nothing.
+    ///
+    /// - a skill hint (with [`with_skills`](Self::with_skills)): at most one
+    ///   line naming the skill that fits the request, when confident;
+    /// - a tool hint (with 40+ tools): one line naming the few most relevant
+    ///   tools. A hint only; no tool is ever removed.
+    ///
+    /// The hint is appended to the request's latest user turn (never to the
+    /// system prompt, never stored), so the cached prefix is untouched. At
+    /// most one decision request per user request (memoized across its
+    /// tool-calling turns), with a 2 s limit; on any failure the agent warns
+    /// and continues exactly as without a model. Requests and spend are
+    /// reported in [`SessionStats::decision`]. Tune it with
+    /// [`with_decision_advisory`](Self::with_decision_advisory); block
+    /// risky tool calls with [`with_tool_gate`](Self::with_tool_gate).
+    ///
+    /// Hosted decision models see the user's request (and, for a short reply
+    /// to an assistant question, that assistant text and the user's earlier
+    /// request) and the skill and tool descriptions.
+    #[cfg(feature = "decision")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "decision")))]
+    pub fn with_decision_model(self, model: crate::decision::DecisionModel) -> Self {
+        self.with_decision_advisory(crate::decision::Advisory::new(model))
+    }
+
+    /// [`with_decision_model`](Self::with_decision_model) with explicit
+    /// advisory settings (thresholds, timeout, which hints run).
+    #[cfg(feature = "decision")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "decision")))]
+    pub fn with_decision_advisory(mut self, advisory: crate::decision::Advisory) -> Self {
+        self.decision = Some(advisory);
+        self
+    }
+
+    /// Gate every tool call on a decision model — a blocking feature, so a
+    /// separate opt-in from [`with_decision_model`](Self::with_decision_model):
+    ///
+    /// ```ignore
+    /// agent.with_tool_gate(ToolGate::new(DecisionModel::jev()))
+    /// ```
+    ///
+    /// Calls that look destructive and not clearly requested are denied with
+    /// a reason the model sees (see [`ToolGate`](crate::decision::ToolGate)
+    /// for the questions and thresholds).
+    ///
+    /// - **Fails closed:** a decision-model error, timeout, or malformed
+    ///   answer denies the call.
+    /// - **Runs last**, after every middleware and extension, whenever you
+    ///   add them, so it judges the arguments that will actually run.
+    ///   (Installing a `ToolGate` with
+    ///   [`with_tool_middleware`](Self::with_tool_middleware) is deprecated:
+    ///   it then runs before every extension and before any middleware added
+    ///   after it, so arguments either rewrites are never judged.)
+    /// - **This agent only:** calls made inside a
+    ///   [`SubAgentTool`](crate::SubAgentTool) are not covered; give it its
+    ///   own gate, where the "user request" is the task text this agent
+    ///   wrote, or install the gate with
+    ///   [`with_tree_extension`](Self::with_tree_extension) to cover every
+    ///   delegated run.
+    /// - Requests and spend are reported in [`SessionStats::decision`].
+    ///
+    /// Defence in depth, not a security boundary — injected content can
+    /// steer the decision.
+    #[cfg(feature = "decision")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "decision")))]
+    pub fn with_tool_gate(mut self, gate: crate::decision::ToolGate) -> Self {
+        self.tool_gate = Some(gate);
+        self
+    }
+
+    /// Screen every prompt with a decision model before it reaches the LLM
+    /// — a blocking feature, so an explicit opt-in:
+    ///
+    /// ```ignore
+    /// agent.with_input_guard(InputGuard::new(DecisionModel::jev()))
+    /// ```
+    ///
+    /// One batched request of yes/no checks per prompt (by default: an
+    /// attempt to override the agent's instructions, and a request for
+    /// clearly harmful help; see [`InputGuard`](crate::decision::InputGuard)).
+    /// A hit rejects the input: the run ends with
+    /// [`AgentEvent::InputRejected`] naming the check.
+    ///
+    /// - **Fails closed:** a decision-model error or timeout (3 s) rejects
+    ///   the input; `InputGuard::with_fail_open` opts out.
+    /// - Installed as an extension: it screens after every input filter
+    ///   ([`with_input_filter`](Self::with_input_filter),
+    ///   [`with_async_input_filter`](Self::with_async_input_filter)).
+    /// - Input with no text (an image-only prompt) passes unscreened;
+    ///   steering and follow-up messages are not screened (`on_input`, like
+    ///   the input filters, sees a run's prompts only).
+    /// - The input text is sent to the decision model's backend. Requests
+    ///   and spend are reported in [`SessionStats::decision`].
+    ///
+    /// Defence in depth, not a security boundary.
+    ///
+    /// # Panics
+    ///
+    /// When the guard has no checks (`without_default_checks()` and none
+    /// added): a blocking guard that checks nothing is a setup mistake.
+    #[cfg(feature = "decision")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "decision")))]
+    pub fn with_input_guard(self, guard: crate::decision::InputGuard) -> Self {
+        guard.assert_has_checks();
+        self.with_extension(guard)
+    }
+
+    /// Add an [`Extension`](crate::Extension) for this agent's runs (see
+    /// [`crate::extension`]). Extensions run in installation order, after the
+    /// tree extensions and after the older hooks (middleware, filters).
+    pub fn with_extension(mut self, extension: impl crate::Extension + 'static) -> Self {
+        self.extensions.push(Arc::new(extension));
+        self
+    }
+
+    /// Add an [`Extension`](crate::Extension) for this agent's runs **and
+    /// every run they delegate to**, at any depth: host policy (permissions,
+    /// deny rules, redaction, audit, a budget across the tree). A child runs
+    /// it ahead of its own extensions and cannot remove it. Its tools are not
+    /// offered to child runs.
+    pub fn with_tree_extension(mut self, extension: impl crate::Extension + 'static) -> Self {
+        self.tree_extensions.push(Arc::new(extension));
+        self
+    }
+
+    /// How many times per run an extension's `on_stop` may continue it
+    /// (default [`DEFAULT_MAX_STOP_CONTINUES`](crate::extension::DEFAULT_MAX_STOP_CONTINUES)).
+    pub fn with_max_stop_continues(mut self, max: usize) -> Self {
+        self.max_stop_continues = max;
+        self
+    }
+
+    /// The host's label for this agent's runs (a session id, say), passed to
+    /// extensions as [`RunContext::label`](crate::extension::RunContext::label).
+    pub fn with_run_label(mut self, label: impl Into<String>) -> Self {
+        self.run_label = Some(label.into());
+        self
+    }
+
+    /// Make this agent's runs delegated runs of the tool call `ctx` belongs
+    /// to: the calling run's tree extensions apply (ahead of this agent's
+    /// own, their tools not offered), at the delegation's depth and under the
+    /// calling run's label unless this agent has one. What a custom
+    /// delegation tool that runs an `Agent` calls; see
+    /// [`AgentLoopConfig::delegated_from`].
+    pub fn delegated_from(mut self, ctx: &ToolContext) -> Self {
+        self.inherited_extensions = ctx.tree_extensions().to_vec();
+        self.depth = ctx.delegation_depth();
+        self.delegated_by = ctx.delegation.call_id.clone();
+        self.parent_run_id = ctx.delegation.parent_run_id.clone();
+        if self.run_label.is_none() {
+            self.run_label = ctx.run_label().map(String::from);
+        }
         self
     }
 
@@ -569,6 +879,9 @@ impl Agent {
     // -- MCP integration --
 
     /// Connect to an MCP server via stdio and add its tools to the agent.
+    /// Native hosts only.
+    #[cfg(feature = "native")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native")))]
     pub async fn with_mcp_server_stdio(
         mut self,
         command: &str,
@@ -585,8 +898,19 @@ impl Agent {
     }
 
     /// Connect to an MCP server via HTTP and add its tools to the agent.
-    pub async fn with_mcp_server_http(mut self, url: &str) -> Result<Self, McpError> {
-        let client = McpClient::connect_http(url).await?;
+    pub async fn with_mcp_server_http(self, url: &str) -> Result<Self, McpError> {
+        self.with_mcp_server_http_transport(HttpTransport::new(url)?)
+            .await
+    }
+
+    /// Connect over a configured [`HttpTransport`] — one carrying an auth
+    /// header ([`HttpTransport::with_header`]), say — and add the server's
+    /// tools to the agent.
+    pub async fn with_mcp_server_http_transport(
+        mut self,
+        transport: HttpTransport,
+    ) -> Result<Self, McpError> {
+        let client = McpClient::connect_http_with(transport).await?;
         let client = Arc::new(tokio::sync::Mutex::new(client));
         let adapters = McpToolAdapter::from_client(client).await?;
         for adapter in adapters {
@@ -737,13 +1061,18 @@ impl Agent {
         if let Some(ref cancel) = self.cancel {
             cancel.cancel();
         }
-        if let Some(handle) = self.pending_completion.take() {
-            // Await the cancelled task to recover tools; ignore panic
-            if let Ok((tools, _messages)) = handle.await {
-                self.tools = tools;
+        if let Some(handle) = self.pending_completion.as_mut() {
+            // Await the cancelled task to recover tools. Taken only once
+            // joined, so a dropped `reset` loses nothing.
+            let joined = handle.await;
+            self.pending_completion = None;
+            match joined {
+                Ok((tools, _messages, _stats)) => self.tools = tools,
+                Err(e) => tracing::error!("Agent loop task failed: {}", e),
             }
         }
         self.messages.clear();
+        self.spend = SessionStats::default();
         self.clear_all_queues();
         self.is_streaming = false;
         self.cancel = None;
@@ -758,21 +1087,15 @@ impl Agent {
     /// agent state (messages, tools). `finish()` is also called automatically
     /// at the start of the next `prompt` / `continue_loop` call.
     ///
-    /// # Panics
-    ///
-    /// Panics if the agent still counts as streaming — in practice only when
-    /// a previous `*_with_sender` future was dropped mid-run, which leaves
-    /// the agent stuck in the streaming state ([`Agent::finish`] cannot
-    /// recover it; recreate the agent). Runs started by the
-    /// receiver-returning methods are joined automatically. A
-    /// misuse-`Result` variant is planned for 0.10.
     pub async fn prompt(&mut self, text: impl Into<String>) -> mpsc::UnboundedReceiver<AgentEvent> {
         let msg = AgentMessage::Llm(Message::user(text));
         self.prompt_messages(vec![msg]).await
     }
 
     /// Send a prompt and parse the reply into `T`, with the JSON Schema
-    /// enforced natively by the provider (Anthropic: forced tool call;
+    /// enforced natively by the provider (Anthropic: `output_config.format`
+    /// when [`AnthropicCompat::native_structured_output`](crate::provider::AnthropicCompat::native_structured_output)
+    /// is set, as in every `claude_*` preset, else a forced tool call;
     /// OpenAI-compatible: `json_schema` response format; Gemini:
     /// `responseSchema`; other providers log a warning and return free text,
     /// which still must parse into `T`).
@@ -780,9 +1103,9 @@ impl Agent {
     /// Runs the loop to completion internally (no event receiver). Derive the
     /// schema however you like — by hand or e.g. with the `schemars` crate.
     ///
-    /// Note: on Anthropic the forced tool call preempts regular tools for
-    /// that request — treat structured prompts as extraction/finalization
-    /// calls, not agentic tool-using turns.
+    /// Note: on Anthropic's tool-forcing path the forced tool call preempts
+    /// regular tools for that request — treat structured prompts there as
+    /// extraction/finalization calls, not agentic tool-using turns.
     pub async fn prompt_structured<T: serde::de::DeserializeOwned>(
         &mut self,
         text: impl Into<String>,
@@ -822,11 +1145,23 @@ impl Agent {
         };
 
         // A failed provider call is not a parse problem — surface it as such.
-        if *stop_reason == StopReason::Error {
+        // A cancelled call (`Aborted`) carries the provider's "Cancelled".
+        if *stop_reason == StopReason::Error || *stop_reason == StopReason::Aborted {
             return Err(StructuredPromptError::Provider {
                 message: error_message
                     .clone()
                     .unwrap_or_else(|| "provider error (no detail)".into()),
+            });
+        }
+        // A refusal is not output: its text is the model's explanation, never
+        // the requested JSON, and a content-filtered reply may be cut short.
+        // Reported with the explanation, rather than as a Parse failure over
+        // the refusal text or as NoOutput when the filter left nothing.
+        if *stop_reason == StopReason::Refusal {
+            return Err(StructuredPromptError::Provider {
+                message: error_message
+                    .clone()
+                    .unwrap_or_else(|| "response stopped as a refusal (no detail)".into()),
             });
         }
 
@@ -859,14 +1194,6 @@ impl Agent {
     ///
     /// Call [`finish()`](Self::finish) after draining events to restore state.
     ///
-    /// # Panics
-    ///
-    /// Panics if the agent still counts as streaming — in practice only when
-    /// a previous `*_with_sender` future was dropped mid-run, which leaves
-    /// the agent stuck in the streaming state ([`Agent::finish`] cannot
-    /// recover it; recreate the agent). Runs started by the
-    /// receiver-returning methods are joined automatically. A
-    /// misuse-`Result` variant is planned for 0.10.
     pub async fn prompt_messages(
         &mut self,
         messages: Vec<AgentMessage>,
@@ -882,43 +1209,122 @@ impl Agent {
         messages: Vec<AgentMessage>,
         output_schema: Option<crate::provider::OutputSchema>,
     ) -> mpsc::UnboundedReceiver<AgentEvent> {
-        self.finish().await; // restore from previous if needed
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.start_run(RunInput::Prompt(messages), output_schema, tx)
+            .await;
+        rx
+    }
 
-        assert!(
+    /// The one run starter behind every `prompt*` / `continue_loop*` method:
+    /// joins the previous run, resolves this run's sourced tools, then spawns
+    /// the loop with this agent's state, which [`finish`](Self::finish)
+    /// takes back.
+    async fn start_run(
+        &mut self,
+        input: RunInput,
+        output_schema: Option<crate::provider::OutputSchema>,
+        tx: mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        self.finish().await; // restore from previous if needed
+                             // Every run is spawned and joined by `finish`, so nothing can leave
+                             // the agent streaming without a run to join.
+        debug_assert!(
             !self.is_streaming,
-            "Agent is already streaming. Use steer() or follow_up()."
+            "a run is streaming with nothing to join"
         );
+        if matches!(input, RunInput::Continue) {
+            assert!(!self.messages.is_empty(), "No messages to continue from.");
+        }
+
+        // Resolve this run's sourced tools before touching any state.
+        let sourced = self.collect_sourced_tools().await;
 
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
         self.is_streaming = true;
 
-        let (tx, rx) = mpsc::unbounded_channel();
-
+        let (tools, own_tools) = self.take_tools(sourced);
         let mut context = AgentContext {
             system_prompt: self.system_prompt.clone(),
             messages: self.messages.clone(),
-            tools: self.take_tools(),
+            tools,
         };
 
         let mut config = self.build_config();
         config.output_schema = output_schema;
 
-        let handle = tokio::spawn(async move {
-            let _new_messages = agent_loop(messages, &mut context, &config, tx, cancel).await;
-            (context.tools, context.messages)
-        });
+        // The run's spans stay children of the caller's span, and go to the
+        // caller's subscriber: a scoped one (`tracing::subscriber::with_default`)
+        // is thread-local, so a task that moves to another worker thread
+        // would otherwise log to the global default.
+        use tracing::instrument::WithSubscriber;
+        let handle = crate::rt::spawn(
+            tracing::Instrument::in_current_span(async move {
+                let (_new_messages, stats) = match input {
+                    RunInput::Prompt(messages) => {
+                        agent_loop_with_stats(messages, &mut context, &config, tx, cancel).await
+                    }
+                    RunInput::Continue => {
+                        agent_loop_continue_with_stats(&mut context, &config, tx, cancel).await
+                    }
+                };
+                // Sourced tools belong to this run only.
+                context.tools.truncate(own_tools);
+                (context.tools, context.messages, stats)
+            })
+            .with_current_subscriber(),
+        );
 
         self.pending_completion = Some(handle);
-        rx
+    }
+
+    /// Wait for the run just started, for the `*_with_sender` methods. If
+    /// this future is dropped first (a timeout, a `select!`), the run is
+    /// cancelled: it ends as aborted, its events still reach the sender, and
+    /// the next [`finish`](Self::finish) or prompt takes the agent's state
+    /// back.
+    ///
+    /// A panic in the run reaches the caller, as it did when these methods
+    /// ran the loop inline.
+    async fn join_run(&mut self) {
+        let stop_if_dropped = self.cancel.clone().map(CancellationToken::drop_guard);
+        let failed = self.join_pending().await;
+        if let Some(guard) = stop_if_dropped {
+            guard.disarm();
+        }
+        if let Some(e) = failed {
+            #[cfg(not(target_arch = "wasm32"))]
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+            tracing::error!("Agent loop task failed: {}", e);
+        }
     }
 
     /// Send a text prompt, streaming events to a caller-provided sender.
     ///
     /// The caller provides an external sender and sets up a consumer task
-    /// before calling this method. This method blocks until the loop finishes
-    /// and state is restored — unlike [`prompt()`](Self::prompt) which spawns
-    /// the loop concurrently and returns immediately.
+    /// before calling this method. This method returns once the loop has
+    /// finished and state is restored — unlike [`prompt()`](Self::prompt),
+    /// which returns the receiver immediately. The loop runs on its own task
+    /// either way.
+    ///
+    /// **Dropping this future stops the run** (wrap it in
+    /// `tokio::time::timeout` to bound it): the run is cancelled and ends as
+    /// aborted, and the next [`finish`](Self::finish) or prompt restores the
+    /// agent's messages and tools. Its last events (including
+    /// [`AgentEvent::AgentEnd`]) still reach `tx` as long as the `Agent`
+    /// lives until the run has ended: call `finish()` after the timeout
+    /// rather than dropping the agent, whose `Drop` aborts the run.
+    ///
+    /// A panic in the run that the loop doesn't contain (tools, middleware,
+    /// extensions and tool sources are contained; a provider or a lifecycle
+    /// callback is not) propagates out of this method. The agent's tools are
+    /// lost with the run, as they would be after a panic in
+    /// [`prompt()`](Self::prompt).
+    ///
+    /// To steer or abort a run while it is going, use
+    /// [`prompt()`](Self::prompt), which leaves the agent free.
     ///
     /// ```rust,no_run
     /// # use agent::Agent;
@@ -933,14 +1339,6 @@ impl Agent {
     /// # }
     /// ```
     ///
-    /// # Panics
-    ///
-    /// Panics if the agent still counts as streaming — in practice only when
-    /// a previous `*_with_sender` future was dropped mid-run, which leaves
-    /// the agent stuck in the streaming state ([`Agent::finish`] cannot
-    /// recover it; recreate the agent). Runs started by the
-    /// receiver-returning methods are joined automatically. A
-    /// misuse-`Result` variant is planned for 0.10.
     pub async fn prompt_with_sender(
         &mut self,
         text: impl Into<String>,
@@ -951,47 +1349,16 @@ impl Agent {
     }
 
     /// Send messages as a prompt, streaming events to a caller-provided sender.
-    /// Blocks until the loop finishes and state is restored.
+    /// Returns once the loop has finished and state is restored; dropping the
+    /// future stops the run (see [`prompt_with_sender`](Self::prompt_with_sender)).
     ///
-    /// # Panics
-    ///
-    /// Panics if the agent still counts as streaming — in practice only when
-    /// a previous `*_with_sender` future was dropped mid-run, which leaves
-    /// the agent stuck in the streaming state ([`Agent::finish`] cannot
-    /// recover it; recreate the agent). Runs started by the
-    /// receiver-returning methods are joined automatically. A
-    /// misuse-`Result` variant is planned for 0.10.
     pub async fn prompt_messages_with_sender(
         &mut self,
         messages: Vec<AgentMessage>,
         tx: mpsc::UnboundedSender<AgentEvent>,
     ) {
-        self.finish().await; // restore from previous if needed
-
-        assert!(
-            !self.is_streaming,
-            "Agent is already streaming. Use steer() or follow_up()."
-        );
-
-        let cancel = CancellationToken::new();
-        self.cancel = Some(cancel.clone());
-        self.is_streaming = true;
-
-        // Move tools temporarily into context for the loop; restored after
-        let mut context = AgentContext {
-            system_prompt: self.system_prompt.clone(),
-            messages: self.messages.clone(),
-            tools: self.take_tools(),
-        };
-
-        let config = self.build_config();
-
-        let _new_messages = agent_loop(messages, &mut context, &config, tx, cancel).await;
-
-        self.tools = context.tools;
-        self.messages = context.messages;
-        self.is_streaming = false;
-        self.cancel = None;
+        self.start_run(RunInput::Prompt(messages), None, tx).await;
+        self.join_run().await;
     }
 
     /// Continue from current context (for retries after errors). Returns a
@@ -1001,73 +1368,23 @@ impl Agent {
     ///
     /// # Panics
     ///
-    /// Panics if there are no messages to continue from, or if a previous
-    /// `*_with_sender` future was dropped mid-run (the agent is stuck in the
-    /// streaming state; [`Agent::finish`] cannot recover it — recreate the
-    /// agent). A misuse-`Result` variant is planned for 0.10.
+    /// Panics if there are no messages to continue from.
     pub async fn continue_loop(&mut self) -> mpsc::UnboundedReceiver<AgentEvent> {
-        self.finish().await; // restore from previous if needed
-
-        assert!(!self.is_streaming, "Agent is already streaming.");
-        assert!(!self.messages.is_empty(), "No messages to continue from.");
-
-        let cancel = CancellationToken::new();
-        self.cancel = Some(cancel.clone());
-        self.is_streaming = true;
-
         let (tx, rx) = mpsc::unbounded_channel();
-
-        let mut context = AgentContext {
-            system_prompt: self.system_prompt.clone(),
-            messages: self.messages.clone(),
-            tools: self.take_tools(),
-        };
-
-        let config = self.build_config();
-
-        let handle = tokio::spawn(async move {
-            let _new_messages = agent_loop_continue(&mut context, &config, tx, cancel).await;
-            (context.tools, context.messages)
-        });
-
-        self.pending_completion = Some(handle);
+        self.start_run(RunInput::Continue, None, tx).await;
         rx
     }
 
     /// Continue from current context, streaming events to a caller-provided sender.
-    /// Blocks until the loop finishes and state is restored.
+    /// Returns once the loop has finished and state is restored; dropping the
+    /// future stops the run (see [`prompt_with_sender`](Self::prompt_with_sender)).
     ///
     /// # Panics
     ///
-    /// Panics if there are no messages to continue from, or if a previous
-    /// `*_with_sender` future was dropped mid-run (the agent is stuck in the
-    /// streaming state; [`Agent::finish`] cannot recover it — recreate the
-    /// agent). A misuse-`Result` variant is planned for 0.10.
+    /// Panics if there are no messages to continue from.
     pub async fn continue_loop_with_sender(&mut self, tx: mpsc::UnboundedSender<AgentEvent>) {
-        self.finish().await; // restore from previous if needed
-
-        assert!(!self.is_streaming, "Agent is already streaming.");
-        assert!(!self.messages.is_empty(), "No messages to continue from.");
-
-        let cancel = CancellationToken::new();
-        self.cancel = Some(cancel.clone());
-        self.is_streaming = true;
-
-        // Move tools temporarily into context for the loop; restored after
-        let mut context = AgentContext {
-            system_prompt: self.system_prompt.clone(),
-            messages: self.messages.clone(),
-            tools: self.take_tools(),
-        };
-
-        let config = self.build_config();
-
-        let _new_messages = agent_loop_continue(&mut context, &config, tx, cancel).await;
-
-        self.tools = context.tools;
-        self.messages = context.messages;
-        self.is_streaming = false;
-        self.cancel = None;
+        self.start_run(RunInput::Continue, None, tx).await;
+        self.join_run().await;
     }
 
     /// Wait for the running agent loop to finish and restore state
@@ -1080,20 +1397,35 @@ impl Agent {
     /// [`continue_loop_with_sender()`](Self::continue_loop_with_sender)).
     /// Call explicitly when you need to access [`messages()`](Self::messages)
     /// right after draining events.
+    ///
+    /// Safe to cancel: if this future is dropped before the run ends, the run
+    /// stays pending and the next `finish` (or prompt) joins it.
     pub async fn finish(&mut self) {
-        if let Some(handle) = self.pending_completion.take() {
-            match handle.await {
-                Ok((tools, messages)) => {
-                    self.tools = tools;
-                    self.messages = messages;
-                }
-                Err(e) => {
-                    // Task panicked or was cancelled — log and leave state as-is
-                    tracing::error!("Agent loop task failed: {}", e);
-                }
+        if let Some(e) = self.join_pending().await {
+            tracing::error!("Agent loop task failed: {}", e);
+        }
+    }
+
+    /// Join the pending run, if any, and take its state back. Returns the
+    /// task's error when it panicked or was aborted; the agent's tools went
+    /// with it, so the agent then has none.
+    async fn join_pending(&mut self) -> Option<crate::rt::JoinError> {
+        // Await the handle in place and take it only once the run has ended,
+        // so dropping this future mid-wait doesn't lose the run (and with it
+        // the agent's tools and history).
+        let handle = self.pending_completion.as_mut()?;
+        let joined = handle.await;
+        self.pending_completion = None;
+        self.is_streaming = false;
+        self.cancel = None;
+        match joined {
+            Ok((tools, messages, stats)) => {
+                self.tools = tools;
+                self.messages = messages;
+                self.spend.merge(&stats);
+                None
             }
-            self.is_streaming = false;
-            self.cancel = None;
+            Err(e) => Some(e),
         }
     }
 
@@ -1105,27 +1437,30 @@ impl Agent {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
-        let provider = self
-            .model_config
-            .as_ref()
-            .map(|m| m.provider.as_str())
-            .unwrap_or("anthropic");
-        crate::provider::resolve_api_key_or_warn(provider)
+        crate::provider::resolve_api_key_or_warn(self.model_config.as_ref())
     }
 
     /// Total dollar cost of the assistant turns currently in history, using
     /// the model's [`CostConfig`](crate::provider::CostConfig) rates.
     ///
-    /// Returns `None` when no `ModelConfig` is set or when the config's
-    /// rates are all zero (pricing unknown — e.g. custom or local models),
-    /// so `None` means "can't price this", never "free". Rates come from the
+    /// Returns `None` when no `ModelConfig` is set or when the config is
+    /// unpriced (`cost: None` — see
+    /// [`ModelConfig::cost`](crate::provider::ModelConfig::cost)), so `None`
+    /// means "can't price this", never "free". A free model (`Some` with zero
+    /// rates) returns `Some(0.0)`. Rates come from the
     /// *current* model config; sessions that switched models mid-way are
     /// priced entirely at the current rates.
+    ///
+    /// **History-derived**: this prices whatever the message history holds,
+    /// so it follows the history — [`clear_messages`](Self::clear_messages),
+    /// [`replace_messages`](Self::replace_messages) and compaction lower it,
+    /// and history loaded with [`with_messages`](Self::with_messages) or
+    /// [`restore_messages`](Self::restore_messages) raises it. It is "what
+    /// the current context cost", not "what this agent spent", and it
+    /// excludes sub-agents. For the bill, use
+    /// [`total_cost_usd`](Self::total_cost_usd).
     pub fn session_cost_usd(&self) -> Option<f64> {
-        let cost = &self.model_config.as_ref()?.cost;
-        if !cost.is_configured() {
-            return None;
-        }
+        let cost = self.model_config.as_ref()?.cost.as_ref()?;
         Some(
             self.messages
                 .iter()
@@ -1137,6 +1472,87 @@ impl Agent {
                 })
                 .sum(),
         )
+    }
+
+    /// What [`SubAgentTool`](crate::SubAgentTool)s spent on this agent's
+    /// behalf, over every run since construction or the last
+    /// [`reset`](Self::reset) — nested sub-agents included, each priced at its
+    /// own model's rates.
+    ///
+    /// Only the delegated part. For the whole bill use
+    /// [`total_cost_usd`](Self::total_cost_usd) /
+    /// [`total_usage`](Self::total_usage), which cover the same window; do not
+    /// add this to [`session_cost_usd`](Self::session_cost_usd) — that is
+    /// history-derived and so covers a different window, and adding two
+    /// `Option<f64>`s by hand gets the unpriced case wrong.
+    ///
+    /// **Window: runs, not history.** Sub-agent spend is not recorded in
+    /// message history, so [`clear_messages`](Self::clear_messages),
+    /// [`replace_messages`](Self::replace_messages) and compaction leave it
+    /// untouched; only [`reset`](Self::reset) zeroes it.
+    ///
+    /// A run started by [`prompt`](Self::prompt) or
+    /// [`continue_loop`](Self::continue_loop) is counted once it is joined by
+    /// [`finish`](Self::finish) (or the next prompt). Per run, the same figure
+    /// is on [`AgentEvent::AgentEnd`] as `stats.sub_agents`.
+    pub fn sub_agent_spend(&self) -> &SubAgentSpend {
+        &self.spend.sub_agents
+    }
+
+    /// What compaction's summarization requests
+    /// ([`LlmCompaction`](crate::LlmCompaction)) cost over every run since
+    /// construction or the last [`reset`](Self::reset) — sub-agents'
+    /// compaction included, each request priced at its summarization model's
+    /// rates. Per run, the same figure is on [`AgentEvent::AgentEnd`] as
+    /// `stats.compaction`; see [`SessionStats::compaction`] for when a
+    /// background request is counted.
+    ///
+    /// Only the compaction part, already included in
+    /// [`total_cost_usd`](Self::total_cost_usd) /
+    /// [`total_usage`](Self::total_usage), which cover the same window.
+    ///
+    /// A summary request is counted by the run that drains it, so one that
+    /// finishes after the last run (or is in flight at [`reset`](Self::reset))
+    /// lands in the next run's figures, after a reset.
+    pub fn compaction_spend(&self) -> &CompactionSpend {
+        &self.spend.compaction
+    }
+
+    /// Everything this agent's runs spent in dollars — its own turns plus
+    /// every sub-agent they delegated to, each run priced at its own model's
+    /// rates at the time it ran, plus compaction's summarization requests
+    /// ([`compaction_spend`](Self::compaction_spend)) and decision-model
+    /// requests ([`SessionStats::decision`]).
+    ///
+    /// **Window: the same as [`sub_agent_spend`](Self::sub_agent_spend)** —
+    /// every run since construction or the last [`reset`](Self::reset),
+    /// accumulated from each run's [`SessionStats`] (the figures on
+    /// [`AgentEvent::AgentEnd`]). Money spent stays spent:
+    /// [`clear_messages`](Self::clear_messages),
+    /// [`replace_messages`](Self::replace_messages) and compaction do not
+    /// lower it, and history loaded with [`with_messages`](Self::with_messages)
+    /// or [`restore_messages`](Self::restore_messages) — spent by some earlier
+    /// agent — does not raise it. That is where it differs from
+    /// [`session_cost_usd`](Self::session_cost_usd), which prices the
+    /// current history.
+    ///
+    /// `None` when any part of the spend cannot be priced (see
+    /// [`SubAgentSpend::is_unpriced`] / [`SessionStats::is_unpriced`]) — an
+    /// unpriced sub-agent makes the bill unknown, not silently low — and when
+    /// no run has carried a cost yet (nothing spent, nothing priced). A priced
+    /// turn that reported no usage makes it `Some(0.0)`. With no delegation,
+    /// summarizing compaction or decision model it is this agent's own cost.
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        self.spend.total_cost_usd()
+    }
+
+    /// Provider usage of everything this agent's runs spent — its own turns
+    /// plus every sub-agent's, plus compaction's summarization requests
+    /// (decision-model tokens are not included). Same window as
+    /// [`total_cost_usd`](Self::total_cost_usd). `total_tokens` stays 0, as in
+    /// [`SessionStats::usage`].
+    pub fn total_usage(&self) -> Usage {
+        self.spend.total_usage()
     }
 
     fn build_config(&self) -> AgentLoopConfig {
@@ -1157,67 +1573,91 @@ impl Agent {
         let follow_up_queue = self.follow_up_queue.clone();
         let follow_up_mode = self.follow_up_mode;
 
-        AgentLoopConfig {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            api_key: self.resolved_api_key(),
-            thinking_level: self.thinking_level,
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-            model_config: self.model_config.clone(),
-            convert_to_llm: None,
-            transform_context: None,
-            prepare_context: self.prepare_context.clone(),
-            get_steering_messages: Some(Box::new(move || {
-                let mut queue = steering_queue.lock().unwrap();
-                match steering_mode {
-                    QueueMode::OneAtATime => {
-                        if queue.is_empty() {
-                            vec![]
-                        } else {
-                            vec![queue.remove(0)]
-                        }
+        // The decision integration (advisor, tool gate) runs as extensions,
+        // appended after the agent's own below.
+        #[cfg(feature = "decision")]
+        let decision_extensions = crate::decision::wire(
+            self.decision.as_ref(),
+            self.tool_gate.as_ref(),
+            &self.skills,
+        );
+        let (turn_hooks, tool_middleware) = (self.turn_hooks.clone(), self.tool_middleware.clone());
+        let provider: Arc<dyn StreamProvider> = if turn_hooks.is_empty() {
+            self.provider.clone()
+        } else {
+            Arc::new(crate::provider::TurnHookProvider::new(
+                self.provider.clone(),
+                turn_hooks,
+            ))
+        };
+
+        let mut config = AgentLoopConfig::new(provider, self.model.clone());
+        config.api_key = self.resolved_api_key();
+        config.thinking_level = self.thinking_level;
+        config.max_tokens = self.max_tokens;
+        config.temperature = self.temperature;
+        config.model_config = self.model_config.clone();
+        config.prepare_context = self.prepare_context.clone();
+        config.get_steering_messages = Some(Box::new(move || {
+            let mut queue = steering_queue.lock().unwrap();
+            match steering_mode {
+                QueueMode::OneAtATime => {
+                    if queue.is_empty() {
+                        vec![]
+                    } else {
+                        vec![queue.remove(0)]
                     }
-                    QueueMode::All => queue.drain(..).collect(),
                 }
-            })),
-            context_config: if self.context_management_disabled {
-                None
-            } else {
-                Some(self.context_config.clone().unwrap_or_else(|| {
-                    self.model_config
-                        .as_ref()
-                        .map(|m| ContextConfig::from_context_window(m.context_window))
-                        .unwrap_or_default()
-                }))
-            },
-            compaction_strategy: self.compaction_strategy.clone(),
-            execution_limits: self.execution_limits.clone(),
-            cache_config: self.cache_config.clone(),
-            tool_output_sink: self.shared_state.clone(),
-            tool_execution: self.tool_execution.clone(),
-            retry_config: self.retry_config.clone(),
-            get_follow_up_messages: Some(Box::new(move || {
-                let mut queue = follow_up_queue.lock().unwrap();
-                match follow_up_mode {
-                    QueueMode::OneAtATime => {
-                        if queue.is_empty() {
-                            vec![]
-                        } else {
-                            vec![queue.remove(0)]
-                        }
+                QueueMode::All => queue.drain(..).collect(),
+            }
+        }));
+        config.context_config = if self.context_management_disabled {
+            None
+        } else {
+            Some(self.context_config.clone().unwrap_or_else(|| {
+                self.model_config
+                    .as_ref()
+                    .map(|m| ContextConfig::from_context_window(m.context_window))
+                    .unwrap_or_default()
+            }))
+        };
+        config.compaction_strategy = self.compaction_strategy.clone();
+        config.execution_limits = self.execution_limits.clone();
+        config.cache_config = self.cache_config.clone();
+        config.tool_output_sink = self.shared_state.clone();
+        config.tool_execution = self.tool_execution.clone();
+        config.retry_config = self.retry_config.clone();
+        config.get_follow_up_messages = Some(Box::new(move || {
+            let mut queue = follow_up_queue.lock().unwrap();
+            match follow_up_mode {
+                QueueMode::OneAtATime => {
+                    if queue.is_empty() {
+                        vec![]
+                    } else {
+                        vec![queue.remove(0)]
                     }
-                    QueueMode::All => queue.drain(..).collect(),
                 }
-            })),
-            before_turn: self.before_turn.clone(),
-            after_turn: self.after_turn.clone(),
-            on_error: self.on_error.clone(),
-            input_filters: self.input_filters.clone(),
-            tool_middleware: self.tool_middleware.clone(),
-            output_schema: None,
-            turn_delay: None,
-        }
+                QueueMode::All => queue.drain(..).collect(),
+            }
+        }));
+        config.before_turn = self.before_turn.clone();
+        config.after_turn = self.after_turn.clone();
+        config.on_error = self.on_error.clone();
+        config.input_filters = self.input_filters.clone();
+        config.tool_middleware = tool_middleware;
+        config.extensions = self.extensions.clone();
+        // The decision features (advisor, gate) run after the agent's own
+        // extensions, so the gate judges the final call.
+        #[cfg(feature = "decision")]
+        config.extensions.extend(decision_extensions);
+        config.tree_extensions = self.tree_extensions.clone();
+        config.max_stop_continues = self.max_stop_continues;
+        config.run_label = self.run_label.clone();
+        config.inherited_extensions = self.inherited_extensions.clone();
+        config.depth = self.depth;
+        config.delegated_by = self.delegated_by.clone();
+        config.parent_run_id = self.parent_run_id.clone();
+        config
     }
 }
 
@@ -1228,10 +1668,8 @@ impl Agent {
 /// tokens on work nobody will read, holding the tools, and keeping the event
 /// channel alive so the caller's receiver never closes.
 ///
-/// Applies only to the receiver-returning methods ([`prompt`](Agent::prompt),
-/// [`continue_loop`](Agent::continue_loop)), which spawn. The `*_with_sender`
-/// variants run inline and never set `pending_completion`, so this is a no-op
-/// for them.
+/// Every run is spawned, so this covers runs started by any `prompt*` /
+/// `continue_loop*` method that have not been joined yet.
 ///
 /// **A dropped `Agent` kills its run.** Keep the `Agent` alive until you have
 /// drained the receiver; dropping it early closes the channel *without* an

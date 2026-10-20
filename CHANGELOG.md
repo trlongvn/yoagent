@@ -4,6 +4,1712 @@ All notable changes to `agent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### yoagent-frontend moved to yobuild
+
+- The experimental frontend (`integrations/yoagent-frontend`: sessions, the
+  browser, phone and terminal UIs, the plugin host) and its `coding_agent`,
+  `handoff_agent` and `minimal_browser` examples moved, with their history, to
+  [yobuild](https://github.com/yologdev/yobuild), and
+  `scripts/try-coding-agent.sh` and `scripts/try-handoff.sh` with them (stubs
+  here say where). yobuild builds them on
+  yoagent and yoagent-rutis from crates.io. It was never published; its
+  unreleased notes went with it. yoagent stays a loop library.
+
+## 0.25.4 (2026-10-14)
+
+- **`ToolGate` judges large calls whole, and commands only whole.** Before, every string argument over 2,000 characters was cut to its head and tail, so a 100,000-character `write_file` was judged on 2,000 characters of content and a long `bash` script with `rm -rf` in its middle was judged without that line; a call still over 12,000 characters after that was denied. Now arguments are sent **whole when they fit** `ToolGate::with_max_argument_chars` (default 48,000 characters) and the decision backend's token limits; a call that does not fit has its longest strings cut only as far as needed, and the state lists what was cut under `tool_call.omitted`, and the gate logs such a partial view at `info` (which arguments, how many characters it did not see). Model-judged denials are now logged at `info` too. **Full views** are never cut — judged whole or denied: `with_full_view(tool, json_pointer)`, by default the built-in `bash` tool's `/command` (`without_default_full_views` drops it). **Behaviour change:** a `bash` command too large to review in full (over about 48,000 characters once serialized as JSON, or the decision backend's token limit if that is smaller) is now denied instead of judged from its head and tail; more calls are sent in full, so large calls cost more decision-model input tokens.
+
+- Docs: the installation page's snippet pinned `yoagent = "0.24"`; it is `"0.25"` now. The agent skill's "What changed" covers this release.
+
+## yoagent-rutis 0.3.1 (2026-10-14)
+
+yoagent-rutis only; no Rust API change (yoagent stays a ≥0.25.1 requirement, rutis 0.9, Rust 1.88).
+
+- **DSH's own host services for dsh plugins**: `plugins/dsh/host-services.json` lists the DSH packages that provide what many dsh plugins wait for — files, attachments, credentials, storage, session persistence, skills — and run headless; the compatibility probe loads them, the frontend examples on request (`--dsh-services`). Attachments, the credentials file and skills live under `DSH_HOME` (else `~/.dsh`) and skills also under `DSH_AGENTS_HOME` (else `~/.agents`), so hosts give the runtime homes of their own; that keeps `~/.dsh` and `~/.agents` out, **not** the inherited environment (DSH's credentials service reads it first), the project's `.env` or its skill folders, nor the filesystem (`dsh-fs-local` has no sandbox). In the [plugin compatibility](docs/evals/plugin-compatibility.md) matrix (re-measured 2026-10-12, on rutis 0.9) DSH's top 20 go from 3 to 4 usable (`@dfy-plugins/dsh-visualize`); what still blocks the rest is DSH's app — its web UI, model layer, agents and settings, among others. pi unchanged at 12/20.
+
+## 0.25.3 (2026-10-12)
+
+Docs only; no code changes.
+
+- **A skill for agents building on yoagent**: `skills/yoagent/SKILL.md` (AgentSkills format), now **shipped in the crate** — so it sits in every user's cargo registry at the version they build against. Which feature for which job, recipes (compiled by `tests/skill_test.rs`), tips and pitfalls, and what changed per version. Plus `llms.txt`, a map of every docs page for agents that browse instead.
+
+## yoagent-rutis 0.3.0 (2026-10-12)
+
+yoagent-rutis only; yoagent is unchanged (0.25.2). Requires yoagent 0.25, **rutis 0.9** and **Rust 1.88**.
+
+- **rutis 0.9** (breaking: rutis types are in this crate's API, so this is a minor bump): `rutis`, `rutis-bridge` and `rutis-loader` 0.9, and the npm (`@arcships/rutis`, `@arcships/rutis-runtime`) and PyPI (`rutis`) packages at 0.9.1. Move the host and the language runtimes together: a 0.9 host sends call origins that a 0.8 runtime rejects. rutis 0.9 needs Rust 1.88 (yoagent itself stays at 1.86), Node 22 (pi: 22.19) and Python 3.10. A Node plugin that disposes itself is now reported to the host.
+- **Bun** (`bun` feature): the same TypeScript plugins in Bun 1.4+ runtimes, rows `bun:<module>`, no build step. Local only for now (rutis's Bun runtime cannot listen remotely yet).
+- **Go** (`go` feature): plugins built with the rutis Go SDK (Go 1.24+), each binary a runtime started when a `go:<plugin>` row needs it. A handler is a map of Go functions; a hook's `context.Context` is cancelled when the host gives the call up, the same contract as a JavaScript hook's `AbortSignal`. Example: `plugins/go/main.go`.
+- **16 MiB per message.** rutis 0.9 closes a channel on a message over 16 MiB, which ends the runtime and every plugin in it. The bridge keeps every call under 15 MiB: the conversation (`messages`) and events reach the plugin with their images as text when they would exceed it — a call's own `args` never change — and an `after_tool` output or `call_tool` arguments still that large are not sent at all (the output is withheld, the tool call fails). The DSH and pi adapters cap a result's images at 12 MiB of base64.
+- **The run's conversation, on request**: a handler can ask for `messages` (yoagent's LLM messages) on the `Turn`, `ToolCall` (`before_tool`) and `Stop` it sees — `Handler::with_messages()` in Rust, `options.messages: true` for TypeScript / Python plugins. Off by default (it copies the conversation for every call); handlers that did not ask never get it.
+- pi adapter: what does not map (commands, shortcuts, events yoagent never fires) is reported at `info`, not `warn`: it is expected, not a fault (refusals stay warnings).
+- **pi adapter: `message_end` and `context` handlers are checked, not refused.** Each message goes (a copy) to the `message_end` handlers once — the assistant message before any of its tools runs — and each request's messages to the `context` handlers; a handler that only reads works, one that would change what it got stops the adapter (yoagent cannot apply the change), and a check cut short by a timeout or cancel does not pass. The final answer is checked after it was given: a rewrite there fails the run only for a required bridge, and refuses later runs. In the [plugin compatibility](docs/evals/plugin-compatibility.md) matrix this takes pi's top 20 from 9 to 12 usable packages (pi-lens, pi-powerline-footer, context-mode; refused 8 → 5).
+
+## yoagent-rutis 0.2.0 (2026-10-10)
+
+yoagent-rutis only; yoagent is unchanged (0.25.2). Requires yoagent 0.25 and **rutis 0.8**.
+
+- **rutis 0.8** (breaking: rutis types are in this crate's API, so this is a minor bump): `rutis`, `rutis-bridge` and `rutis-loader` 0.8, and the npm (`@arcships/rutis`, `@arcships/rutis-runtime`) and PyPI (`rutis`) packages the plugins use at 0.8.0 — since 0.8 the packages in rutis's release train share one version. Depend on `rutis = "0.8"` too: a `rutis` 0.6 next to it is a second copy of the core, whose types do not match. (rutis 0.8 runs natively on Windows, but yoagent-rutis is untested there: its runtime tests are Unix-only, and the terminal UIs read the keyboard from `/dev/tty`.)
+- **DSH asks the user** (`plugins/dsh/host-dialogs.ts`, loaded on hosts that provide a `ui` service): an `ask` from a DSH tool policy becomes a confirm showing the reason and the arguments (yes allows; no, no answer in time or a failing host denies), and DSH's `ask_user_question` is answered through the frontends (select, multiple select, typed text; a question left unanswered fails the tool rather than inventing an answer). Without a frontend attached, DSH's own result as before. Load it with `ui` shared into the DSH runtime.
+- **DSH tool cards**: the DSH adapter returns a tool's own presenters with a successful result as `details.view = {call?, result?}` (DSH's card vocabulary: generic, terminal, diff, search, read, web); a card never fails its call.
+- **pi dialogs reach a frontend** (optional): with a host `ui` service and `plugins/pi/host-ui.ts` loaded next to the pi adapter, pi extensions' `ctx.ui.select` / `confirm` / `input` / `editor` / `notify` reach the user (pi's RPC mode, `hasUI` true); a question whose hook is cancelled is withdrawn by its key; without them, print mode as before.
+- The examples read the DeepSeek key from `DEEPSEEK_API_KEY` only (no `~/.dskey` fallback).
+
+## 0.25.2 (2026-10-09)
+
+Patch release. yoagent-rutis (0.1.1) and yoagent-workers (0.2.0) are unchanged. **Behaviour change on Unix** (`BashTool`, below): a running command no longer receives the terminal's Ctrl+C; hosts should cancel or drop the call on Ctrl+C.
+
+### Added
+
+- **Headers for HTTP MCP servers** (#275). `HttpTransport::with_header(name, value)` sends a header on every request of the session — `initialize`, the `initialized` notification, tool calls and the closing `DELETE` — so servers that need a token, an API key or a `User-Agent` can be reached. Setting a name again replaces it; values are marked sensitive; an invalid name, a value that is not visible ASCII, or a name the transport or HTTP client sets itself (`Accept`, `Content-Type`, `Mcp-Session-Id`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Host`) is an error before anything is sent. Connect with `McpClient::connect_http_with(transport)` or `Agent::with_mcp_server_http_transport(transport)` (same handshake and timeouts as `connect_http` / `with_mcp_server_http`, which are unchanged). Works on wasm32. Tests: every request of a session carries the headers (DELETE included, mutation-checked), an agent connects through a configured transport, refusals, replacement, and a plain transport sends none.
+
+### Fixed
+
+- **`BashTool` kills what a command started** (#277, suggested by @shahidcodes). On Unix, `bash` now leads its own process group, and a timeout, a cancel or dropping the call kills the whole group: pipeline stages, `&&` lists and background jobs no longer keep running. Only a process that starts its own session (`setsid`) escapes. A command that finishes on its own leaves a background job alone when the job's output is redirected (`cmd >log 2>&1 &`); one still writing to the tool's output keeps the call open until the timeout, which now kills it. **Behaviour change:** the command is no longer in the terminal's foreground group, so the terminal's Ctrl+C does not reach it — cancel or drop the call on Ctrl+C (the `cli` example now aborts the run), and a command prompting on `/dev/tty` (`sudo`, SSH) stops until the timeout. Windows is unchanged (the `bash` process only). Adds `libc` as a Unix-only dependency (already in the tree through tokio). Tests: timeout, cancel, drop and normal completion in `tests/tools_test.rs`, mutation-checked.
+
+### Docs
+
+- **README:** a new loop diagram (the `Extension` hooks at their real points, `on_stop`'s continue, limits as a second exit), "Why yoagent", "Extend it" (a policy example, plugins and the pi / DSH adapters), "Runs where agents run" (Workers), What's in the box as a table, Contributing, Security and Acknowledgements.
+
+### Tests
+
+- **HTTP MCP on wasm32.** `tests/wasm32.rs` runs an agent that connects to an HTTP MCP server, discovers its tool and calls it from the loop, through the host's `fetch` (a scripted server replaces the global `fetch`): handshake, `Mcp-Session-Id` replay and the tool result. The Workers guide notes that a stalled MCP stream has no idle read timeout of its own on wasm32.
+
+## 0.25.1 (2026-10-09)
+
+Patch release: additive only. Ships with **yoagent-rutis 0.1.1** (requires yoagent 0.25.1); yoagent-workers is unchanged (0.2.0).
+
+### GASP
+
+- **Plugin logs in the run's record (opt-in).** `GaspRecorder::extension()` (install on the agent: it learns each run's id) and `GaspRecorder::plugin_log_layer()` (add to the `tracing` subscriber) record a rutis plugin's diagnostics — the yoagent-rutis bridge's `log`, target `yoagent_rutis::plugin` — as `observation.created` on the run they belong to, through the summarizer, with `{source: "plugin", level}` metadata. Only lines whose `run_id` is one of the recorder's runs are recorded. The `gasp` feature now also enables `tracing-subscriber` (registry only). Test: `tests/gasp_plugin_log_test.rs`.
+
+### yoagent-rutis
+
+- **pi extensions** (`plugins/pi/pi-extensions-adapter.ts`): the tools and tool policies of [pi](https://github.com/earendil-works/pi) coding-agent extensions, loaded unchanged with pi's own loader, as one yoagent handler following pi 1.1.0's semantics. `registerTool` → tools (pi's activation and first-registration-wins, `prepareArguments` and validation before the policies, only the judged arguments run), `setActiveTools` → an enforced allowlist, `tool_call` → `before_tool` (yoagent's built-ins under pi's names, arguments translated both ways, relative paths resolved where the policies look; an override of a built-in is enforced; `terminate` stops the run), `tool_result` → `after_tool` (a failing handler withholds the result), `input` → `on_input`, `before_agent_start` additions → a turn note. Fails closed: a load error, a failing `session_start`, an unfired deciding event (`context`, `message_end`, ...; unless `allowUnmapped`) or a pi tool named like a yoagent built-in (unless `withoutBuiltins`) refuses the load; other unmapped API (observer and session events, commands, renderers, providers, MCP servers) is reported, or refuses with `strict`. Example `pi_extensions` (any extension files; `--live` with DeepSeek; `--without`), test `pi_test`. `ctx.executeTool` runs pi tools as nested calls (pi's pipeline; never rejects); a deciding event registered mid-run stops that run; adapter warnings reach the host's logs. `pi.appendEntry` / `pi.sendMessage` are recorded in the adapter's in-memory session instead of throwing (pi tools that record their result this way no longer fail after the work). CI: a weekly `pi latest` job runs the adapter's tests against the newest pi.
+- **Images in tool results, across ecosystems.** TypeScript and Python handlers' `call_tool` results and `after_tool` edits take `content` blocks in yoagent's JSON shape (`{"type": "image", "data": <base64>, "mimeType"}` next to text blocks) instead of `text`, so pictures cross the bridge both ways (`after_tool` already saw `output.content`). The dsh adapter turns dsh image blocks (references into dsh's attachment store) into yoagent images through the `attachments` service when one is loaded; the rutis-agent example reads a runner's `{"content": [...]}` value as blocks (rutis-agent results are otherwise text). Rust handlers already returned full yoagent tool results. Tests: `content_blocks` unit test, TypeScript/Python round trip in `languages_test`, dsh with and without a store in `dsh_test`.
+- **Plugin logs reach the host.** The `yoagent` service gains `log(level, message, { run_id }?)`: a TypeScript/Python plugin's diagnostics go to the host's `tracing` output (target `yoagent_rutis::plugin`, with the run as a `run_id` field) instead of the runtime process's stderr. It never rejects (a rejected, uncaught call would end the plugin's runtime): any message, extra context fields ignored. In Python it is a coroutine to `await`. The dsh adapter uses it. Test: `tests/plugin_log_test.rs`.
+- **Docs: one contract, other ecosystems.** The extensions guide shows DSH and rutis-agent plugging in through `Extension` and the bridge with no core change (pi too, since #265); the bridge README states the adapter contract (map what the host honours, refuse what would decide unenforced, deny on failing policies, withhold on failing redactions, report what is ignored). CI now also runs the rutis-agent example.
+- Test fixes: `dsh_test` no longer reads the abort file mid-write (empty) as the result; `pi_test`'s refusal checks wait for the adapter to become active or fail (the loader counts a row still waiting for its Node runtime as settled, so on a slow runner a refusal could be read before it happened).
+
+### Docs
+
+- **Design philosophy** (`docs/design-philosophy.md`): why yoagent is a loop library and not an agent, the one `Extension` contract, fail-closed rules, plugins and ecosystems outside the core, what it costs, and a checklist for what belongs in the core. Linked from the introduction and the README.
+- The yoagent-rutis adapter guide gives dated npm package counts for the pi and DSH ecosystems (packages, not plugins that run through the adapters).
+
+## 0.25.0 (2026-10-08)
+
+### Added
+
+- **Extensions** (`yoagent::extension`, #241): one plug-in contract for the agent lifecycle. An `Extension` is installed with `Agent::with_extension` / `SubAgentTool::with_extension` (an `Arc<E>` is one too), and each run gets fresh `RunHooks` from `start_run`, so state for one run is isolated. The hooks:
+  - `tools` (once per run);
+  - `on_input`;
+  - `before_model` (note, stop or fail);
+  - `before_tool` (allow, modify or deny; `&self`, so parallel calls are judged concurrently);
+  - `after_tool` (edit the `ToolOutput`);
+  - `on_stop` (accept, continue or fail the final answer);
+  - `on_event` (every event, in order);
+  - `finish` (with a `RunOutcome` whose `end()` is a `RunEnd`).
+
+  **Advisory or required:** a required extension's failure fails the run, which ends with an `Error` message prefixed `EXTENSION_FAILED_PREFIX`; tool calls not started yet are not run.
+
+  **Every hook watches the run's cancellation**, and `finish` is bounded. **Partial tool output** is withheld while an extension filters tool output. **A rechecking policy** judges rewritten arguments again. `ClonedHooks` wraps hooks cloned per run.
+
+  **`with_tree_extension`** applies an extension to every delegated run at any depth, so host policy reaches sub-agents (a parent's `ToolMiddleware` never did); a custom delegation tool passes the tree on with `Agent::delegated_from` / `AgentLoopConfig::delegated_from`, reading `ToolContext::{tree_extensions, delegation_depth, run_label}`. Also new: `Agent::with_run_label` and `Agent::with_max_stop_continues`. Guide: `docs/concepts/extensions.md`.
+- **`RunHooks::take_failure`**: a defaulted hook through which an extension hands over a failure it recorded but could not raise in place (from `on_event`, or background work). The loop asks before each turn, before a response's tools, before `on_stop` and when the run ends, so a required extension's recorded failure fails the run however it ends. `yoagent-rutis` uses it for plugin `on_event` / `tools` failures.
+- **`extension::Budget`**: a dollar limit, checked before each model request: once spend reaches it, the run stops (the request that goes past it still completes). Per run (a sub-agent's reported spend included), or `.across_runs()` (a session, or a whole delegation tree with `with_tree_extension`; `spent_usd()` reads the total). `Budget::for_model` returns `None` for an unpriced model; a negative or NaN limit panics.
+- **Extension examples**: `extension_policy` (deny/modify with `ClonedHooks`, `rechecks_modified_calls`), `extension_redact` (`after_tool` + `filters_tool_output`), `extension_verifier` (`on_stop` continues, `finish` reading `RunOutcome::end()`), `extension_budget` (per run and `.across_runs()`), `extension_tree` (`with_tree_extension` over a `SubAgentTool` and a hand-written `Agent::delegated_from` tool) and `extension_audit` (`on_event` + `finish`). Each runs offline on a scripted `MockProvider` and checks its own result, and CI runs them all; `-- --live` drives a real model (`DEEPSEEK_API_KEY` or `ANTHROPIC_API_KEY`). New `tests/extension_combos_test.rs` covers extensions together with every tool strategy, compaction, steering, `prompt_structured`, provider retries (with `Budget`), and middleware plus the tool gate on one call.
+- **The OpenAI Responses provider (the GPT-6 presets) and Azure OpenAI can carry reasoning across tool calls** (#228) — **opt-in, off by default, and not yet verified against the live API** (checked against recorded request shapes only): `ModelConfig::with_encrypted_reasoning(true)` (`OpenAiCompat::encrypted_reasoning`). With it off, requests are as in 0.24. Opted in, a reasoning model's request asks for `include: ["reasoning.encrypted_content"]`, the finished reasoning item is kept on its `Content::Thinking` block (`redacted` holds its `id`, `summary` and `encrypted_content` as JSON, `redacted_protocol` the API it came from; the readable summary stays in `thinking`), and the next request sends it back in place as a `reasoning` input item, before the call or message it led to — what OpenAI recommends for function calling with reasoning models. That call or message is replayed with its output item `id` (`fc_…` / `msg_…`, recorded in the same JSON as `call_ids` / `message_id`), since OpenAI refuses a reasoning item without its paired item; items with no replayed reasoning before them still go without ids. It goes only to the API that produced it: OpenAI's and Azure's encrypted reasoning do not cross, and Anthropic's or Bedrock's never reach either. A reasoning item with no output after it in its turn is not sent. `include` is sent, and reasoning items are replayed, only for a reasoning model (`ModelConfig::reasoning`, or a request that sends a reasoning effort), because a non-reasoning model rejects both with a 400 — so after `Agent::set_model` to `gpt-4.1` the history goes without reasoning items and without item ids; a `custom` Azure config has `reasoning: false`, so set it for a reasoning deployment. `store` is still not sent. A summary that arrives only in the finished item now becomes the thinking text. Verified against mock servers only; `tests/integration_openai_responses.rs` (`--ignored`, needs `OPENAI_API_KEY`) runs the two-turn exchange live.
+- **`prompt_cache_key` on the Responses API** (OpenAI and Azure, #228): the same key Chat Completions sends — `CacheConfig::session_key`, else derived from the system prompt — and none when caching hints are off. Not gated on a compat flag: the field belongs to the Responses API, and Azure documents it.
+- **OpenAI's Decisions API as a decision backend** (feature `decision`): `OpenAiDecisionBackend` (`POST /v1/decisions`, key from `OPENAI_API_KEY` at call time, `with_api_key` / `with_base_url` / `with_retry` / `with_safety_identifier` / `with_capabilities`) and the preset `DecisionModel::gpt_6_luna()`; another model id with `with_model`, a configured backend with `DecisionModel::from_openai_backend`. Noul → `predicate`, Choice → `choice`, Score → `score`, question ids → `name`, a JSON state → pretty-printed `input` text; answers matched by `name` (by position only when unnamed and one per question). A `refusal` answer fails the call with `DecisionError::Refused` naming the question (not retried, and it ends a fallback chain), so the tool gate and the input guard fail closed. Priced, after `prices::enable_bundled()`, from the new bundled entry `openai-decisions/gpt-6-luna` ($0.10 per million input tokens, output free) only while requests go to `api.openai.com`. Image input is not supported. **Tested against mock servers only — not run against the live API.**
+- **`DecisionError::Refused { message }`** (+ `DecisionError::refused`, `is_refusal`; feature `decision`): an OpenAI refusal returns it, and `DecisionModel::or` returns it at once instead of asking the next model, so a fallback never answers what the first model declined. The tool gate and the input guard still fail closed.
+- **`LlmCompaction::reprice(&self)`** and a defaulted `CompactionStrategy::reprice`; `Agent::reprice` now also re-prices the compaction summarizer, so an agent built before the pricing opt-in can be priced afterwards.
+- **A one-time `warn!` per model when a first-party price lookup misses** while only `YOAGENT_PRICES` / `install_override` / `install_fetched` is in effect (no bundled snapshot). `LivePrices` is `#[must_use]`.
+- **`SessionStats::compaction`** (`CompactionSpend { usage, cost_usd, requests }`) and **`Agent::compaction_spend()`**: what `LlmCompaction`'s summarization requests cost, priced at the summarizer's own `cost`. See the fix below.
+- **`yoagent-rutis` (unpublished): TypeScript and Python hooks get a cancel handle.** Every hook but `on_event` finds it in its first argument, as the field `signal`: a real `AbortSignal` in JavaScript, rutis's `Signal` in Python (`.cancelled`, `await signal.wait()`). It is aborted when the bridge gives the call up — the run cancelled (`Agent::abort()`), the hook's timeout passed, the plugin unloaded mid-call — and never once the call completed. A `call_tool` that passes `call.signal` on (to `fetch`, a child process, dsh's `execute`) now stops when its run is cancelled; before, a JavaScript hook always ran to completion. A field rather than an extra positional argument, so fixed-signature Python methods keep working. It is not plain data: Python's `json.dumps(call)` now refuses the argument (drop `signal` first). Tested end to end in both languages (cancel and timeout abort it; a completed call's handle never is). No yoagent core change.
+- **`yoagent-rutis` (unpublished): dsh tools as yoagent tools.** `plugins/dsh/dsh-tools-adapter.ts` offers every tool of a DeepSeek Harness tool registry (`@deepseek-ai/dsh-tools`' `tools` service) to yoagent agents: `call_tool` runs dsh's `execute` with the bridge's cancel handle as dsh's `signal`, an `isError` result is an error tool result, and `before_model` adds the system-prompt sections dsh plugins wrote (the harness's own left out, capped at 2000 characters) as a turn note. dsh plugins run unchanged in rutis's Node runtime; `plugins/dsh/package.json` pins dsh 0.2.0-rc.2, `@deepseek-ai/cordis` 4.0.4 and `dsh-free-search` 0.8.1, in its own install (the language tests' stays small). `examples/dsh_tools.rs` (feature `node`) runs the unchanged `dsh-free-search` plugin's `platform_search` for a scripted model (it searches the web: needs network) or DeepSeek (`--live`) and checks its outcome. `tests/dsh_test.rs` covers the adapter with a no-network fixture dsh plugin (`plugins/dsh/fixture-tools.ts`): tools offered, text, `isError`, the prompt note, and a cancelled run aborting a slow dsh tool through its signal; CI's `rutis-bridge-languages` job installs `plugins/dsh` too.
+- **`yoagent-rutis` (unpublished): rutis-agent's tools as yoagent tools**, an example workspace (`examples/rutis-agent-tools/`, its own `[workspace]`, not built with the crate): a rutis plugin maps every `ToolDef` of rutis-agent's `ToolRegistry` to a yoagent tool per run (failures are `ToolError`s, yoagent's cancel token is the one rutis-agent's `execute` watches), shown with rutis-agent's real `replace_text`, a tool registered into the registry while the host runs (offered on the next run), and a cancelled call; scripted, or `--live` with DeepSeek, self-checking. **rutis-agent comes from git** (the rutis repository at tag v0.7.0, the one on rutis 0.6; crates.io's 0.2.0 is on rutis 0.2) **with a `[patch.crates-io]` for `rutis`**, so the graph holds one `rutis` crate.
+
+### Changed
+
+- **The Azure OpenAI and OpenAI Responses providers share their request code** (#228). Azure's request builder and read loop were a copy of the Responses provider's; both now use one (`provider/responses_request.rs`), and Azure keeps only its endpoint, `api-key` header and legacy deployment override. The bodies they sent were already identical; the new fields above reach both.
+- **`yoagent-rutis` (unpublished) moves to rutis 0.6** (`rutis = "0.6"`, built against 0.6.1; 0.6 made rutis's public types `#[non_exhaustive]`, 0.6.1 added optional APIs).
+- **`yoagent-rutis` (unpublished) is rebuilt on `Extension`** (#250). `RutisBridge::install(&root)` provides a `yoagent` `Registry` service; plugins register a `Handler` (a name plus any of `tools`, `before_tool`, `after_tool`, `before_model`, `on_input`, `on_stop`, `finish`, `on_event`, with plain-data arguments: `ToolCall`, `Turn`, `Input`, `Stop`, `RunInfo`), tied to the plugin's lifecycle; `bridge.extension()` is one `impl Extension` (`RutisExtension`) whose `start_run` snapshots the handlers. The host sets `.required()`, `.filters_tool_output()`, `.rechecks_modified_calls()`, `.require_policy()` and per-hook timeouts (60 s policy, 30 s input, 5 s turn). Installed with `with_tree_extension`, plugin policy now reaches sub-agents. New for plugins: `after_tool` (redaction), `on_stop` (verifiers), `finish`. Removed: the four adapters (`PluginToolSource`, `RutisToolMiddleware`, `RutisTurnHook`, `RutisInputFilter`), `attach` / `attach_sub_agent` / `AgentRutisExt`, `ToolRegistry`, `ToolCallEvent` / `ToolVerdict` / `ToolPolicy` / `TurnEvent` / `InputEvent`, and the `event_sender` tee (every run's events are now published on the bus from `on_event`, as `AgentEventEmitted` with `run_id()`, `label()` and `depth()`). The bus chains and their workarounds (frozen arguments, recorded denials, `mark_judged`, liveness checks around each dispatch) are gone with them. A handler whose plugin unloads mid-run is unavailable for that run: its tools fail, its `before_tool` denies, its `on_input` rejects, its `after_tool` withholds (without failing a `required()` run — an unload is not a failure). A failing `on_event` handler is switched off alone: bus publishing and the other handlers go on, and a `required()` run fails at its next decision point (a failure in the run's last events is logged).
+- **`yoagent-rutis` (unpublished) runs TypeScript and Python plugins** through rutis-bridge 0.7 (#250; features `node`, `python`, `websocket`, passed through; the default build stays Rust-only). `RutisBridge::install` then also provides the registry as the host service `yoagent`: a plugin calls `register(name, handler, options?)` with an object (or Python dict) of async functions passed by reference, and passes the returned unregister function to `ctx.effect`; a runtime that exits or crashes has its handlers removed. Same hooks and plain-JSON arguments as Rust handlers; `on_event` is opt-in and filtered by event type (`options.events`). The handler shape ships as `plugins/yoagent.d.ts` (no SDK package yet), with one TypeScript and one Python example plugin, a host example (`examples/language_plugins.rs`), end-to-end tests against real Node 24 / Python 3.12 runtimes, and a CI job (`rutis-bridge-languages`). The bridge still builds on 1.86. An abandoned call is cancelled through the hook's `signal` (see Added); Python coroutines are cancelled too.
+- **The decision features run as extensions** (#241 dogfooding). `with_tool_gate`, `with_input_guard` and `with_decision_model` install a `ToolGate` (`before_tool`), an `InputGuard` (`on_input`) and the advisor (a `before_model` note); the gate and guard keep their old trait impls, now deprecated (below). Three ordering effects:
+  - the gate runs after every middleware **and extension**, so it also judges arguments an extension rewrote;
+  - the guard screens after all input filters, not in their list;
+  - the advisor's hint comes before turn-hook notes and is judged once per turn rather than once per provider attempt (it was memoized per request, so the same request is sent).
+- **A Responses / Azure stream without `usage` warns** with `usage_missing = true` (as Bedrock does); usage stays zero.
+- **Anthropic and Bedrock no longer send OpenAI Responses reasoning summaries that carry encrypted reasoning** (#228; only arises with encrypted reasoning on). Anthropic used to replay a Responses summary as a `thinking` block with `signature: ""`, and Bedrock as unsigned `reasoningText` (to a non-Claude model); such a block now holds Responses-tagged encrypted reasoning in `redacted`, which both skip. A summary without encrypted content (a response that did not return any) is handled as before.
+
+### Changed (breaking)
+
+- **Nothing is priced by default; pricing is an explicit, process-wide opt-in.** Until 0.24 every first-party constructor (`ModelConfig::anthropic` / `openai` / …, the named presets) and the decision presets `jev()` / `clef()` / `clef_flash()` priced themselves from the `prices.json` compiled into the crate. Now `ModelConfig::cost` is `None` from every constructor, decision presets are unpriced, and so `session_cost_usd()`, `total_cost_usd()` and the `llm_stream` span's `cost_usd` report *unpriced* and `Budget::for_model` returns `None` — until the process opts in, once, before building configs:
+  - `yoagent::provider::prices::enable_bundled()` — offline and reproducible: the bundled snapshot (the same `prices.json`, still in the crate). Works on every target, wasm32 included.
+  - `prices::enable_live(&PriceSource::ModelsDev).await` / `prices::enable_live_cached(&source, path, CacheOptions)` (native) — fetch now and install over the bundled snapshot; a failed fetch falls back to the snapshot, logs it and reports it (`LivePrices::fell_back()`, `origin.fetch_error()`).
+
+  Free models stay $0 without an opt-in (`DecisionModel::local`, a loopback `DecisionModel::logprobs`, a zero-rate `cost` you set). A `YOAGENT_PRICES` file, `global::install_override` and `global::install_fetched` are still honoured and are opt-ins of their own for exactly the models they list. An explicit `cost`, `ModelConfig::with_prices(&table)` and `reprice()` work as before. New: `global::clear_bundled()`, `global::is_bundled_enabled()`, `global::pricing_enabled()`, `LivePrices`. Pricing never makes a network request unless you call a function that says it does. **An app that shows costs (a yoyo-style CLI) must add one call at startup**, e.g. `yoagent::provider::prices::enable_bundled();` — otherwise every cost reads as unpriced. Guide: `docs/concepts/pricing.md#enabling-pricing`. Also: a decision preset's "unlisted id" warning is logged only once prices are enabled, and price overrides for `cloudflare/*` entries are no longer reported as inert with the `decision` feature.
+- **`AgentMessage::Extension(ExtensionMessage)` is now `AgentMessage::Custom(CustomMessage)`** (#228), so it isn't confused with `Extension`, the plug-in contract. Match arms and constructors need the new names; `ExtensionMessage` remains as a deprecated alias of `CustomMessage` (a variant can't have an alias). **Saved data is unchanged:** `AgentMessage` is untagged, so the variant name is never serialized, and `CustomMessage::new` still writes `role: "extension"`. For example, yoyo-evolve matches `AgentMessage::Extension` in five places. Migration: `AgentMessage::Extension(m)` → `AgentMessage::Custom(m)`, `ExtensionMessage` → `CustomMessage`.
+- **`yoagent::provider::sse` is private; `drive_sse` and `SseEvent` are removed** (#228). Nothing used them: every SSE provider reads its own stream. The module's one remaining function, `open_event_source`, was already crate-private.
+- **`AgentLoopConfig` is `#[non_exhaustive]`; build it with `AgentLoopConfig::new(provider, model)`.** `new` sets every other field to the default the struct-literal examples used (no API key, thinking off, no context management, no hooks, parallel tools, the default retry policy). Fields stay public, so set what you need afterwards: `config.max_tokens = Some(1024);`. A struct literal no longer compiles outside the crate. Every field added so far was a breaking change for code calling `agent_loop` directly, which is why recent features went through task-locals; new fields (such as `#241`'s extensions) no longer break anyone. `Agent` and `SubAgentTool` users are unaffected.
+- **`ModelConfig::openai_responses` infers `reasoning` from the model id** (#228). It was `true` for every id; it is now `false` for `gpt-3*`, `gpt-4*` (`gpt-4o`, `gpt-4.1`, …), `chatgpt-*` and any id containing `-chat` (`gpt-5-chat-latest`), and stays `true` for everything else (the o-series, `gpt-5*`, the GPT-6 presets, unknown ids). Without it, with encrypted reasoning turned on, `openai_responses("gpt-4.1", ..)` with `ThinkingLevel::Off` would be sent `include: ["reasoning.encrypted_content"]` and fail with a 400 ("Encrypted content is not supported with this model"). Set `config.reasoning` to override. A `ThinkingLevel` set on one of those ids now logs the existing "not marked reasoning-capable" warning (and still sends the effort). Breaking only if you read `config.reasoning`; set it to override.
+
+### Deprecated
+
+- **The 0.10-deprecated constructors are hidden from the docs** (#228): `Agent::new` / `with_model` / `with_model_config` and the same on `SubAgentTool` still compile (with a deprecation warning) but no longer appear on docs.rs. They will be removed in 1.0, as their notes say.
+- **`ToolGate` as a `ToolMiddleware` and `InputGuard` as an `AsyncInputFilter`.** Install them with `with_tool_gate` / `with_input_guard` (or as extensions), and drive them outside the loop with the new `ToolGate::decide(&call)` and `InputGuard::screen(text)`. Rust cannot mark a trait impl `#[deprecated]`, so the first use of each in a process logs a warning; both impls will be removed in a later release. A gate installed as a middleware runs before every extension and before any middleware added after it, so it does not judge arguments those rewrite.
+- **`ExtensionMessage`** is a deprecated alias of `CustomMessage` (see the rename above).
+
+### Fixed
+
+- **A cancelled run no longer executes the tool calls it had not started** (#243). If the run was cancelled while the model's response arrived, its tool calls used to run anyway, and the cancel was only seen at the next turn: after a user pressed cancel, the agent could still run a command or write a file. Such a call is now answered with an error result ("Tool call not run: the run was cancelled.") and never runs, and the run ends with `[Agent stopped: cancelled]` as before. A tool already running still gets the cancel through its `ToolContext`.
+- **Every message in the history has its events** (#243). A final failure or a cancel before the provider sent any output appended its assistant message without a `MessageStart`/`MessageEnd`, so transcripts rebuilt from events missed it. It is now announced with both. This includes a run aborted during a retry's backoff: after the `ProviderRetry`, its `Aborted` message arrives as a `MessageStart` and `MessageEnd` with no text, also through `retry_safe_events`. A retried attempt that failed before any output still gets only its `ProviderRetry`.
+- **Every `TurnStart` has a `TurnEnd`** (#243). A turn stopped by an execution limit, or by `on_before_turn` returning `false`, ended without one. It now ends with the history's last message (the stop marker, for a limit) and no tool results.
+
+  These change what consumers see: a run can now send more events (a `MessageStart`/`MessageEnd` pair, a `TurnEnd`) and run fewer tools than before. A consumer that counts events, or relied on tools running after a cancel, should check them.
+- **A sub-agent cancelled before it answered fails its delegation** with `ToolError::Cancelled`. It used to return "(sub-agent produced no text output)" as a success.
+- **The `*_with_sender` methods run on the same spawned path as `prompt` / `continue_loop`** (#228). Dropping one of their futures (a `tokio::time::timeout`, a `select!`) used to drop the loop mid-turn, lose the agent's tools and leave it "streaming" for good, so the next prompt panicked. Now it cancels the run: the run ends aborted, its last events (with `AgentEnd`) still reach the sender while the `Agent` lives (call `finish` after a timeout rather than dropping the agent), and the next `finish` or prompt restores the agent's history and tools. A panic in the run still propagates to the caller. The spawned run keeps the caller's tracing span as its parent (this also fixes `prompt` / `continue_loop`, whose loop spans used to start a new trace). `finish` and `reset` are also safe to cancel now. The four run starters share one implementation, and the stale "misuse-`Result` variant planned for 0.10" notes are gone.
+- **`LlmCompaction`'s summarization spend now reaches the run's stats** (#228). It was reported only on `ContextCompacted` events and in an `info!` log, so `SessionStats`, `total_usage()`, `total_cost_usd()` and `Agent::total_cost_usd()` under-counted every session that summarized. The spend is a separate bucket, `SessionStats::compaction`, so `usage`, `turns` and `cost_usd` stay the main model's own turns. Details:
+  - **Totals change:** `total_usage()` and `total_cost_usd()` (on `SessionStats` and `Agent`) now include it, so they are higher for sessions that summarized; with a summarizer that has no price (`cost: None`), `total_cost_usd()` is now `None` rather than a figure that left the summaries out.
+  - **When it is counted:** the request runs on its own task, so its spend is counted by the run whose next compaction step finds it finished. A request still in flight when a run ends is counted by the next run that uses the strategy (`Agent` keeps one strategy across runs). Each request is counted once, whether its briefing was spliced, discarded or rejected (a `Length` or `Refusal` summary was billed too); a request that failed or timed out reported no usage.
+  - **Sub-agents:** a child run's compaction spend folds into the parent's `compaction` bucket (one bucket for the delegation tree, like `decision`), not into `sub_agents`. `extension::Budget` counts it in a sub-agent's reported total, and (see below) the run's own. A child whose summarizer is unpriced now reports an unpriced total, so `Budget` prices that child's whole usage at the budget's own rate (as it already did for unpriced decision spend).
+  - **Serialized stats:** the field is omitted when empty and defaults when absent, so stored `SessionStats` still deserialize.
+- **`extension::Budget` counts the run's own decision and compaction spend** — tool gate, input guard and advisor evaluations, and `LlmCompaction` summaries — each at its model's price, or the budget's own rates when unpriced. It counted only assistant turns and sub-agents.
+- **A failed decision evaluation's spend is recorded:** a response that arrived but could not be used (a refusal, an unusable answer, one rejected by the central check) adds its reported usage to `SessionStats::decision` / `total_cost_usd` (built-in OpenAI, SystemOne and logprob backends). A 2xx whose body is unreadable counts as unpriced spend, never $0. Custom backends (`from_backend`) still report no spend on failure.
+- **An empty `with_api_key` fails before sending** (`OpenAiDecisionBackend`, `SystemOneBackend`, `LogprobBackend`, `DecisionModel::with_api_key`): `MissingApiKey` instead of sending `Bearer `.
+- **An `Agent` run carries the caller's tracing subscriber** into its spawned task (and the extension observer and compaction tasks do too), so a subscriber set with `tracing::subscriber::set_default` / `with_default` sees runs on a multi-thread runtime.
+- **Responses / Azure, encrypted reasoning:** a reasoning item whose following output item has no id is no longer stored or replayed (warned) — it would 400 every later request — and an unparseable reasoning `output_item.done` ends the previous item's range.
+- **yoagent-rutis: a TypeScript/Python handler's `on_event` delivery no longer fails silently.** A panic during delivery is caught, and a delivery task that ended (seen on `send` or `flush`) is recorded; either is the handler's failure (a required extension fails the run, an advisory one logs it). Before, the remaining events were dropped and the run never failed.
+- **A cancelled run no longer blames an extension for a withheld tool result.** When the run is cancelled while an extension's `after_tool` is still working, the result is still withheld (a redactor may not have run), but the text now says the run was cancelled before the extension finished, instead of "extension '…' did not finish processing it", which reads like the extension failed.
+- **`list_files` reports what it couldn't read** (#260, found by yoyo). `find` skips an unreadable subdirectory, prints the error on stderr and exits non-zero; the tool ignored both, so a partial listing read as complete. The listed files are still returned, now with the errors under `Warnings` in the text and in `details.warnings` (capped); a listing with no files and an error fails, as `search` does.
+
+## 0.24.3
+
+Reliability fixes from the October codebase review: overloaded providers are retried, failed streams are errors rather than truncated answers, MCP over stdio is robust, `search` keeps partial results, sub-agent limits are configurable, and the onboarding paths work as written. No breaking changes. Two behaviours to know about:
+
+- A run cancelled while tools run now ends with an `[Agent stopped: cancelled]` user message in its history.
+- A bare `ModelConfig::anthropic("claude-…")` now infers its thinking mode and native structured outputs from the id.
+
+### Added
+
+- **`SubAgentTool::with_execution_limits(ExecutionLimits)`.** A delegation's token and duration caps were hard-coded (1M tokens, 5 minutes), with only `with_max_turns` adjustable. Because the token count includes every turn's whole prompt, a sub-agent working over a large context reached the cap within a few turns, and nothing could raise it. All limits are now settable; `with_max_turns` still changes only the turns. The defaults are unchanged.
+
+### Fixed
+
+- **MCP over stdio:**
+  - **Response matching:** a request now waits for the response with its own id. The transport used to read exactly one line as the answer, so a logging or progress notification the server sent first failed the call and left every later call off by one.
+  - **Server messages:** server notifications are skipped. Server requests are answered: `ping` succeeds and anything else is declined (logged at `WARN`), so the server does not wait. Stale responses and non-JSON lines (logged at `WARN`) are dropped.
+  - **Handshake:** `notifications/initialized` is sent as a notification (`JsonRpcNotification`, `McpTransport::notify`). It used to be a request awaiting a reply that a spec-compliant server never sends, so connecting could hang. If a built-in transport cannot deliver it, the connect now fails (a custom transport that keeps the default `notify` stays best-effort), and the whole handshake is bounded at 60 s.
+  - **stderr** is drained into the log whatever its encoding; a server that logged more than a pipe holds used to block. When the server exits, the error is now `McpError::Transport("Connection closed: MCP server '…' exited with …; last stderr: …")` with its exit status and last stderr, instead of a bare `ConnectionClosed`.
+  - **The server process** is killed when the transport is dropped.
+  - **Interrupted writes:** a message cut off by a cancelled call no longer garbles the next one.
+- **MCP tool calls** honour the run's cancellation. Over stdio they are also bounded at five minutes from when the call is sent (`McpClient::with_call_timeout`, `McpToolAdapter::with_call_timeout`). HTTP calls have no whole-call bound, since the transport's idle timeout already ends a stalled one. A hung stdio server used to hang the agent, with the client lock held so every tool from that server waited too.
+- **MCP content** kinds this crate does not model reach the model as text: a text `resource` as its own text, anything else as its JSON with large base64 payloads replaced by their size, logged once per type. They used to make the whole call fail to parse.
+- **`search` keeps its matches when some files cannot be read.** `rg` and `grep -r` exit 2 when any file errors (permission denied, a file removed mid-walk), even after finding matches. The tool reported that as "Search error" and dropped every match. Matches now come back followed by the tool's stderr under `Warnings:`; `details.warnings` holds the same text (capped at 2,000 characters) or `null`. A search that found nothing and hit an error still fails. A search that had warnings and exited 0 (a GNU grep `warning:` line, say) also no longer fails.
+- **Overloaded providers are retried.** HTTP 529 (Anthropic "overloaded") and 503 ("service unavailable") were `Api` errors that ended the turn at once. They are now `RateLimited`: backed off and retried, honouring `Retry-After`. Anthropic's in-stream `overloaded_error` and Bedrock's `serviceUnavailableException` are retried the same way. Other 5xx responses still are not. `RateLimited` carries no message, so the server's explanation is logged at `WARN`, and its text now reads "Rate limited" (or "…, retry after 1500ms") instead of "retry after Nonems".
+- **A failed stream is no longer returned as a finished answer:**
+  - **OpenAI-compatible:** a mid-stream `{"error": …}` chunk (OpenRouter and other gateways) parsed as an empty chunk, and `finish_reason: "error"` read as a normal stop. The turn ended as `Ok` with the partial text. Both are now errors; a rate limit or overload among them (a string code such as `rate_limit_exceeded`, or a numeric 503/529) is retried.
+  - **Gemini:**
+    - A stream that ends without a `finishReason` is a retryable `Network` error. A drop after it keeps the response, so it is not billed twice.
+    - A prompt blocked via `promptFeedback.blockReason`, and `IMAGE_SAFETY`, are a `Refusal` with a message.
+    - `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL` and `TOO_MANY_TOOL_CALLS` are an `Error` carrying Gemini's `finishMessage`. Any other unhandled finish reason is logged.
+    - An HTTP 503 honours `Retry-After`, and an in-stream overload (`UNAVAILABLE`, numeric 503) is retried.
+
+    Each of these used to come back as an empty or truncated `Ok`.
+  - **Vertex AI** now uses Gemini's stream parser instead of an old copy (215 lines removed). It gains every Gemini fix: transport errors, in-stream errors, safety refusals and `ToolUse` being kept. Synthesized tool-call ids change from `vertex-fc-N` to `google-fc-N`, and a server-sent `functionCall.id` is used when present.
+- **A cancel while tools run is marked.** The run used to end with the last assistant message still `ToolUse`, indistinguishable from a normal stop. A cancelled sub-agent's delegation was therefore reported as a success. The run now appends `[Agent stopped: cancelled]` (`agent_loop::CANCELLED_MARKER`), and `SubAgentTool` reports it as a failure. A run cancelled before its first assistant message gets no marker (a sub-agent cancelled that early still returns its "no text output" fallback).
+- **`ToolExecutionStrategy::Batched { size: 0 }`** panicked in `chunks(0)`; it now runs as size 1.
+- **`ModelConfig::anthropic(id, ..)` infers the Claude options from a `claude-…` id** (`AnthropicCompat::for_claude_id`). It used to leave them unset:
+  - `anthropic("claude-haiku-4-5", ..)` got adaptive thinking, which Haiku 4.5 rejects.
+  - Every 4.5+ id went without native structured outputs and fell back to tool-forcing, which Fable 5.1 and Opus 5.5 reject.
+
+  A non-Claude id (a model behind a Messages-protocol gateway) is unchanged. The context window and output limit stay generic (200K / 16K); use a preset (`claude_sonnet_5()` …) to get the model's own. The provider docs' snippets that set `config.anthropic` now start from `for_claude_id`, so they no longer switch native structured outputs off.
+
+### Docs
+
+- **`max_total_tokens` explained.** Each turn counts its whole prompt (cached tokens included) plus its output. The prompt resends the conversation, so a run's total grows much faster than the conversation itself: the 1M default is reached around turn 16 of a run at a 60K-token context. All limits apply per run (each `prompt` starts at zero). The rustdoc and the context-management guide now say so, with a table, the settings for long agentic runs, and sub-agents' fixed caps. Behaviour is unchanged.
+- New guide: [Testing Your Agent](docs/guides/testing.md), covering `MockProvider`, testing a middleware alone, and abort. Its examples run as `tests/testing_guide_test.rs`.
+- **The `cli` example:**
+  - It no longer reads `ANTHROPIC_API_KEY` for every provider. The README's `--provider groq` command panicked without one, and with one exported the Anthropic key was sent to Groq, OpenAI or a local server.
+  - Each provider now reads its own variable; `API_KEY`, when set, is sent to whichever provider is selected.
+- **Quick starts:** the docs.rs front page, `quick-start.md` and `examples/basic.rs` use `ModelConfig::claude_sonnet_5()` instead of a bare `anthropic()` config.
+- **The README's Ollama snippet** gains the `/v1` its base URL needs, and the try-it commands gain `ollama pull llama3.1:8b`.
+- **Decision-model latency:** "~100 ms" is replaced with what we measured, a few hundred ms per request.
+
+## 0.24.2
+
+Security fixes for the built-in tools and the Gemini provider, found in a
+codebase review. Upgrade if you use the file tools with `allowed_paths`, the
+`search` tool, or Gemini. No breaking changes.
+
+### Security
+
+- **File-tool sandbox escapes (`write_file` / `edit_file` / `read_file` with `allowed_paths`):**
+  - **A `..` after a missing directory.** `PathSandbox` dropped every `..` that came after a directory that did not exist yet. `root/new/../../x` was checked as `root/new/x` (inside the root), while `write_file` created `root/new` and wrote `x` one level *above* the root.
+  - **A dangling symlink.** `root/link`, pointing at a missing file outside the root (a cloned repository can ship one), passed as a plain new file, and the write followed it to create the target outside.
+  - **A relative path whose first component is missing** (`a/../link/x`) was collapsed lexically and never checked for symlinks, so it could escape through `link`. The same gap rejected a plain new file such as `newdir/a.txt` as "outside the allowed directories".
+  - **What changed:**
+    - Relative paths are anchored at the working directory before resolving.
+    - `..` components are kept, and a path that climbs through a missing directory is resolved again.
+    - A dangling symlink is followed and checked; a symlink loop is refused.
+    - Sandboxed tools do their I/O on the path that was checked (`PathSandbox::io_path`).
+  - Without `allowed_paths`, paths are still used as given.
+- **`search` flag injection.** The model's pattern went to `rg` / `grep` as a bare argument, so a pattern starting with `-` was parsed as a flag. `--pre=<cmd>` makes ripgrep run a command on every file it searches.
+  - The pattern is now passed as `--regexp=` (`-e` for grep), with `--` before the path.
+  - `list_files` prefixes a path starting with `-`, so `find` cannot read it as an expression.
+- **Gemini API key in error text.** The key travelled in the URL (`?key=`), and reqwest includes the URL in its error messages. Any transport failure therefore put the key into logs, `ProviderRetry` events, the turn's `error_message` and GASP recordings.
+  - It is now sent in the `x-goog-api-key` header, marked sensitive.
+  - The key is trimmed, so one with a trailing CR/LF keeps working, as it did in the URL.
+  - The header is not added when `ModelConfig.headers` already sets `x-goog-api-key`, or when there is no key. An `Authorization` header (a proxy's, say) does not affect it.
+  - A proxy that forwards the `key` query parameter but drops unknown headers would need updating.
+
+### Fixed
+
+- **A panicking tool no longer kills the run.** Tool `execute` is now contained the way middleware already was, including a panic while the call's future is created. The panic becomes an error tool result (`tool '<name>' panicked: …`, logged with the `tool_call_id`) and the loop continues; a sibling call in the same batch is unaffected. Before, the loop task died and the run's messages were lost. The agent also silently lost all its tools for every later run.
+- **`bash`:**
+  - Output is cut as bytes and then decoded, so a cap that falls inside a multi-byte character no longer panics (it did on large CJK output).
+  - Each stream is read with a byte cap (`max_output_bytes` per stream), so memory stays bounded however much a command prints. The cap used to apply only after everything was buffered.
+  - A timeout or cancel kills the `bash` process (`kill_on_drop`); it used to keep running. What it started (pipeline stages, commands in a `&&` list, background jobs) can still outlive it.
+  - A timeout now returns the output printed so far, with the truncation note when the cap was hit. A read error on a stream is reported instead of looking like the end of the output.
+  - An already-cancelled call no longer starts the command.
+- **`search` / `list_files`:**
+  - `max_results` capped matches per file (`--max-count`), so a search could return far more than asked, all of it buffered. The tool now reads matches as they arrive, keeps the first `max_results` and stops the search at the next one, saying there are more (`details.truncated`).
+  - Both tools kill `rg` / `grep` / `find` on timeout or cancel.
+
+## 0.24.1
+
+Retry-safe event streams for output that cannot take text back, and a loop
+fix for providers that never send `Done`. No breaking changes; everything new
+is additive.
+
+### Added
+
+- **Retry-safe event streams** (#218): `retry::retry_safe_events(rx)` and
+  `retry::RetrySafeEvents` hold back each provider attempt's events until it
+  succeeds. A retried attempt's partial text never reaches the consumer; a
+  final failure keeps its start and end (its `content` included) but not its
+  deltas; an attempt left open is dropped, never released. For
+  non-interactive, append-only output such as stdout on a pipe or a log. It
+  covers the agent's own messages, not a sub-agent's `ToolExecutionUpdate`s.
+  `docs/concepts/retry.md` also describes the pattern for interactive
+  terminals: abort when a retry follows streamed text. When the abort lands
+  in the backoff (by default about a second), the turn ends `Aborted` without
+  sending the retry (tested).
+
+- **`clef-worker` example** (`integrations/yoagent-workers/examples/clef-worker/`):
+  a complete Cloudflare Worker running a yoagent agent whose tool calls are
+  gated by Clef through the Workers AI binding (`ToolGate` + `yoagent_workers::ai::clef`).
+  Managed with the Cloudflare CLI (`cf`, `cloudflare.config.ts`). It reports
+  each tool call's outcome (`ok` / `denied` / `gate_unavailable` / `failed`),
+  a failed model call as a 502 and a turn-limit stop explicitly. Type-checked
+  and linted for wasm32 in CI, and run live once with `cf dev` against the
+  real Workers AI binding: Clef's first real calls (allowed a read and a
+  requested delete; no denial was observed, because DeepSeek refused the
+  injected instruction itself).
+- The `clef-worker` example reports `timing` (the run and each Clef call, in
+  ms). Measured under `cf dev`: Clef a median 444 ms per gate check (12 calls,
+  one Cloudflare-side failure, `5012`), the whole request 2.55 s; Jev, the same
+  request natively, 267 ms (12 calls, no failures). Details in its README.
+- The `clef-worker` example can gate with Jev (`?gate=jev`, `TYPESAFE_API_KEY`
+  secret) and was deployed to Cloudflare and tested on the edge: per gate
+  check, Clef via `env.AI` a median 308 ms (12 calls), Jev via `fetch` 230 ms
+  (11 calls), no failures; whole requests 2.07 s / 1.91 s. Jev's first run in a
+  Worker. Deployed via `cf deploy --prebuilt` (cf beta.12's build step did not
+  exit); the Worker was deleted afterwards.
+- `examples/decision.rs` asks Clef instead of Jev when `CLOUDFLARE_ACCOUNT_ID`
+  is set, says which model it uses, and exits 1 when the request fails.
+
+### Fixed
+
+- A provider that returns `Ok` without sending `StreamEvent::Done` no longer
+  leaves its message open: the loop sends the `MessageEnd` with the message
+  the provider returned. All built-in providers send `Done`; this affected
+  custom ones. A failed event forwarder is now logged instead of ignored.
+
+## 0.24.0
+
+Cloudflare's Clef decision models, over the REST API and (new crate
+`yoagent-workers`) through a Worker's AI binding, plus two fixes. No breaking
+changes: `DecisionError::RateLimited` gains a `body` field, and the variant is
+`#[non_exhaustive]`.
+
+### Added
+
+- **Cloudflare's Clef decision models** (feature `decision`):
+  `DecisionModel::clef(account_id)` and `DecisionModel::clef_flash(account_id)`
+  call `@cf/cloudflare/clef` / `@cf/cloudflare/clef-flash` on Workers AI, which
+  speak the SystemOne API. The token is read at call time from
+  `CLOUDFLARE_API_TOKEN`, then `CLOUDFLARE_AUTH_TOKEN`. Priced from
+  `prices.json` (`cloudflare/clef` $0.24, `cloudflare/clef-flash` $0.09 per
+  million input tokens) while requests go to `api.cloudflare.com`. Underneath,
+  `SystemOneBackend::workers_ai(account_id, model_path)` and
+  `SystemOneBackend::with_endpoint_url(url)` (an exact URL). The backend
+  unwraps Cloudflare's `{"result": ...}` envelope and keeps Cloudflare's
+  error text: a 429 for a used-up daily allocation (code 3036) is not retried,
+  out of capacity (3040) is; a 2xx `"success": false` is `Invalid` (schema
+  error 5006) or `Backend`. Tested against a mock server only.
+- **`DecisionError::RateLimited` carries the server's `body`** (new field;
+  the variant is `#[non_exhaustive]`), shown in its message, with
+  `DecisionError::rate_limited_with_body`. A SystemOne key read from the
+  environment is trimmed, and a 401/403 names the variable it came from.
+- **`decision::parse_systemone_response(body, request)`**: the SystemOne
+  response parser `SystemOneBackend` uses (lenient, Cloudflare's envelope
+  unwrapped), public for backends that move the request themselves.
+- **`yoagent-workers` (new crate, `integrations/yoagent-workers/`)**: yoagent
+  on Cloudflare Workers through the Worker's own bindings. First,
+  `yoagent_workers::ai::{clef, clef_flash, AiBackend}` run Clef through the
+  Workers AI binding (`env.AI`) as a `DecisionBackend` — no API token, no
+  account id. Binding errors are read for Workers AI's codes: out of capacity
+  (3040) is retried (`AiBackend::with_retry`), a used-up daily allocation
+  (3036) is not. wasm32 only; tested under Node against fake bindings. Not yet on
+  crates.io (it needs `parse_systemone_response`); yoagent's core does not
+  depend on it.
+
+### Fixed
+
+- **A sub-agent's retried attempt is marked in its updates.** A sub-agent
+  forwards its text deltas to the parent's `on_update`, including those of a
+  provider attempt that then fails and is retried. It now also forwards
+  `[sub-agent retrying after: <error>]` on `AgentEvent::ProviderRetry`, like
+  the existing `[sub-agent calling tool: <name>]` marker, so the failed
+  attempt's partial text is not read as the start of the answer.
+- **An overflow reported by an empty 400/413 body is detected on the
+  message.** Cerebras and Mistral answer an oversized request with an empty
+  400/413, which `ProviderError::classify` already treats as
+  `ContextOverflow`. But the turn's recorded error (`"Context overflow: "`)
+  holds no overflow phrase, so `Message::is_context_overflow()` returned
+  `false` for it. It now recognises any turn that ended with a
+  `ContextOverflow` error.
+
+## 0.23.0
+
+A minor bump because it breaks: the `native` feature below breaks builds that
+already set `default-features = false`.
+
+### Breaking
+
+- **`default-features = false` now turns off the new `native` feature.**
+  Before this release yoagent had no default features, so that line did
+  nothing. It now removes the filesystem and shell tools, `default_tools()`,
+  `StdioTransport` / `with_mcp_server_stdio`, `FileBackend`,
+  `PriceTable::fetch_cached` and all of reqwest's default features. The last
+  one is the dangerous part: without reqwest's TLS the build still succeeds,
+  but every HTTPS provider call fails at runtime (as a retryable network
+  error, so each turn spends its retries first). **Migration:** native users
+  who set `default-features = false` add `features = ["native"]`.
+- **A retried provider attempt now ends with a `MessageEnd`, followed by the
+  new `AgentEvent::ProviderRetry`.** Previously the abandoned attempt had no
+  closing `MessageEnd` (and, depending on the scheduler, some or all of its
+  events never reached consumers). Now every attempt that opened a message
+  is closed: a retried one by a `MessageEnd` with `StopReason::Error` and an
+  `error_message` saying it will be retried, then a `ProviderRetry
+  { attempt, max_attempts, error, delay_ms }`. **Migration:** a consumer
+  that treats an error `MessageEnd` as the turn's failure should check
+  whether the next event is `ProviderRetry` (see
+  [the event contract](docs/concepts/messages-events.md)). The bundled
+  consumers do: the GASP recorder no longer records retried attempts as model
+  calls, and `examples/release_smoke` / `examples/long_horizon` no longer
+  report a run whose retry succeeded as failed.
+
+### Added
+
+- **`wasm32-unknown-unknown` builds (e.g. Cloudflare Workers).** A new
+  default `native` feature holds what needs a native host (see Breaking).
+  `cargo build --target wasm32-unknown-unknown --no-default-features` builds
+  the agent loop, all providers (over the host's `fetch`), HTTP MCP,
+  `SharedState` in memory, sub-agents, compaction and the `decision`
+  feature; `openapi` and `gasp` stay native-only, and WASI targets are not
+  supported. New `yoagent::rt` gives `spawn`, `sleep`, `timeout`,
+  `JoinHandle` and `Instant`: Tokio's own on native targets (unchanged
+  behaviour, paused-clock tests intact), and the host executor,
+  `setTimeout` and `performance.now()` on wasm32. `StreamProvider`,
+  `AgentTool`, `McpTransport`, `CompactionStrategy`, `ToolSource`,
+  `SharedStateBackend`, `TurnHook`, `ToolMiddleware`, `InputFilter`,
+  `AsyncInputFilter` and `DecisionBackend` now require
+  `rt::MaybeSend + rt::MaybeSync`. That is a blanket over `Send + Sync` on
+  native targets, so existing implementations and bounds are unaffected;
+  implementations that run on wasm32 use
+  `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` /
+  `#[cfg_attr(not(target_arch = "wasm32"), async_trait)]`. On wasm32,
+  `LlmCompaction` takes its existing no-runtime path and never summarises,
+  and there are no environment variables, so keys must be passed explicitly.
+  Wall-clock reads on the agent path (`types::now_ms`, `ExecutionTracker`,
+  SigV4) use `web-time`, which is `std::time` on native targets and the host
+  clock on wasm32 (where `std::time` panics). Provider SSE streams disable
+  the eventsource library's own reconnect (`retry::Never`): providers
+  already stop at the first stream error and the agent loop owns retries, so
+  it never took effect, but its timer panicked on wasm32 and a reconnect
+  would re-send a completion request. `PriceTable::fetch` keeps its timeout
+  on wasm32 (a per-request timeout). Items that need `native` carry a docs.rs
+  badge. Guide: [WebAssembly & Cloudflare Workers](docs/guides/wasm-workers.md).
+  CI gains a `wasm32` clippy job (default and `decision`, with a lint that
+  bans the std clock and Tokio calls that panic there) and a native
+  `--no-default-features` row.
+
+- **`AgentEvent::ProviderRetry`** (wire tag `providerRetry`), sent when a
+  provider attempt fails with a retryable error and will be retried: the
+  failed attempt (1-based), the attempts allowed, the error text, and the
+  backoff it waits. See Breaking for how it pairs with `MessageEnd`.
+
+- **`ToolSource`: tools resolved per run.** A new trait
+  (`yoagent::ToolSource`, module `tool_source`) with one async method,
+  `tools() -> Vec<Arc<dyn AgentTool>>`, installed with
+  `Agent::with_tool_source` / `SubAgentTool::with_tool_source`. Each source is
+  consulted once at the start of every run (every `prompt*` and
+  `continue_loop*` call; once per delegation for a sub-agent), and its tools
+  are offered alongside the agent's own for that run only — they are dropped
+  again when the run ends. On a name collision the agent's own tools win, then
+  earlier sources, then the earlier tool within a source; each dropped
+  duplicate is logged, and the run is never refused. The surviving sourced
+  tools are sorted by name, so a source returning the same set in another
+  order never changes the request prefix (any change to the *set* still
+  rewrites the prompt cache — per-run consultation bounds that to run
+  boundaries). Sources have no timeout: a sub-agent stops waiting when the
+  parent run is cancelled; on an `Agent`, dropping the prompt future leaves
+  its state untouched. A panicking source (even one that panics before
+  returning its future) is contained and contributes nothing. For tool sets that change while the agent
+  lives (plugin systems, reconnecting MCP servers); nothing changes for agents
+  without a source. Non-breaking: `AgentTool`, `AgentContext` and
+  `AgentLoopConfig` are unchanged.
+
+- **`yoagent-rutis` (new crate, `integrations/yoagent-rutis/`)**: a bridge
+  that lets [rutis](https://crates.io/crates/rutis) plugins extend a live
+  `Agent` — contribute tools (via `ToolSource`), gate tool calls, add turn
+  notes, reject input and observe `AgentEvent`s on the rutis bus. Its own
+  crate, not yet on crates.io (it needs a yoagent release with `ToolSource`);
+  yoagent itself does not depend on rutis.
+
+- **wasm32 tests run in CI.** `tests/wasm32.rs` runs under Node with
+  `wasm-bindgen-test`: the `rt` shims (`sleep` waits on the host timer,
+  `timeout`, `spawn` and abort, `Instant`) and two whole agent runs, a tool
+  turn and a retried provider failure on real timers. Lint alone cannot see
+  code that compiles for wasm32 but panics or hangs there. Native
+  dev-dependencies are now target-scoped so the test builds for wasm32; no
+  library code changes.
+
+### Changed
+
+- **A cancelled run ends as `StopReason::Aborted`, not `Error`.** When the
+  provider returns `ProviderError::Cancelled`, or the run is cancelled while
+  a provider call fails, the turn's message (and its closing `MessageEnd`)
+  now carries `Aborted`, so `on_error` is no longer called for a
+  cancellation. Cancelling during a retry's backoff ends the turn at once
+  instead of after the delay and one more request. A cancelled
+  `SubAgentTool` delegation still fails the tool call, and a cancelled
+  `prompt_structured` still returns `StructuredPromptError::Provider`
+  ("Cancelled"), as before.
+
+### Fixed
+
+- **Failed provider attempts reach consumers deterministically.** On a
+  retryable error the loop used to abort the event forwarder, so how much of
+  the failed attempt's partial output had already reached consumers depended
+  on the scheduler. The loop now drains the forwarder after each attempt,
+  then closes the attempt (see Breaking). The final failed attempt is closed
+  with the same error message the turn returns. History is unchanged: it
+  holds only the successful answer (or the final error). A custom
+  `StreamProvider` must drop every clone of its event sender before `stream`
+  returns, or the loop waits for it.
+
+## 0.22.0
+
+### Added
+
+- **`Content::Thinking` gains `redacted: Option<String>` and
+  `redacted_protocol: Option<ApiProtocol>`**, and a
+  `Content::thinking_redacted(protocol, data)` constructor, for reasoning a
+  provider returns encrypted instead of as text (the Anthropic API's
+  `redacted_thinking` data, Amazon Bedrock's base64 `redactedContent`).
+  `redacted_protocol` records which API produced the payload, and it is
+  replayed only to that API: neither API documents the other's encrypted
+  reasoning as valid, so each provider skips the other's (and a block with no
+  recorded protocol), logged at debug. An unknown `redactedProtocol` (written
+  by a newer yoagent) loads as none recorded rather than failing the
+  message. The variant is `#[non_exhaustive]`, so
+  this is not a breaking change; both fields are omitted from JSON when
+  `None` (`redactedProtocol` when present, `redacted_protocol` also
+  accepted), so session files and the event wire format are unchanged for
+  content without redacted reasoning.
+
+- **Amazon Bedrock API keys** ([#174](https://github.com/yologdev/yoagent/issues/174)).
+  An `api_key` without `:` is a Bedrock API key and is sent as
+  `Authorization: Bearer <key>` — unless it evidently is not one
+  (whitespace or control characters, an `AKIA`/`ASIA` start, non-base64
+  characters, or the length of a bare secret key), which is refused so IAM
+  credentials joined with something other than `:` never go out as a bearer
+  token. `AWS_BEARER_TOKEN_BEDROCK`, AWS's variable for it, is read before
+  the IAM variables, both by the provider (with an empty `api_key`, on every
+  request: `AWS_BEARER_TOKEN_BEDROCK`, then `AWS_ACCESS_KEY_ID` +
+  `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`)) and by
+  `resolve_api_key("bedrock")`. The SigV4 region comes from the endpoint
+  host (`bedrock-runtime[-fips].<region>` with any AWS partition suffix,
+  dual-stack `api.aws` and VPC endpoints included), else `AWS_REGION`, else
+  `AWS_DEFAULT_REGION`.
+
+### Changed
+
+- **Behaviour change: Amazon Bedrock requests with IAM credentials are signed
+  by yoagent** ([#174](https://github.com/yologdev/yoagent/issues/174)). If
+  you route Bedrock through a local signing proxy (`aws-sigv4-proxy` and the
+  like) with IAM credentials in the environment, yoagent used to send them as
+  `Bearer access:secret` for the proxy to re-sign; it now signs itself, and a
+  proxy `base_url` has no region in its host, so the request fails with
+  `ProviderError::Auth` unless `AWS_REGION` is set. Set `AWS_REGION`, or put a
+  placeholder `authorization` header in `ModelConfig.headers` so yoagent
+  sends no credentials and leaves signing to the proxy.
+
+- **Behaviour change: `Agent`, `SubAgentTool` and `LlmCompaction` resolve a
+  Bedrock key by protocol, not by provider string.** For any
+  `BedrockConverseStream` config they pass an empty key and the provider
+  reads `AWS_BEARER_TOKEN_BEDROCK` / `AWS_*` on each request. Before, a config
+  whose provider was not exactly `"bedrock"` (say
+  `ModelConfig::custom(ApiProtocol::BedrockConverseStream, "aws-bedrock", ..)`)
+  picked up the generic `YOAGENT_API_KEY` / `API_KEY`; those are no longer
+  sent to AWS. A custom `StreamProvider` registered for
+  `BedrockConverseStream` now also receives an empty key, where it used to
+  get `AWS_BEARER_TOKEN_BEDROCK` or the composed IAM credentials when the
+  provider string was `"bedrock"`; it should read its credentials itself, or
+  be given an explicit key.
+
+- **Behaviour change: `MIN_HEADROOM_RATIO` is 0.30 (was 0.15).** It is the
+  lowest ratio of the context budget the headroom policy may compact to. For
+  tool-heavy sessions the policy's "leave room for 30 turns" demand exceeds
+  the budget and pins compaction to this floor. At 0.15 that dropped the
+  opening task prompt in 91% of compactions at the default 96K budget (and
+  the latest request in 41%). At 0.30 it is 0% and 2%, for about 7% more input
+  tokens per request and no measurable change in compaction count or
+  prefix-cache hit rate. Measured offline against the real compaction code
+  with `examples/compaction_sweep` (#164, #150; see
+  `docs/evals/compaction-defaults.md`); live cache hit rates are unconfirmed.
+  Small budgets (around 26K) can still collapse, because the newest turn
+  alone can exceed any target. With the headroom policy on, the floor also
+  applies when `compact_target_ratio` is set below 0.30, so such a config now
+  compacts to 0.30. To compact harder, set `compact_headroom_turns: None`:
+  compaction then uses `compact_target_ratio` unfloored.
+
+### Fixed
+
+- **The Anthropic provider keeps and replays `redacted_thinking` blocks**
+  ([#197](https://github.com/yologdev/yoagent/issues/197)). The block did not
+  deserialize, so it was dropped without a log, a later block padded the gap
+  with an empty text placeholder, and it was never sent back. With thinking
+  and tool use the API requires a turn's thinking blocks, redacted ones
+  included, to come back unmodified, so a continuation could be rejected or
+  lose the model's reasoning. The block is now kept in order at its own
+  position (its `data` arrives whole in `content_block_start`) and replayed
+  as `{"type": "redacted_thinking", "data": ...}` in place. Any other block
+  type the provider does not surface (server-side tool blocks, `fallback`,
+  types added later) and any unknown delta type is skipped with one warning
+  per type naming it, instead of silently; skipped blocks leave no
+  placeholder and later blocks keep their deltas. Stream events'
+  `content_index` now always matches the block's position in the final
+  message. A `content_block_start` or `content_block_delta` that does not
+  parse is logged instead of dropped silently. Tested against mock streams,
+  not the live API.
+
+- **Amazon Bedrock streaming works** ([#174](https://github.com/yologdev/yoagent/issues/174)).
+  `BedrockProvider` parsed the ConverseStream body as newline-delimited JSON
+  and silently skipped every line that did not parse. Real responses are
+  binary `application/vnd.amazon.eventstream` frames, so nothing parsed and
+  every turn came back as an empty *successful* assistant message
+  (`StopReason::Stop`, zero usage). The payload structs did not match AWS's
+  shapes either; streamed `toolUse.input` was never collected, so every
+  Bedrock tool call ran with `{}`; text split across network chunks was
+  decoded per chunk, corrupting multi-byte characters; a dropped connection
+  returned the partial content as a success; and all text and reasoning went
+  into the first block of each kind.
+
+  The response is now decoded as event stream frames: bytes are buffered
+  across network chunks, both CRC-32 checksums are verified (in-house, no new
+  dependency; checked against the AWS SDK eventstream test vectors), and
+  events are dispatched on the `:event-type` / `:message-type` headers with
+  payload shapes taken from the AWS Bedrock Runtime API reference. Text,
+  reasoning (with its signature, so it replays) and tool input accumulate per
+  `contentBlockIndex`; tool input is parsed at `contentBlockStop` with the
+  same rule as the other providers, so truncated or unparseable arguments —
+  and a tool block that never closed — are answered with an error tool result
+  instead of running on `{}`. Every documented `stopReason` is mapped
+  (`max_tokens` → `Length`, `guardrail_intervened` and `content_filtered` →
+  `Refusal`, `model_context_window_exceeded` → a context-overflow `Error`),
+  and usage includes cache reads and writes. In-stream exceptions classify
+  like their HTTP status (`throttlingException` → retryable rate limit, an
+  over-long-input `validationException` → context overflow). A checksum
+  mismatch, a truncated frame, a dropped connection, or a stream without
+  `messageStop` (including an empty body) is now an error — except once both
+  `messageStop` and `metadata` have arrived, when a later drop keeps the
+  finished response instead of retrying (and re-billing) it. A `200` with a
+  non-eventstream content type reports its body.
+
+  Reasoning replays as Bedrock requires: a signed block as `reasoningText`
+  with its signature, a redacted block as `redactedContent` (previously both
+  failed — a redacted block was replayed as empty text with an empty
+  signature, which Bedrock rejects). Reasoning without a signature is replayed
+  without a signature key (it is optional, and non-Claude reasoning models
+  such as gpt-oss never sign); to a Claude model, which verifies signatures,
+  it is not replayed. A signature is never sent as `""`. Content this provider
+  does not surface (images, citations, tool results, server-side tool use,
+  and union members or event types added later) is dropped with a warning
+  rather than silently. A response that ends without a `metadata` event
+  reports zero usage, as the other providers do, and logs a warning with
+  `usage_missing = true`.
+
+  Tested against mock frames built to AWS's documented format, not against a
+  live Bedrock endpoint. Requests are now also authenticated properly (next
+  entry).
+
+- **Amazon Bedrock no longer sends the secret access key in a bearer header**
+  ([#174](https://github.com/yologdev/yoagent/issues/174)). Without an
+  `authorization` header in `ModelConfig.headers`, `BedrockProvider` sent
+  `Authorization: Bearer {api_key}` — with `api_key` in the documented
+  `access_key_id:secret_access_key[:session_token]` form, the secret key went
+  out in a header, and Bedrock rejected the request. IAM credentials are now
+  used to SigV4-sign the request (signing name `bedrock`; `x-amz-date`,
+  `x-amz-content-sha256` over the exact body bytes sent, and
+  `x-amz-security-token` for a session token); only the access key id and a
+  signature are sent. An `authorization` header in `ModelConfig.headers`
+  still wins and is sent alone (now matched in any case, and no longer
+  requires `api_key` to contain `:`). Every authentication failure is a
+  `ProviderError::Auth` before anything is sent, naming what is wrong but
+  never a credential: no credentials, one half of the IAM pair in the
+  environment, a variable that is not valid Unicode, a malformed
+  `access:secret` value, a temporary (`ASIA…`) key without its session token,
+  a value that cannot be an HTTP header (a newline, non-ASCII — previously a
+  retried `Network("builder error")`), a `ModelConfig.headers` entry that
+  SigV4 sets itself, a clock before 1970, or SigV4 with no region.
+  Credential headers are marked sensitive (redacted from `Debug`). A request
+  reqwest cannot build is now `ProviderError::Other` (not retried) instead of
+  a retryable `Network` error. A trailing `/` on `base_url` is dropped (it
+  produced `//model/…`). A `403` for an expired or not-yet-valid signature
+  says to check the system clock. The model id is now percent-encoded in the
+  request path as the AWS SDKs send it (`:` → `%3A`, `/` → `%2F`); ids
+  without those characters are sent as before.
+
+  The signer is hand-written (private `provider::sigv4`, on the RustCrypto
+  `sha2` and `hmac` crates — two new dependencies) and pinned to AWS's
+  `aws-sig-v4-test-suite` vectors; a mock-server test recomputes each
+  signature from the request received. Not tested against a live endpoint.
+
+## 0.21.0
+
+### Added
+
+- **Decision models, behind the new `decision` feature (off by default, no
+  new dependencies).** `yoagent::decision` asks typed questions — Noul
+  (yes/no), Choice (one of up to 255 options), Score (2–10 ordered levels) —
+  about a text or JSON state and returns typed answers with probabilities
+  and a confidence. Nothing is sent until you construct a `DecisionModel`;
+  an API key in the environment enables nothing.
+  - `DecisionModel` presets: `jev()` (TypeSafe, `TYPESAFE_API_KEY`,
+    `TYPESAFE_BASE_URL`), `jev_opencode()` / `jev_opencode_free()`
+    (OpenCode Zen, `OPENCODE_API_KEY`), `local(url)` (self-hosted
+    SystemOne servers such as JevK5, no key); `from_backend` for anything
+    else. Keys are read at call time. Builders `with_model`,
+    `with_timeout`, `with_api_key`, `with_retry`, `with_cost`; getters
+    `model`, `timeout`, `capabilities`. One-line `noul` / `choice` /
+    `score` returning `NoulAnswer` / `ChoiceAnswer` / `ScoreAnswer`,
+    `ask(state)` returning an `Ask` batch builder (`noul`, `choice`,
+    `score`, `question`, `send`), and `evaluate` / `evaluate_request`.
+  - Requests and answers: `Question` (`noul`, `noul_with_criteria`,
+    `choice`, `choice_with_criteria`, `score`; accessors `kind`,
+    `instructions`, `options`, `choice_criteria`, `noul_criteria`,
+    `levels`), `QuestionKind` (`all`, `as_str`), `Request` (`new`,
+    `question`, `get`), `Answer` (`kind`, `confidence`, `as_noul`,
+    `as_choice`, `as_score`), `NoulAnswer`, `ChoiceAnswer` (probabilities
+    in option order), `ScoreAnswer`, `DecisionUsage`, and `Evaluation`
+    (`new`, `with_answer`, `with_cost_usd`; `model`, `usage`, `cost_usd`,
+    `answers` in request order, `get`, `noul`, `p_true`, `choice`,
+    `score`), plus `distribution_confidence`.
+  - `DecisionBackend` trait with `Capabilities` (`new`,
+    `with_max_choice_options`, `with_max_score_levels`, `with_batching`,
+    `with_local`, `with_token_limits`, `supports`); `SystemOneBackend`
+    (`new`, `typesafe`, `opencode_zen`, `with_api_key`, `with_api_key_env`,
+    `with_base_url`, `with_retry`, `with_capabilities`, `endpoint_url`;
+    lenient parsing, 429/529 and transport errors retried with
+    `RetryConfig` backoff, server `retry-after` honoured) and `MockBackend`
+    (`new`, `neutral`, `from_fn`, `push`, `push_error`,
+    `with_capabilities`, `requests`, `request_count`). Requests are
+    validated against the backend's limits before sending; an unsupported
+    question type is an error, never emulated. Every backend's answers are
+    validated (kind; finite probabilities and confidences in `[0, 1]`; a
+    probability for every Choice option and every Score level, summing to
+    1 within `max(0.02, n × 0.005)` for `n` options or levels, for servers
+    that round; choices among the options); answers nobody asked for
+    are dropped.
+  - `DecisionError` (`Clone`, `#[non_exhaustive]`, matched with
+    `matches!`): `Http`, `RateLimited`, `Timeout`, `Invalid`,
+    `Unsupported`, `Transport { message, source }`, `MissingApiKey`,
+    `Backend { message, source }`, `BadResponse`; constructors `http`,
+    `rate_limited`, `transport`, `transport_with_source`, `backend`,
+    `backend_with_source`; `is_retryable`, `retry_after`.
+  - Confidence is the backend's when reported, otherwise TypeSafe's
+    `(n * p_max - 1) / (n - 1)` (`distribution_confidence`).
+  - Pricing: `prices.json` lists `typesafe/jev-1.13.0` ($0.042 per million
+    input tokens, output free). `jev()` evaluations are priced by the model
+    id the API reports, only on TypeSafe's host; aliases, unlisted versions,
+    gateways and `from_backend` are unpriced, `local()` is $0; a response
+    that reports no usage is unpriced unless the handle is free. A
+    non-batching request that fails or times out partway records the usage
+    already billed. An unpriced handle keeps a cost the
+    backend reports itself. The price audit records the entry as absent
+    from models.dev (with a test that counts it). With the feature on,
+    `typesafe` override entries are no longer reported as inert.
+- **`Agent::with_decision_model(model)`** — advisory features only, which
+  never block, and which need skills or 40+ tools (otherwise nothing is
+  sent): a skill hint and a tool hint, each at most one note appended to the
+  request's latest user message — never the system prompt, never stored.
+  One decision request per user message (memoized across its tool-calling
+  turns), 2 s limit; any failure warns and adds nothing.
+  `with_decision_advisory(Advisory)` tunes it: `Advisory::new` and
+  `with_skill_hint`, `with_skill_need_threshold`,
+  `with_skill_confidence_threshold`, `with_tool_hint`,
+  `with_tool_hint_min_tools`, `with_max_tool_hints`,
+  `with_tool_hint_min_probability`, `with_timeout`.
+- **`Agent::with_tool_gate(ToolGate::new(model))`** — an explicit, blocking
+  opt-in: a `ToolMiddleware` that denies calls a decision model judges
+  destructive and not requested by the user, judged against the user's
+  request with the preceding exchange for short confirmations. Runs after
+  every other middleware and **fails closed** (errors, timeouts, malformed
+  answers, arguments too large to read, no user request). `ToolGate`
+  builders: `with_destructive_threshold`, `with_requested_threshold`,
+  `with_destructive_question`, `with_requested_question`, `with_check`,
+  `with_timeout`. Covers only its own agent. Defence in depth, not a
+  security boundary. `SubAgentTool` mirrors `with_decision_model`,
+  `with_decision_advisory` and `with_tool_gate`.
+- **`SessionStats::decision`** (`DecisionStats`: `requests`, `failures`,
+  `timeouts`, `usage`, `cost_usd`, `unpriced`; methods `is_empty`,
+  `is_unpriced`, `merge`) — decision-model spend of a run, including async
+  input filters and sub-agents; part of `total_cost_usd()`. Omitted from the
+  wire when empty.
+- **Hooks for policy engines** (no feature needed). `ToolCallRequest` and
+  `SessionStats` gain fields, but both are `#[non_exhaustive]`, so this is
+  not breaking; `AgentLoopConfig` gains no field.
+  - `ToolCallRequest::messages`, `ToolCallRequest::run_prompts` (the user
+    messages this run was given, which compaction cannot remove),
+    `latest_user_text()` and `user_request()` — middleware can see the
+    conversation. `user_request()` never looks back past a compaction
+    boundary or past the latest user message (even an image-only one); it
+    falls back to the run's prompts, then `None`. It includes the preceding
+    assistant text and earlier request only for a short reply to an
+    assistant question.
+  - `is_loop_injected(text)` (crate root) — whether a user-role text was
+    written by the loop or by compaction. It recognises
+    `llm_compaction::SUMMARY_MARKER`, `agent_loop::AGENT_STOPPED_PREFIX`,
+    `agent_loop::LOOP_ABORT_PREFIX` (all already public), and the
+    crate-private level-2 summary prefix, level-3 compaction marker and
+    loop-detection nudge.
+  - `AsyncInputFilter` (`filter`) and `Agent::with_async_input_filter` —
+    input filters that await, in the same ordered list as sync filters; a
+    panic is contained and rejects. `InputFilter` gains a provided
+    `as_async()` (default `None`); `AsyncFilter::new` puts an async filter
+    in `AgentLoopConfig::input_filters`.
+  - `TurnHook` and `Agent::with_turn_hook` — an async hook before every LLM
+    request that may append one transient note to the request's latest user
+    message. Raw loops wrap their provider with `provider::TurnHookProvider::new`.
+    `TurnContext` carries `run_prompts`; `TurnContext::new` /
+    `with_run_prompts` for tests; `TurnContext::latest_user_text` and
+    `user_request` as on `ToolCallRequest`.
+- **Decision models: any LLM with logprobs** (feature `decision`).
+  `DecisionModel::logprobs(base_url, model)`,
+  `DecisionModel::from_logprob_backend(LogprobBackend, model)` and
+  `LogprobBackend` (`new`, `with_api_key`, `with_retry`, `with_temperature`,
+  `with_max_choice_options`, `with_top_logprobs`, `with_min_label_mass`,
+  `with_thinking_disabled`, `with_extra_body`, `temperature`, `is_local`,
+  `endpoint_url`) turn any OpenAI-compatible `/chat/completions` server that
+  returns logprobs (llama.cpp `llama-server`, vLLM, SGLang, LM Studio, hosted
+  APIs) into a decision backend: one one-token completion per question
+  (`max_tokens: 1`, `temperature: 0`, `logprobs: true`,
+  `top_logprobs: max(configured K, label count)`, K = 20), labels `A`/`B`
+  (Noul), `A`.. (Choice, the options in order) and `0`–`9` (Score), read
+  from the first token's `top_logprobs`: tokens trimmed and case-folded,
+  duplicates summed; no label in the top K, or labels covering less than
+  half of the first-token probability (a thinking model's `<think>`, an
+  answer in words), is `BadResponse`; an absent label is bounded by the
+  smallest reported probability instead of 0. Thinking must be off
+  (`with_thinking_disabled` sends `chat_template_kwargs.enable_thinking =
+  false`, not by default). Calibration is approximate; the backend's
+  `with_temperature` rescales it. Choice up to 20 options by default (up to
+  26 when raised), Score up to 10 levels; Noul/Choice/Score only (a future
+  kind is `Unsupported`). One request per question: the backend reports
+  `batching: false` with 8 concurrent requests, so the questions of a
+  request run concurrently and the spend of completed ones is recorded even
+  when another fails or the call times out. No key unless set and no
+  environment variable read; local and $0 only on a loopback host, otherwise
+  unpriced until `with_cost`. `DecisionModel::with_api_key` and
+  `with_retry` also apply to logprob models.
+- **`Capabilities::max_concurrent_requests`** (`with_max_concurrent_requests`,
+  default 1) — for a non-batching backend, how many single-question
+  requests `DecisionModel` runs at once. The split path now stops starting
+  new questions after the first failure but awaits those in flight.
+- **Decision-model fallbacks.** `DecisionModel::or(fallback)` (chainable,
+  flattened in order; each member asks with its own model id) tries the next
+  model on any error a member returns, `Invalid` (e.g. a 422) included; each
+  member is validated against its own capabilities (a request invalid for
+  every member fails at once; one over a member's limits skips it unsent).
+  One overall budget (`with_timeout` of the chain, judged by the clock, not
+  the error kind) covers the chain; the gate's (5 s), input guard's (3 s)
+  and advisory's (2 s) limits replace it, as they do a single model's; and
+  `with_attempt_timeout` caps a member's attempt within it. Every attempt
+  sent is recorded in `SessionStats::decision`. `model()` /
+  `capabilities()` report the primary's; `fallback_models()` lists the
+  rest. New error variant `DecisionError::AllFailed { attempts }` with
+  `FallbackAttempt` (`model`, `error`, `was_sent`); it is retryable when any
+  member's error was (the enum is `#[non_exhaustive]`, so this is additive).
+  A request that cannot be built (a malformed base URL) is now `Invalid`,
+  not a retried `Transport` error, for the SystemOne and logprob backends.
+- **`DecisionModel::from_arc(Arc<dyn DecisionBackend>, model)`** — wrap a
+  shared or runtime-chosen backend.
+- **Calibration.** `decision::calibrate(model, examples)` and
+  `calibrate_with(model, examples, CalibrationOptions)` measure a model on
+  labelled `CalibrationExample`s (`noul`, `choice`, `score`, `new` with an
+  `Expected` of `Noul`/`Choice`/`Score`; getters `state`, `question`,
+  `expected`), evaluated with bounded concurrency
+  (`CalibrationOptions::new`, `with_concurrency` — default 4 —,
+  `with_target_precision`; getters `concurrency`, `target_precision`).
+  `CalibrationReport`: `count`, `accuracy` / `brier` / `ece` (`Option`,
+  `None` when nothing was evaluated; ECE over 10 bins with the
+  `ReliabilityBin`s), Noul `best_f1` and `precision_threshold` as
+  `ThresholdPoint`s, a `suggested_temperature` (grid search minimising NLL;
+  approximate for logprob models), `models` per answering model with
+  `mixed_models()`, and the `errors` (`CalibrationError`: `index`, `error`)
+  and `skipped` examples — counted, never fatal. Its `Display` is for
+  people, not a stable format.
+- **`Agent::with_input_guard(InputGuard::new(model))`** — an explicit,
+  blocking opt-in built on `AsyncInputFilter`: one batched request of
+  Nouls per prompt (default checks `injection` and `harmful`, each
+  rejecting at `p >= 0.8`; they may change in minor releases — pin them
+  with `without_default_checks` + `with_check`); a hit rejects the input
+  with a reason naming the check. The whole input is sent; input over
+  32,000 characters (`with_max_input_chars`) is not sent. **Fails closed**
+  (error, timeout — 3 s by default —, missing answer, or input over the
+  limit rejects); `with_fail_open()` opts out. Builders `with_check` (a
+  built-in id replaces that check), `without_default_checks` (independent
+  of call order), `with_threshold` (panics on an unknown id or a value
+  outside `[0, 1]`), `with_timeout`, `with_max_input_chars`; `check_ids()`.
+  `with_input_guard` panics on a guard with no checks. Input with no text
+  (image-only) passes unscreened; steering and follow-up messages are not
+  screened (input filters see prompts only). `SubAgentTool::with_input_guard`
+  screens a sub-agent's task.
+- **Hook builders** (no feature needed). `ToolCallRequest::new(tool_call_id,
+  tool_name, args)` with `with_messages` and `with_run_prompts`, to
+  unit-test middleware — `ToolGate` included — outside the crate.
+  `ToolCallRequest::user_request_parts()` and
+  `TurnContext::user_request_parts()` return `UserRequestParts` (`latest`,
+  `reply: Option<ReplyContext { question, earlier_request }>`,
+  `source: UserRequestSource` — `Conversation` / `RunPrompts` —, and
+  `run_prompts`; all `#[non_exhaustive]`), the same selection as
+  `user_request()`, whose prose is now documented as not a stable format.
+- **`SubAgentTool::with_turn_hook` and `SubAgentTool::with_async_input_filter`**,
+  mirroring `Agent`. A sub-agent task rejected by an input filter fails the
+  tool call with the reason instead of running.
+
+## 0.20.0
+
+This release is 0.20.0: two constructor behaviours change (see Breaking).
+
+### Breaking
+
+- **`ModelConfig::meta` returns `None` for an id the price table does not
+  list.** It used to price every id at Muse Spark 1.1/1.2's standard rates,
+  so `meta("muse-spark-1.2-contributor", ..)` overstated the contributor
+  tier by 12x–75x. `muse-spark-1.1` and `muse-spark-1.2` keep their rates.
+  *Migration:* for any other Meta id, set `config.cost` yourself, or add the
+  id to a user override (`YOAGENT_PRICES` or
+  `prices::global::install_override`) and build the config afterwards.
+- **Generic first-party constructors return `Some` for a listed id.**
+  `anthropic`, `openai`, `openai_responses`, `google`, `xai`, `groq`,
+  `deepseek`, `mistral`, `zai`, `minimax`, `qwen` and `meta` look
+  `(provider, id)` up in the price table:
+  `ModelConfig::anthropic("claude-sonnet-5", ..)` now carries
+  `claude_sonnet_5()`'s rates instead of `None`, so
+  `session_cost_usd()` and the telemetry `cost_usd` field report a number
+  where they reported nothing. An id the table does not list is still
+  `None`. Gateways and custom endpoints (`custom`, `openai_compat`, `local`,
+  `ollama`, `opencode_zen` / `opencode_go`, `mock`) stay `None` — their bill
+  is not the vendor's list price. This replaces 0.19's "generic
+  constructors are unpriced" rule.
+  *Migration:* code that relied on `cost.is_none()` for a generic
+  constructor should check the id against `PriceTable::builtin()` instead,
+  or set `config.cost = None` after construction to keep a model unpriced.
+
+### Added
+
+- **Prices are data: `src/provider/prices.json` and `PriceTable`.** Every
+  rate, tier and caveat that was an `f64` literal in a `ModelConfig`
+  constructor now lives in one JSON file (schema 1, keyed by provider then
+  model id, with `source`, `verified` and `note` per entry), embedded with
+  `include_str!`. Every preset's resulting `CostConfig` is bit-for-bit what
+  0.19.0 shipped; a new test pins each one.
+  - `PriceTable` (plain data) offers `builtin()`, `from_json_str` /
+    `from_path`, `layered(&over)` (per-model replacement), `cost`, `entry`,
+    `iter`, `len`, `insert`, `changes_from` and `to_json`.
+  - Every entry is validated through `PriceTable::insert` and the public
+    `PriceEntry::validate`: non-empty ids, finite non-negative rates,
+    strictly ascending tier thresholds above 0, a `YYYY-MM-DD` `verified`
+    date, and a `cache_write_at_input` flag the rates agree with.
+    `PriceEntry` has `new` and `with_*` builders, including
+    `with_absent_upstream`.
+  - `PriceError` is `Clone` and `#[non_exhaustive]`, as is each struct
+    variant. `Json`, `Io` and `Http` errors name the file or URL. Transport
+    errors are kept as an opaque source, so no HTTP client type is part of
+    the API.
+  - Unknown fields: data people maintain by hand (`from_json_str`,
+    `from_path`, `YOAGENT_PRICES`, `PriceSource::Url`) is strict — an
+    unknown field is `PriceError::UnknownField`, a typo or data for a newer
+    yoagent. This crate's published file (`PriceSource::YoagentMain`) and
+    caches are lenient: unknown fields are ignored, logged at `warn` and
+    returned to the caller.
+  - The format contract: a field that changes billing bumps `schema`; a
+    metadata-only field does not. A test pins the field set to
+    `PRICE_SCHEMA_VERSION`.
+  - `CostConfig` and `ContextTier` now derive `PartialEq`.
+- **Runtime price overrides, in `provider::prices::global`.** Constructors
+  read a process-wide table: a user layer over an opt-in fetched layer over
+  the built-in data, each replacing whole entries per `(provider, id)`.
+  - `install_override(table) -> OverrideReport` installs the user layer
+    under one lock. The report (`#[must_use]`) lists the models it changed
+    (`changes`, excluding entries no constructor reads), the models that
+    revert because a previous user layer listed them (`reverted`), entries
+    for providers outside `PRICED_PROVIDERS` (`inert`), and `warnings`. It
+    warns about inert entries, entries that drop the replaced entry's
+    context tiers, cache rates left unset where the replaced entry set
+    them, and replacing an existing user layer (including one from
+    `YOAGENT_PRICES`). `clear_override()` removes the layer; `resolved()`
+    snapshots the table.
+  - `YOAGENT_PRICES=/path/to/prices.json` seeds the user layer, read once on
+    first use; unset or empty means no file. A bad file is logged with
+    `tracing::warn!` and ignored, never a panic.
+    `env_override_status() -> EnvOverride` reports `Unset`,
+    `Loaded { path, entries, warnings }` or `Rejected { path, error }`, and
+    `load_env_override()` reads the file strictly on demand, so a host can
+    fail fast. The crate's unit tests never read the variable, and the test
+    suite passes with it set.
+  - Constructors resolve when they run: install prices before building
+    configs, or re-price afterwards (below). A `cost` set on a config wins
+    over every process-wide layer — but `reprice()` and `with_prices()`
+    overwrite it.
+- **Re-pricing.** `ModelConfig::reprice()` repeats a first-party
+  constructor's lookup against the current table, and may set `None` when
+  the model is no longer listed. It applies only to a config a pricing
+  constructor built whose `provider` is still in `PRICED_PROVIDERS` (a
+  private, unserialized marker records the first); anything else is
+  returned unchanged. `Agent::reprice()` and `SubAgentTool::reprice()` do
+  the same for the config they hold. `ModelConfig::with_prices(&table)`
+  re-resolves from a table you hold, without global state: listed models
+  get the table's rates, unlisted ones keep theirs (it never clears a
+  price), and it applies to gateways and custom endpoints too.
+- **Opt-in live price sources.** Nothing is ever fetched implicitly.
+  - `PriceTable::fetch(&source)` and `fetch_with(&source, FetchOptions) ->
+    FetchReport { table, skipped, ignored_fields }` read models.dev
+    (`ModelsDev`, `ModelsDevAt(url)` — mapped into this crate's schema,
+    tiers from `tiers` or `context_over_200k`, provider keys `alibaba` and
+    `opencode` renamed to `qwen` and `opencode-zen`), this crate's checked
+    `prices.json` on GitHub `main` (`YoagentMain`, so a merged price fix
+    reaches users without a release), or a URL in this crate's format
+    (`Url`). `FetchOptions` sets the timeout (default 10 s).
+  - A models.dev model the mapping cannot express is skipped, never
+    approximated, and reported as a `SkippedModel` with the reason
+    (`from_models_dev_json_report` does the same offline). A skipped model
+    the built-in data lists is named in a `warn` log.
+  - `global::install_fetched(table)` installs the fetched layer, above the
+    built-in data and below the user layer; `install_fetched_with(table,
+    InstallPolicy::AddOnly)` instead merges in only models no lower layer
+    lists. Both are `#[must_use]` and return the `PriceChange`s against the
+    previous built-in-plus-fetched table, so reverts show up, marking
+    changes the user layer overrides as `shadowed`. Replacing a non-empty
+    fetched layer is logged at `warn`. Separately, the built-in models the
+    new layer prices differently are logged at `warn` — the first five, and
+    a count of the rest; `changes_from` computes the full list without
+    installing.
+  - `PriceTable::fetch_cached(&source, path, CacheOptions) -> CachedPrices`
+    caches to a file you choose (defaults: refetch after a day, accept a
+    stale cache up to a week old, 10 s timeout). The cache records its
+    source URL; a cache of another source is a miss. `PriceOrigin` carries
+    what fits each origin: `Fetched { cache_write_error }`,
+    `Cache { age }`, `StaleCache { age, fetch_error }` or
+    `Builtin { fetch_error }`. `CachedPrices` also returns the skip list,
+    ignored fields, and any `CacheProblem` (an unreadable or invalid cache,
+    or a source mismatch), each also logged. A cache whose age is unknown (a
+    future modification time) is never fresh, and is a stale fallback only
+    when `max_stale` is `Duration::MAX`.
+
+  Precedence for what constructors set, highest first: user override >
+  fetched > built-in.
+- **`tests/price_audit.rs` audits every `prices.json` entry**, not a
+  hand-kept preset list, so an entry cannot be added unaudited. Its
+  allowances are now data (`cache_write_at_input`, `absent_upstream`), and
+  its comparison logic also runs offline in CI against a checked-in slice of
+  models.dev.
+
+## 0.19.0
+
+### Breaking
+
+- **`ThinkingLevel` gains `XHigh` and `Max`, and is now `#[non_exhaustive]`**
+  ([#171](https://github.com/yologdev/yoagent/issues/171)). `High` was the top
+  of the enum, so Anthropic's `xhigh` (Anthropic's recommended setting for
+  coding and agentic work on current models) and `max`, and DeepSeek's `max`,
+  could not be requested at all. Setting the highest level the type offered
+  read as "maximum reasoning" and was not. The ceiling was invisible.
+
+  Each provider now maps the new levels to its own ladder, and where the ladder
+  is shorter it **clamps** to the highest value this crate knows it accepts
+  instead of sending a value it would reject (Anthropic's adaptive effort
+  excepted, see below). The full table is on `ThinkingLevel`'s doc comment:
+
+  | Level | Anthropic effort | Anthropic legacy / Bedrock budget | OpenAI-compat¹ / Responses / Azure | DeepSeek² | Gemini / Vertex 2.x budget (3.x: `thinkingLevel`, see Fixed) |
+  |-------|------|------|------|------|------|
+  | `XHigh` | `xhigh` | 16,384 | `xhigh`, or `high` (clamped) below an `XHigh` ceiling³ | `high` (clamped) | 24,576 (clamped) |
+  | `Max` | `max` | 30,720 | the model's ceiling: `max`, `xhigh` or `high`³ | `max` | 24,576 (clamped) |
+
+  ¹ When `supports_reasoning_effort` is set. ² When both
+  `supports_thinking_control` and `supports_reasoning_effort` are set.
+  DeepSeek maps a requested `xhigh` to `high` itself, so `XHigh` is sent as
+  `high`; only `Max` selects DeepSeek's `max` rung. ³ The ceiling is declared
+  per model with `OpenAiCompat::max_reasoning_effort` (default `high`); see
+  Fixed, [#176](https://github.com/yologdev/yoagent/issues/176).
+
+  Adding the variants did not change what any existing level sends. (Other
+  entries below do, among them: xAI now receives an effort; Gemini 3 gets
+  `thinkingLevel`; `claude_haiku_4_5()` and OpenCode Claude ids before 4.6
+  send budget rather than adaptive thinking; and structured calls on the
+  Claude presets keep their thinking.) The new serde names are `"xhigh"` and `"max"`
+  (lowercase, like the others). Persisted configs keep loading because the
+  existing names are unchanged.
+
+  Anthropic effort is passed through, not clamped: Opus 4.6 / Sonnet 4.6 have
+  no `xhigh` rung (it arrived with Opus 4.7) and will reject it. The crate has
+  no per-model effort table.
+
+  **Migration:** an exhaustive `match` on `ThinkingLevel` outside this crate no
+  longer compiles. Add arms for `XHigh` and `Max`, or a wildcard arm. The
+  wildcard is required from now on (`#[non_exhaustive]`), so the next rung a
+  vendor adds is not another breaking change. Code that only constructs or
+  compares levels is unaffected.
+
+- **`ModelConfig::cost` is now `Option<CostConfig>`; `None` means
+  pricing unknown** ([#172](https://github.com/yologdev/yoagent/issues/172)).
+  Sixteen public constructors — `custom`, the generic `anthropic`, `openai`,
+  `local`, `opencode_zen`, `opencode_go`, `openai_compat`, `ollama`, `zai`,
+  `minimax`, `qwen`, `xai`, `groq`, `deepseek`, `mistral` and `google` — plus
+  `mock()`, which delegates to `custom`, shipped `CostConfig::default()`, whose
+  rates are all `0.0`. A consumer reading `config.cost` for DeepSeek got a
+  number indistinguishable from a free model; "do you know this price?" could
+  only be answered by knowing to call `is_configured()`. So consumers kept
+  parallel price tables, outside the models.dev audit, and those rotted: yoyo
+  overstated every `deepseek-v4-flash` cost ~3.7x. Those seventeen now return
+  `None`, as does the new `openai_responses` constructor. The twelve priced
+  presets return `Some`: `claude_fable_5_1`, `claude_fable_5`,
+  `claude_opus_5_5`, `claude_opus_5`, `claude_opus_4_8`, `claude_sonnet_5`,
+  `claude_haiku_4_5`, `gpt_5_5`, `gpt_6_astra`, `gpt_6_sol`, `gpt_6_luna` and
+  `meta` — every one in the price audit (`tests/price_audit.rs`, which now
+  requires at least 12). The generic constructors gained no prices: each one
+  added later should land with a price-audit entry.
+
+  In memory, `Some` with every rate zero now means **free** (a local model, a
+  free tier): `session_cost_usd()`, `SessionStats::cost_usd`, the `llm_stream`
+  span's `cost_usd` and `LlmCompaction`'s summary cost all report `0.0` for it,
+  and are absent only for `cost: None`. Before, the crate's accounting treated
+  an all-zero config as unknown, so a free model could not be expressed.
+
+  Serde: a missing or `null` `cost` is `None`, and `None` is omitted on
+  serialize, so older releases still load the output. A persisted `cost`
+  object with **every rate zero** — what every unpriced preset wrote before
+  this release — deserializes to `None`, because reading it as free would
+  report $0 for models that bill. The cost of that: **a free config saved by
+  this release also reloads as `None` (unknown)**, since the two encodings are
+  identical on disk. Reapply `Some(CostConfig::new(0.0, 0.0))` after loading if
+  you persist one. Any non-zero rate, including one only in a context tier,
+  loads as `Some` unchanged.
+
+  Migration:
+
+  ```rust
+  // before                                   // after
+  config.cost.input_per_million = 1.80;       config.cost.get_or_insert_with(CostConfig::default).input_per_million = 1.80;
+  config.cost = CostConfig::new(0.15, 0.60);  config.cost = Some(CostConfig::new(0.15, 0.60));
+  config.cost.cost_usd(&usage)                config.cost.as_ref().map(|c| c.cost_usd(&usage))
+  if config.cost.is_configured() { .. }       if let Some(c) = &config.cost { .. }
+  ```
+
+  Do **not** migrate the first row to `if let Some(c) = config.cost.as_mut()`:
+  every generic constructor now returns `None`, so on DeepSeek, `custom`,
+  `openai` and the rest the assignment silently never runs. On a named preset,
+  `get_or_insert_with` edits the existing rates; on a generic constructor it
+  starts from all-zero — output then bills at $0 and cache tokens at the input
+  rate (see Changed) — so set every rate you are billed for, or build the
+  whole thing with `Some(CostConfig::new(..))`. The last row changes meaning
+  for an all-zero config built in memory, which is now free rather than
+  unknown.
+
+- **`AnthropicCompat` is now `#[non_exhaustive]` and gains
+  `native_structured_output`** ([#175](https://github.com/yologdev/yoagent/issues/175)).
+  A struct literal no longer compiles outside the crate, the same rule as
+  `OpenAiCompat`: start from `AnthropicCompat::default()`,
+  `AnthropicCompat::legacy()` or `AnthropicCompat::for_claude_id(id)` and set
+  fields, or chain `with_native_structured_output(..)` /
+  `with_bearer_auth(..)`. Serde is unchanged: a persisted config without the
+  new key loads with it off.
+
+  ```rust
+  // before
+  AnthropicCompat { adaptive_thinking: true, bearer_auth: true }
+  // after
+  AnthropicCompat::default().with_bearer_auth(true)
+  ```
+
+- **`prompt_structured` on the `claude_*` presets uses Anthropic's native JSON
+  outputs** instead of a forced tool call
+  ([#175](https://github.com/yologdev/yoagent/issues/175)). Every Claude preset
+  (`claude_fable_5`, `claude_fable_5_1`, `claude_opus_5_5`, `claude_opus_5`,
+  `claude_opus_4_8`, `claude_sonnet_5`, `claude_haiku_4_5`) now sets
+  `anthropic: Some(..)` with `native_structured_output` on, and so do
+  `opencode_zen("claude-…")` ids from Claude 4.5 on (see Fixed); each of those
+  models is on Anthropic's supported list for `output_config.format`. What
+  changes for a structured call on those configs:
+  - the schema goes out as `output_config.format`, not as a synthetic tool
+    plus `tool_choice`;
+  - thinking is no longer dropped for that request (a set `ThinkingLevel`
+    keeps its thinking alongside the format — an `effort`, or a
+    `budget_tokens` budget on `claude_haiku_4_5()`), so the call can cost more
+    output tokens;
+  - tool choice stays `auto`, so the model may call regular tools before
+    answering;
+  - the API compiles the schema into a grammar and rejects features the tool
+    path tolerated: objects need `"additionalProperties": false`, and numeric
+    and length constraints (`minimum`, `maxLength`, …) are unsupported. A
+    schema that worked before can now fail as `StructuredPromptError::Provider`
+    with a 400.
+
+  **Migration:** add `"additionalProperties": false` to every object in the
+  schema and drop numeric/length constraints (validate those after parsing),
+  or turn the flag off to keep tool-forcing:
+  `config.anthropic = Some(AnthropicCompat::default())` (or `legacy()` for a
+  pre-4.6 model). Fable 5.1 and Opus 5.5 reject forced `tool_choice`, so on
+  those the flag must stay on.
+
+  `ModelConfig::anthropic(id, name)` and `AnthropicCompat::default()` leave the
+  flag off, and with it off the request body is byte-identical to before.
+
+### Added
+
+- **GPT-6 presets: `ModelConfig::gpt_6_astra()`, `gpt_6_sol()`,
+  `gpt_6_luna()`** ([#176](https://github.com/yologdev/yoagent/issues/176)).
+  There is no bare `gpt-6` id. All three use the **Responses API**
+  (`openai_responses`): OpenAI's Chat Completions "does not support function
+  calling with GPT-6 Astra", and on Sol/Luna allows it "only with
+  reasoning_effort set to none", so an agent with tools needs Responses.
+  1,050,000-token context, 64K of 128K max output, effort ceiling `max`
+  (`ReasoningEffortCeiling::Max`). `ThinkingLevel::Off` omits the effort, so
+  the model runs at its default; the crate never sends `none` (Astra rejects
+  it with a 400). `temperature` is rejected while the effort is not `none` —
+  leave it unset. The Responses provider does not enforce `prompt_structured`
+  schemas (it warns and ignores them), so structured outputs are not
+  guaranteed on these presets. Priced per 1M tokens, with a 272K context tier
+  (the whole request moves to the long rates):
+
+  | Preset | Input | Cached | Cache write | Output | >272K in / cached / write / out |
+  |--------|------:|------:|------:|------:|------|
+  | `gpt_6_astra` | $10 | $1 | $12.50 | $50 | $20 / $2 / $25 / $75 |
+  | `gpt_6_sol` | $2 | $0.20 | $2.50 | $10 | $4 / $0.40 / $5 / $15 |
+  | `gpt_6_luna` | $0.10 | $0.01 | $0.125 | $0.50 | $0.20 / $0.02 / $0.25 / $0.75 |
+
+  Read from the raw markup of OpenAI's pricing and model pages on 2026-09-25;
+  added to the price audit, which now compares context tiers field by field.
+
+- **`OpenAiCompat::max_reasoning_effort` (`ReasoningEffortCeiling`)** — see
+  Fixed ([#176](https://github.com/yologdev/yoagent/issues/176)).
+
+- **`ModelConfig::openai_responses(id, name)`**
+  ([#178](https://github.com/yologdev/yoagent/issues/178)). `ModelConfig::openai()`
+  targets Chat Completions, and there was no first-party constructor for
+  OpenAI's Responses API. The new one sets `ApiProtocol::OpenAiResponses`,
+  `https://api.openai.com/v1`, provider `openai` (key from `OPENAI_API_KEY`),
+  `reasoning: true` and `cost: None`; `Agent::from_config` resolves it to
+  `OpenAiResponsesProvider`.
+
+- **`ModelConfig::claude_fable_5_1()`**
+  ([#170](https://github.com/yologdev/yoagent/issues/170)). 1M context, 64K of
+  128K max output, $10 / $50 per MTok input/output, $12.50 5-minute cache
+  writes, and **$0.25 cache hits** — 0.025x input, against 0.1x ($1.00) on
+  Fable 5. That is the only rate that differs, and it is the one that dominates
+  an agent loop's bill: a consumer mapping `claude-fable-5-1` onto
+  `claude_fable_5()` by prefix, which is the natural thing to do with no 5.1
+  preset, reported cache reads 4x high. Rates read from the raw markup of
+  Anthropic's pricing page on 2026-09-24; added to the price audit.
+
+  Fable 5.1 rejects forced `tool_choice` (`any`/`tool`) with a 400. The preset
+  sets `native_structured_output`, so `prompt_structured` works on it (see
+  Fixed, [#175](https://github.com/yologdev/yoagent/issues/175)).
+
+- **`ModelConfig::claude_opus_5_5()`**
+  ([#175](https://github.com/yologdev/yoagent/issues/175)). 1M context, 64K of
+  128K max output, $4 / $20 per MTok input/output, $5 5-minute cache writes,
+  and **$0.20 cache hits** (0.05x input, not the usual 0.1x). The 1-hour write
+  rate ($8) is not modelled, since the crate only places 5-minute breakpoints.
+  Rates read from the raw markup of Anthropic's pricing page on 2026-09-25 and
+  matched against models.dev; added to the price audit,
+  `llm_compaction_live`'s id map and `release_smoke` (`SMOKE_MODEL=opus55`).
+
+  Not a drop-in for Opus 5. Thinking is always on: `ThinkingLevel::Off` omits
+  the field, and the model still thinks at its default effort, `medium`. The
+  API rejects forced `tool_choice` (the preset uses native structured outputs,
+  so `prompt_structured` works), and rejects non-default `temperature`/`top_p`/
+  `top_k`. Thinking blocks are bound to the model and the conversation prefix.
+
+- **`AnthropicCompat::native_structured_output`** and
+  `AnthropicCompat::with_native_structured_output` (see Breaking).
+
+- **`AnthropicCompat::for_claude_id(id)`** infers compat flags from a Claude
+  model id: budget thinking (`legacy()`) before Claude 4.6, adaptive from 4.6,
+  and `native_structured_output` from 4.5; an id with no recognizable version
+  is treated as current generation. A version token is read by its leading
+  digits, so suffixed ids (`claude-opus-4-6[1m]`,
+  `claude-sonnet-4-5@20250929`, `claude-opus-4-6-v1:0`) keep their minor
+  version; an 8-digit date is never a minor. **`AnthropicCompat::with_bearer_auth(on)`**
+  sets `bearer_auth` without a struct literal.
+
+- **`ModelConfig::google: Option<GoogleCompat>`** with
+  `GoogleCompat::force_thinking_level()` / `force_thinking_budget()`, to
+  override which Gemini thinking field is sent (see Fixed, Gemini 3).
+
+- **`MockResponse::ToolCallsWithUsage` and `MockResponse::ErrorWithUsage`**, so
+  tests can bill a tool-calling turn and a mid-stream failure.
+
+### Changed
+
+- **`MockProvider` panics on a transcript a real provider would reject**
+  ([#160](https://github.com/yologdev/yoagent/pull/160)). It used to accept
+  any message sequence, so a test could pass on a history — an orphan tool
+  call, a tool result with no matching call — that every real provider
+  returns a 400 for. It now panics with the offending messages.
+  **Migration:** a test that builds a malformed history on purpose should
+  use `MockProvider::without_transcript_validation()` (added) and say why at
+  the call site.
+
+- **Behaviour change: a cache rate left at `0.0` bills at the input rate.**
+  `CostConfig::cost_usd` used to bill cache-read / cache-write tokens at a
+  zero rate as free, so a forgotten cache rate silently under-reported. A zero
+  `cache_read_per_million` / `cache_write_per_million` now means "not
+  separately priced" and bills at the applicable input rate: the base
+  `input_per_million`, or inside a `ContextTier` that tier's own input rate
+  (never the base cache rate). A vendor with no cache-write charge is now
+  priced correctly without setting one. A fully zero config still costs $0,
+  so "free" keeps working. `tests/price_audit.rs` accepts a crate cache-write
+  rate that models.dev omits only while it equals the band's input rate.
+
+  **Migration:** a config that set a cache rate to `0.0` to mean "these tokens
+  are free" while charging for input now reports a higher cost. Zero can no
+  longer express that; set a tiny positive rate (e.g. `with_cache_read(1e-9)`)
+  if a vendor genuinely charges nothing for cache hits. Configs that leave
+  cache rates unset on a vendor that does charge for them now report closer
+  to the real bill, but should still set the real rate.
+
+- **`gpt_5_5()` and `meta()` state their cache-write rate explicitly** as the
+  input rate ($5, and $10 above 272K, for GPT-5.5; $1.25 for Muse Spark):
+  neither vendor charges extra for cache writes. Under the old zero-is-free
+  rule those tokens billed at $0.
+
+- **`ModelConfig::gpt_5_5()` bills the long-context band.** OpenAI's gpt-5.5
+  model page: "prompts with >272K input tokens are priced at 2x input and 1.5x
+  output for the full session". The preset was flat at $5/$30 and now carries a
+  `ContextTier` above 272,000 prompt tokens at $10 input / $45 output, so a
+  long-context request is no longer under-billed by half on input. The
+  long-band **cached-input rate, $1.00, is unverified**: the page names input
+  and output only, and the pricing page no longer lists gpt-5.5. It matches
+  models.dev and the 2x the GPT-6 pages state for cache rates; the literal
+  reading would keep $0.50. It is set rather than left out because an unset
+  tier cache rate bills at the tier's input rate ($10). The old "deliberately
+  flat" rationale — no gpt-5.5 row in the pricing page's long-context table —
+  is superseded by the model page.
+
+- **A clamped reasoning effort is logged.** When `XHigh` / `Max` is sent lower
+  than requested because of the model's `max_reasoning_effort` (`XHigh` →
+  `high`, `Max` → `high` or `xhigh`), the Chat Completions, Responses and
+  Azure providers log one `tracing::warn!` per distinct clamp per model id per
+  process, naming the model, instead of downgrading silently.
+
+- **`SessionStats::cost_usd` is now sticky-`None` once a turn cannot be
+  priced**, the same rule as `SubAgentSpend::merge`. Previously an unpriced
+  turn followed by a priced one produced a partial sum that read as the whole
+  cost. Only reachable when rates change mid-run, which the built-in loop does
+  not do today.
+
+- **`ModelConfig::minimax` now points at `https://api.minimax.io/v1`**
+  instead of `https://api.minimaxi.chat/v1`. MiniMax's OpenAI-compatible API
+  reference names `api.minimax.io/v1` as the base URL. Configs that override
+  `base_url` are unaffected; set it back to the old host if your key is tied to
+  it.
+
+- **Examples no longer default to retired model ids.** `release_smoke`
+  (`gemini-3-pro` → `gemini-3.1-pro-preview`, `deepseek-chat` →
+  `deepseek-flash`), `long_horizon` (`deepseek-chat` → `deepseek-flash`), `rlm`
+  (`grok-4-1-fast-reasoning` → `grok-4.7`) and the `cli` per-provider defaults
+  (xAI `grok-4.7`, Groq `openai/gpt-oss-120b`, DeepSeek `deepseek-flash`,
+  MiniMax `MiniMax-M3`, Google `gemini-3.8-flash`). `llm_compaction_live`
+  prices `deepseek-flash` and corrects the Flash peak rates to $0.30 / $1.20 /
+  $0.006 cache hit per million.
+
+### Fixed
+
+- **Truncated tool arguments no longer run the tool on `{}`**
+  ([#167](https://github.com/yologdev/yoagent/issues/167)). When a response hit
+  its output token limit mid-`arguments`, `openai_compat.rs` (OpenAI, Groq,
+  Together, DeepSeek, Fireworks, Mistral, xAI, …) fell back to an empty object
+  and warned, so `delete_files({"paths":` became `delete_files({})` — the tool
+  ran on its own defaults and the model saw a plausible result.
+  `openai_responses.rs` and `azure_openai.rs` did the same without even the
+  warning.
+
+  A **non-empty** argument buffer that does not parse is now kept as
+  `{"__partial_json": "<raw text>"}` (`provider::parse_tool_arguments`), and
+  `execute_single_tool` — the choke point every execution strategy shares —
+  answers such a call with an error tool result instead of running it. When
+  the text ended early, the arguments "were cut off before they were complete
+  (the response likely hit the output token limit)… The tool was not run. Do
+  not resend the same call unchanged — make the arguments smaller"; it is
+  deliberately *not* told to retry, since the same call would be cut off at the
+  same point again. Complete but malformed JSON (a trailing comma, two objects
+  run together) is answered "not valid JSON… Send the arguments as a single
+  valid JSON object" instead. Either way the loop continues so the model can
+  adapt. The check runs before middleware, so
+  `ToolMiddleware` never sees such a call. `provider::unparsed_tool_arguments`
+  recognizes the marker.
+
+  **Valid JSON that is not an object** is refused the same way. `null`
+  resolves to `{}` like an empty buffer; a string, number, array or boolean is
+  marked, and the error says the arguments "were not a JSON object (got a
+  string)". The motivating case is double-encoded arguments,
+  `"{\"path\":\"src\"}"`, which parsed to a JSON string — `list_files` then
+  read `path` as missing and silently listed `.`.
+
+  An **empty** buffer is unchanged: a zero-argument tool streams `""`, which
+  still resolves to `{}` and runs. That distinction is what the Anthropic
+  provider once got wrong, and both cases are now pinned together in one loop
+  test.
+
+  **`StopReason::Length` is no longer overwritten.** These three providers
+  relabelled any turn that carried a tool call as `ToolUse`, hiding a
+  `finish_reason: "length"` / `response.incomplete` — the very turns that
+  produce cut-off arguments. Such a turn now reports `Length`; the loop still
+  extracts and answers its tool calls (it only stops early on `Error` and
+  `Aborted`).
+
+  The marker key is the one the Anthropic provider already used as its
+  streaming accumulator, now a shared `UNPARSED_ARGUMENTS_KEY` constant.
+  Anthropic's behaviour is **unchanged** — it still fails the turn when an
+  accumulator is left unparsed — but the loop's guard now backs it up.
+
+  Google and Vertex receive arguments as already-parsed JSON objects, so they
+  have no unparseable-buffer case and are unchanged. Bedrock is also unchanged
+  here: its stream parsing needs a larger fix, tracked in
+  [#174](https://github.com/yologdev/yoagent/issues/174).
+
+- **`ThinkingLevel::XHigh` / `Max` no longer clamp to `high` on OpenAI models
+  that accept more** ([#176](https://github.com/yologdev/yoagent/issues/176)).
+  The clamp was there because nothing recorded which models take `xhigh`; now
+  a model declares it. `OpenAiCompat::max_reasoning_effort` is a
+  `ReasoningEffortCeiling` (`High` / `XHigh` / `Max`, `#[non_exhaustive]`,
+  serde default `High`): `XHigh` sends `xhigh` when the ceiling is at least
+  `XHigh`; `Max` sends `max`, `xhigh` or `high` — whatever the ceiling is. It
+  is a declared capability, never inferred from the model id. Honoured by
+  Chat Completions **and** by the Responses and Azure providers, which until
+  now ignored `ModelConfig::compat` entirely; they read this one field from
+  it and nothing else, so a Responses config opts in the same way a Chat
+  Completions one does. Per OpenAI and Azure: `max` exists on GPT-5.6 and
+  GPT-6; `xhigh` on GPT-6, GPT-5.6, GPT-5.5, GPT-5.4 (and gpt-5.2,
+  gpt-5.1-codex-max); gpt-5 and gpt-5.1 top out at `high`.
+
+  | Preset | Ceiling | `XHigh` → | `Max` → |
+  |--------|---------|-----------|---------|
+  | `gpt_6_astra`, `gpt_6_sol`, `gpt_6_luna` | `Max` | `xhigh` | `max` |
+  | `gpt_5_5` | `XHigh` | `xhigh` | `xhigh` |
+  | `OpenAiCompat::xai()` | `XHigh` | `xhigh` | `xhigh` |
+  | everything else | `High` | `high` | `high` |
+
+  `ThinkingLevel::Off` still omits the effort on every model — the model runs
+  at its default (`medium` on OpenAI reasoning models), not without
+  reasoning. The crate never sends OpenAI's `none` rung, which several models
+  (GPT-6 Astra, gpt-5, the o-series) reject with a 400. (A
+  `supports_effort_none` flag existed briefly during development and was
+  removed before release; a persisted `OpenAiCompat` carrying that key still
+  loads and the key is ignored.)
+
+  xAI gets `XHigh` on every Grok model: xAI documents that models without
+  `xhigh` treat it as `high` rather than rejecting it. DeepSeek's
+  `low`/`high`/`max` ladder (`supports_thinking_control`) is unchanged and
+  does not read the new field. Every other existing preset sends
+  byte-identical bodies (whole-body tests across all levels); persisted
+  `OpenAiCompat` values without the field load with the old behaviour.
+
+- **xAI (Grok) now receives `ThinkingLevel`.** `OpenAiCompat::xai()` did not
+  set `supports_reasoning_effort`, so every level was silently dropped and Grok
+  always ran at its default. It now sends `reasoning_effort` like other
+  OpenAI-compat providers: `Minimal`/`Low` → `low`, `Medium` → `medium`,
+  `High` → `high`, `XHigh`/`Max` → `xhigh` (ceiling `XHigh`, above; grok-4.6
+  and later accept `xhigh`, and earlier models treat it as `high`). xAI
+  reasoning cannot be disabled, so `Off` still sends nothing and leaves the
+  model at its default (`high`), not "no reasoning"
+  ([xAI reasoning guide](https://docs.x.ai/developers/model-capabilities/text/reasoning)).
+
+- **Gemini 3 gets `thinkingLevel`, not a token budget.** Both Gemini
+  providers sent `thinkingConfig.thinkingBudget` for every model. Google's
+  REST reference says `thinkingLevel` is "Recommended for Gemini 3 or later
+  models", and its guide warns that a budget on Gemini 3 Pro "may result in
+  unexpected performance". For Gemini 3 and later, `GoogleProvider` and
+  `GoogleVertexProvider` now send `thinkingLevel` (`Minimal` → `MINIMAL`,
+  `Low` → `LOW`, `Medium` → `MEDIUM`, `High`/`XHigh`/`Max` → `HIGH`) and never
+  a budget alongside it, which Gemini rejects. `Minimal` is clamped to `LOW`
+  on models without a `MINIMAL` rung (3.7 / 3.8 Flash reject it with an error;
+  3.x Pro and unlisted models are treated the same way).
+
+  Image models take only the levels Google's Vertex thinking table lists:
+  3.1 Flash Image / 3.1 Flash-Lite Image accept `MINIMAL` and `HIGH`
+  (`Minimal`/`Low` → `MINIMAL`, `Medium` and up → `HIGH`); 3 Pro Image
+  accepts `HIGH` only. Gemini 3 TTS models are in neither thinking guide's
+  list of thinking models, so they get no `thinkingConfig` at any level.
+
+  **`ThinkingLevel::Off` still omits `thinkingConfig` on every Gemini model.**
+  On Gemini 3 that does not disable thinking: the model runs at its own
+  default level (3.1 Pro `HIGH`, 3.5–3.8 Flash `MEDIUM`, Flash-Lite
+  `MINIMAL`), and 3 Pro / 3.1 Pro cannot turn thinking off at all. Use
+  `ThinkingLevel::Minimal` to ask for the least thinking — `MINIMAL` "Matches
+  the "no thinking" setting for most queries" (Google) where the model accepts
+  it.
+
+  **Gemini 2.x payloads are byte-identical** to before: `thinkingLevel` on a
+  pre-3 model is an error, so those keep `thinkingBudget`.
+
+  Detection is version-based, as Google's rule is: the last segment of the
+  model id (so `models/…` and Vertex resource paths work), `@version` dropped,
+  `gemini-<major>…` with major ≥ 3. `gemini-flash-latest` / `gemini-pro-latest`
+  count as Gemini 3; `gemini-flash-lite-latest` and unreadable ids keep the
+  budget, which Gemini 3 still accepts. Override per model with the new
+  `ModelConfig::google: Option<GoogleCompat>` —
+  `GoogleCompat::force_thinking_level()` / `force_thinking_budget()`.
+  `None` is omitted on serialize, so existing serialized configs are unchanged.
+
+- **`prompt_structured` works on Claude Fable 5.1 and Opus 5.5**
+  ([#175](https://github.com/yologdev/yoagent/issues/175)). Both models reject
+  forced `tool_choice` with a 400, and the Anthropic provider forced a
+  synthetic tool for every structured call, so every call failed as
+  `StructuredPromptError::Provider`. With `native_structured_output` set (the
+  presets set it) the provider sends
+  `output_config.format = {"type": "json_schema", "schema": ...}` and no tool
+  or `tool_choice`, and thinking is kept: `format` and the adaptive-thinking
+  `effort` share one `output_config` object. A hand-built
+  `ModelConfig::anthropic("claude-fable-5-1", ..)` without the flag still
+  forces the tool and gets the 400.
+
+- **On the native structured-output path, a user tool named like the schema
+  runs.** The loop unwrapped any tool call named after the `OutputSchema` into
+  the answer text. That is right when the provider forced a synthetic tool,
+  but on Anthropic's native path no synthetic tool exists, so a real tool
+  that happened to share the name (e.g. `structured_output`) was swallowed
+  instead of executed. The unwrap now runs only on the tool-forcing path.
+  (Only the native path added in this release was affected.)
+
+- **`claude_haiku_4_5()` uses budget thinking.** The preset inherited adaptive
+  thinking (`AnthropicCompat::default()`), which Haiku 4.5 rejects with a 400,
+  so any `ThinkingLevel` other than `Off` failed. It now uses
+  `AnthropicCompat::legacy()` (`budget_tokens`), with native structured
+  outputs on.
+
+- **OpenCode `claude-*` routes get per-generation compat.** `opencode_zen`
+  gave every Claude id adaptive thinking and bearer auth and nothing else, so
+  a pre-4.6 model (Haiku 4.5, Sonnet/Opus 4.5 and older) 400ed on any
+  thinking level, and `prompt_structured` tool-forced and 400ed on Opus 5.5 /
+  Fable 5.1. Claude ids now get `AnthropicCompat::for_claude_id` (budget
+  thinking before 4.6, adaptive from 4.6, native structured outputs from 4.5)
+  plus bearer auth. Qwen and MiniMax routes are unchanged. `jev-*` ids, which
+  OpenCode serves on its `/systemone` endpoint that yoagent does not target,
+  now log a warning like `gemini-*` ids do.
+
+- **OpenCode routes `grok-*` and `muse-spark-*` (Zen and Go) and `gpt-*`
+  (Go) to the Responses API.** The gateways' endpoint tables list those
+  families only on `/responses`, but `opencode_zen` / `opencode_go` sent them
+  to `/chat/completions`. Zen's `gpt-*` routing was already right.
+
+- **Azure OpenAI requests go to the v1 endpoint.** The provider posted to
+  `{base_url}/responses?api-version=2025-01-01-preview` with a
+  deployment-scoped `base_url`, a path where Azure never served the Responses
+  API, so requests failed (tests passed because the mocks matched any path).
+  Requests now go to `POST {resource}/openai/v1/responses` with no
+  `api-version`, the deployment name as the body's `model`. `base_url` may be
+  the resource endpoint, `…/openai` or `…/openai/v1` (`*.services.ai.azure.com`
+  too). An empty API key no longer sends an empty `api-key` header, so a
+  Microsoft Entra ID `Authorization: Bearer` token set in `ModelConfig::headers`
+  works on its own.
+
+  **Migration:** a legacy `…/openai/deployments/{deployment}` `base_url` still
+  works — it is routed to `/openai/v1/responses` and `{deployment}` replaces
+  the configured model id in the body (logged at `info`). A query string or
+  fragment on `base_url` (`…/deployments/my-gpt?api-version=2024-10-21`) is
+  dropped before the path is read, so it no longer ends up in the deployment
+  name. New configs should use
+  `https://{resource}.openai.azure.com/openai/v1` with the **deployment name**
+  as the model id. Any other `base_url` (a proxy path, say) now gets
+  `/openai/v1/responses` appended rather than `/responses?api-version=…`;
+  point a proxy at a path that forwards that.
+
+- **Responses and Azure OpenAI: function calls are collected again**
+  ([#178](https://github.com/yologdev/yoagent/issues/178)). Both providers opened
+  a tool-call buffer only on `response.function_call_arguments.start`, an event
+  the Responses API does not send, so every streamed function call was dropped
+  and the turn ended as plain text. The two providers now share one parser
+  written against OpenAI's published event types: a call starts on
+  `response.output_item.added` (`item.type == "function_call"`), argument
+  deltas are routed by `output_index` / `item_id` (parallel calls no longer
+  share "the last buffer"), and the complete arguments from
+  `response.function_call_arguments.done` / `response.output_item.done` are the
+  source of truth, which also covers servers that send no deltas. Truncated
+  arguments still become the `__partial_json` marker and `response.incomplete`
+  still reports `StopReason::Length` (#167). A delta for an unknown item is
+  logged with `warn!`, not dropped silently. Data-only SSE messages take their
+  event name from the payload's `type`.
+
+- **Responses and Azure OpenAI: reasoning is streamed.** The providers matched
+  `response.reasoning.delta`, which does not exist. They now map
+  `response.reasoning_summary_text.delta` and `response.reasoning_text.delta`
+  to `Content::Thinking` (Azure previously ignored reasoning entirely).
+
+- **Responses and Azure OpenAI: cache usage is reported.** `usage` read only
+  input and output tokens. `input_tokens_details.cached_tokens` and
+  `.cache_write_tokens` now fill `Usage::cache_read` / `cache_write`, and
+  `Usage::input` is the uncached remainder (the Anthropic and OpenAI-compatible
+  convention), so `CostConfig` prices cache hits and cache writes at their own
+  rates. Previously every cached token was billed at the full input rate.
+  Context-tier selection still sees the whole prompt.
+
+- **Azure OpenAI** now reports `StopReason::Length` when `response.completed`
+  carries `status: "incomplete"`, as the Responses provider already did.
+
+- **Refusals and content-filter stops are reported as `StopReason::Refusal`.**
+  The shared Responses parser (OpenAI Responses and Azure) dropped refusals:
+  `response.refusal.delta` / `.done` were ignored and a finished message kept
+  only `output_text` parts. A refusal — streamed, in a `content_part.done`, or
+  in the finished `message` item — now sets `StopReason::Refusal`, keeps the
+  refusal text as the turn's text (deduplicated), and is never relabelled
+  `ToolUse`. `incomplete_details.reason == "content_filter"` (on
+  `response.incomplete` or an incomplete `response.completed`) is `Refusal`
+  too; every other reason stays `Length`. On Chat Completions,
+  `finish_reason: "content_filter"` is `Refusal` (it was `Stop`), and an open
+  tool call no longer relabels it `ToolUse`; a model refusal streamed in
+  `delta.refusal` (then `finish_reason: "stop"`) was ignored entirely and is
+  now the turn's text, streamed as text deltas, with `StopReason::Refusal`.
+  All three providers set the assistant message's `error_message` to say why
+  (Chat and Responses share the wording "Request declined by the model
+  (refusal): …").
+
+  `Agent::prompt_structured` returns `StructuredPromptError::Provider` with
+  that explanation for a refusal, instead of a `Parse` error over the refusal
+  text (or `NoOutput` when a filter left no text).
+
+- **Tools no longer run after a refusal.** The loop stopped only on `Error` /
+  `Aborted`, so a tool call in a response that ended as `StopReason::Refusal`
+  — complete, say, before a content filter cut in — was executed and the run
+  continued. A refusal is now terminal: every tool call in it is answered with
+  an error tool result ("Tool call not run: the response was stopped as a
+  refusal …", with the usual `ToolExecutionStart`/`End` events) without being
+  executed, and the run ends with `TurnEnd` / `AgentEnd` and no further LLM
+  turn, as after `Error` / `Aborted` — queued steering and follow-up messages
+  stay queued. Applies to every `ToolExecutionStrategy`.
+
+- **A `null` usage count no longer drops the usage.** Some servers send
+  explicit `null` token counts; `#[serde(default)]` covers only a missing
+  key, so one `null` failed the whole Chat Completions chunk or Responses
+  terminal event — losing the usage and the stop reason carried with it. A
+  `null` count now reads as 0, and the first one in the process is logged at
+  `warn`, since the turn's tokens and cost are then undercounted.
+
+- **Rate limits are no longer mistaken for context overflow.** Azure OpenAI's
+  mid-stream capacity error (`too_many_requests` / `no_capacity`, "…exceeds
+  the maximum usage size allowed during peak load…") matched the Gemini
+  overflow phrase "exceeds the maximum", so it triggered compaction instead of
+  a backoff retry. HTTP 429 is now classified `RateLimited` before the
+  overflow phrases are checked, and an SSE error event whose structured
+  `type` / `code` / `status` is `too_many_requests`, `no_capacity`,
+  `rate_limit_exceeded`, `rate_limit_error` or `rate_limit` is `RateLimited`
+  (retried). The Gemini phrase is narrowed to "exceeds the maximum number of
+  tokens", matching Gemini's actual overflow message.
+
+- **DeepSeek thinking mode with tools no longer fails on the second turn.**
+  DeepSeek requires that "for requests carrying the tools parameter, the
+  reasoning_content must be fully passed back to the API in all subsequent
+  requests — even for turns where the model did not perform a tool call",
+  and answers a request that does not with a 400
+  ([thinking mode guide](https://api-docs.deepseek.com/guides/thinking_mode)).
+  The OpenAI-compat provider dropped `Content::Thinking` when rebuilding
+  assistant messages, so any tool-using DeepSeek agent with thinking on broke
+  after its first tool call. Assistant turns now carry their thinking as
+  `reasoning_content` (multiple thinking blocks are concatenated) when the
+  request has tools. Without tools DeepSeek ignores the field, so it is not
+  sent. Gated on a new `OpenAiCompat::replays_reasoning_content` flag, set only
+  by `OpenAiCompat::deepseek()`; every other provider's request body is
+  byte-identical to before. A DeepSeek compat persisted before this flag
+  deserializes it as `false`, so rebuild it from the preset.
+
+- **Chat Completions usage now reports cache writes.** `prompt_tokens_details.
+  cache_write_tokens` (GPT-5.6 and later bill cache writes at 1.25x input) was
+  ignored, so `Usage::cache_write` stayed 0 and those tokens were counted as
+  ordinary `input`. It is now parsed into `cache_write` and excluded from
+  `input`, alongside `cached_tokens` — OpenAI's
+  [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+  computes ordinary input as `input_tokens - cached_tokens -
+  cache_write_tokens`. Responses without the field split exactly as before.
+
+- **Sub-agent spend now reaches the parent, in its own bucket**
+  ([#173](https://github.com/yologdev/yoagent/issues/173)). `SubAgentTool` ran
+  its child loop on a private channel and forwarded no usage, so every total a
+  delegating agent reported — `SessionStats`, `session_cost_usd`, anything a
+  consumer summed off the stream — silently left out what its sub-agents spent.
+  The error only ran one way (always under), nothing distinguished a parent
+  that delegated from one that did not, and nesting hid a whole tree of spend
+  behind one number.
+
+  `SessionStats` gains `sub_agents: SubAgentSpend` — `usage`, `cost_usd` and
+  `runs`, summed over the **whole delegation tree** (a sub-agent's own
+  sub-agents included). It is a separate bucket: `usage`, `turns` and
+  `cost_usd` stay the agent's own, so delegation stays attributable.
+  `SessionStats::total_usage()` / `total_cost_usd()` give the whole bill.
+  - **Per delegation**, `ToolExecutionEnd` carries the sub-agent's full
+    `SessionStats` in `details`; read it with
+    `SessionStats::from_sub_agent_result(&result)`. Its `usage` is the
+    sub-agent's own and its `sub_agents` what it delegated, so own and nested
+    spend stay distinguishable. A tool call that reported several runs carries
+    their combination (own figures summed, nested buckets merged).
+  - **Failed delegations count.** A sub-agent that errors or is loop-aborted
+    returns `Err(ToolError)`, which cannot carry data, so it reports through a
+    side channel on `ToolContext`; the loop folds it in and attaches the stats
+    to the error result's `details`.
+  - **Custom delegation tools** report the same way with
+    `ToolContext::report_delegated_run(stats)` — once per run, before
+    `execute` returns (a report after that is lost). `SubAgentTool` uses it
+    too.
+  - **Each run is priced at its own model's rates** — a sub-agent on a cheaper
+    model is never re-priced at the parent's. `cost_usd` becomes `None` as soon
+    as any delegated spend is unpriceable, rather than a sum that quietly skips
+    it; `SubAgentSpend::merge` keeps that rule for callers accumulating across
+    runs. `None` therefore means "unpriced" *or* "nothing spent and nothing
+    priced" (a priced run that used no tokens is `Some(0.0)`);
+    `SubAgentSpend::is_unpriced()` / `SessionStats::is_unpriced()` tell them
+    apart.
+  - **`Agent::total_cost_usd()` / `Agent::total_usage()`** give the whole bill
+    — own turns plus every sub-agent — so callers never add two `Option<f64>`s
+    by hand (both `zip` and `unwrap_or(0.0)` are wrong in some case). They and
+    **`Agent::sub_agent_spend()`** share one window: every run since
+    construction or `reset()`, accumulated from each run's stats. Clearing,
+    replacing or compacting history does not lower them. `session_cost_usd()`
+    is unchanged and stays history-derived — it prices the current context at
+    the current model's rates, excludes sub-agents, and is not the bill.
+  - Usage and run counts in the spend rollups saturate instead of
+    overflowing.
+
+  Additive on the wire: `subAgents` is omitted when nothing was delegated, so
+  a run without sub-agents serializes exactly as before.
+
+
 ## 0.18.1
 
 ### Changed

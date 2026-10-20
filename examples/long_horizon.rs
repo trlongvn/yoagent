@@ -136,8 +136,12 @@ async fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Run
         cache_read_after_compaction: 0,
     };
     let mut assistant_turns = 0usize;
+    // Set by an error `MessageEnd` for one event: what to undo if the next
+    // event says that attempt is being retried.
+    let mut retryable: Option<u64> = None;
 
     while let Some(event) = rx.recv().await {
+        let just_errored = retryable.take();
         match event {
             AgentEvent::MessageUpdate {
                 delta: StreamDelta::Text { delta },
@@ -176,13 +180,27 @@ async fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Run
                     // instead: by then compaction has certainly run, and a
                     // byte-stable prefix should still be producing hits.
                     assistant_turns += 1;
-                    if assistant_turns > 6 {
-                        out.cache_read_after_compaction += usage.cache_read;
-                    }
+                    let counted = if assistant_turns > 6 {
+                        usage.cache_read
+                    } else {
+                        0
+                    };
+                    out.cache_read_after_compaction += counted;
                     if stop_reason == StopReason::Error {
                         out.error =
                             Some(error_message.unwrap_or_else(|| "unknown provider error".into()));
+                        retryable = Some(counted);
                     }
+                }
+            }
+
+            // The error just counted closed an attempt that is being retried:
+            // it was neither a turn nor the run's result.
+            AgentEvent::ProviderRetry { .. } => {
+                if let Some(counted) = just_errored {
+                    assistant_turns -= 1;
+                    out.cache_read_after_compaction -= counted;
+                    out.error = None;
                 }
             }
 
@@ -247,14 +265,14 @@ fn transcript_is_well_formed(messages: &[AgentMessage]) -> Result<(), String> {
 /// model and demonstrating the anti-pattern this example warns about.
 fn summarizer() -> ModelConfig {
     match std::env::var("SMOKE_MODEL").ok().as_deref() {
-        Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
+        Some("deepseek") => ModelConfig::deepseek("deepseek-flash", "DeepSeek Flash"),
         _ => ModelConfig::claude_haiku_4_5(),
     }
 }
 
 fn model() -> ModelConfig {
     match std::env::var("SMOKE_MODEL").ok().as_deref() {
-        Some("deepseek") => ModelConfig::deepseek("deepseek-chat", "DeepSeek Chat"),
+        Some("deepseek") => ModelConfig::deepseek("deepseek-flash", "DeepSeek Flash"),
         Some("gpt") => ModelConfig::openai("gpt-5.5", "GPT-5.5"),
         _ => ModelConfig::claude_sonnet_5(),
     }
@@ -262,6 +280,9 @@ fn model() -> ModelConfig {
 
 #[tokio::main]
 async fn main() {
+    // The cost check needs prices: opt in to the bundled snapshot before any
+    // config is built (nothing is priced by default).
+    agent::provider::prices::enable_bundled();
     // Compaction decisions are only visible through tracing. `YO_LOG=debug`
     // shows which path each compaction took and why summarization did or did
     // not arm; without a subscriber the diagnosis is guesswork.

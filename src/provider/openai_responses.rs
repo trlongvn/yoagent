@@ -2,23 +2,26 @@
 //!
 //! This is the newer OpenAI API that uses a different event format
 //! from Chat Completions. It has first-class support for reasoning items.
+//!
+//! The request body and the stream reader are shared with
+//! [`AzureOpenAiProvider`](super::AzureOpenAiProvider) (see
+//! `responses_request.rs`); this file holds only what differs: the URL
+//! (`{base_url}/responses`) and bearer auth.
 
-use super::model::ModelConfig;
+use super::model::ApiProtocol;
+use super::responses_request::{build_request_body, stream_response};
 use super::traits::*;
 use crate::types::*;
-use async_trait::async_trait;
-use futures::StreamExt;
-use reqwest_eventsource::EventSource;
-use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub struct OpenAiResponsesProvider;
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl StreamProvider for OpenAiResponsesProvider {
-    fn protocol(&self) -> Option<crate::provider::ApiProtocol> {
-        Some(crate::provider::ApiProtocol::OpenAiResponses)
+    fn protocol(&self) -> Option<ApiProtocol> {
+        Some(ApiProtocol::OpenAiResponses)
     }
 
     async fn stream(
@@ -38,7 +41,7 @@ impl StreamProvider for OpenAiResponsesProvider {
             .ok_or_else(|| ProviderError::Other("ModelConfig required".into()))?;
 
         let url = format!("{}/responses", model_config.base_url);
-        let body = build_request_body(&config, model_config);
+        let body = build_request_body(&config, ApiProtocol::OpenAiResponses);
         debug!(
             "OpenAI Responses request: model={} url={}",
             config.model, url
@@ -54,406 +57,140 @@ impl StreamProvider for OpenAiResponsesProvider {
             request = request.header(k, v);
         }
 
-        let request = request.json(&body);
-        let mut es =
-            EventSource::new(request).map_err(|e| ProviderError::Network(e.to_string()))?;
+        stream_response(
+            request.json(&body),
+            "OpenAI Responses",
+            ApiProtocol::OpenAiResponses,
+            &config,
+            &model_config.provider,
+            tx,
+            cancel,
+        )
+        .await
+    }
+}
 
-        let mut content: Vec<Content> = Vec::new();
-        let mut usage = Usage::default();
-        let mut stop_reason = StopReason::Stop;
-        let mut tool_call_buffers: Vec<ToolCallBuffer> = Vec::new();
-        // Buffer index currently receiving argument deltas; moved forward by
-        // each `function_call_arguments.start`.
-        let mut active_tool_call: usize = 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::model::{ModelConfig, OpenAiCompat, ReasoningEffortCeiling};
 
-        let _ = tx.send(StreamEvent::Start);
+    const ALL_LEVELS: [ThinkingLevel; 7] = [
+        ThinkingLevel::Off,
+        ThinkingLevel::Minimal,
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::XHigh,
+        ThinkingLevel::Max,
+    ];
 
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    es.close();
-                    return Err(ProviderError::Cancelled);
-                }
-                event = es.next() => {
-                    match event {
-                        None => break,
-                        Some(Ok(reqwest_eventsource::Event::Open)) => {}
-                        Some(Ok(reqwest_eventsource::Event::Message(msg))) => {
-                            match msg.event.as_str() {
-                                "response.output_text.delta" => {
-                                    if let Ok(data) = serde_json::from_str::<TextDeltaEvent>(&msg.data) {
-                                        let text_idx = content.iter().position(|c| matches!(c, Content::Text { .. }));
-                                        let idx = match text_idx {
-                                            Some(i) => i,
-                                            None => {
-                                                content.push(Content::Text { text: String::new() });
-                                                content.len() - 1
-                                            }
-                                        };
-                                        if let Some(Content::Text { text }) = content.get_mut(idx) {
-                                            text.push_str(&data.delta);
-                                        }
-                                        let _ = tx.send(StreamEvent::TextDelta {
-                                            content_index: idx,
-                                            delta: data.delta,
-                                        });
-                                    }
-                                }
-                                "response.reasoning.delta" => {
-                                    if let Ok(data) = serde_json::from_str::<TextDeltaEvent>(&msg.data) {
-                                        let idx = content.iter().position(|c| matches!(c, Content::Thinking { .. }));
-                                        let idx = match idx {
-                                            Some(i) => i,
-                                            None => {
-                                                content.push(Content::Thinking { thinking: String::new(), signature: None });
-                                                content.len() - 1
-                                            }
-                                        };
-                                        if let Some(Content::Thinking { thinking, .. }) = content.get_mut(idx) {
-                                            thinking.push_str(&data.delta);
-                                        }
-                                        let _ = tx.send(StreamEvent::ThinkingDelta {
-                                            content_index: idx,
-                                            delta: data.delta,
-                                        });
-                                    }
-                                }
-                                "response.function_call_arguments.start" => {
-                                    if let Ok(data) = serde_json::from_str::<FunctionCallStartEvent>(&msg.data) {
-                                        // Buffers are routed by position, never by "last seen" — concurrent tool
-                // calls must land in their own buffer.
-                let idx = tool_call_buffers.len();
-                tool_call_buffers.push(ToolCallBuffer {
-                                            id: data.call_id.unwrap_or_default(),
-                                            name: data.name.unwrap_or_default(),
-                                            arguments: String::new(),
-                                        });
-                                        let buf = &tool_call_buffers[idx];
-                                        active_tool_call = idx;
-                                        let _ = tx.send(StreamEvent::ToolCallStart {
-                                            content_index: idx,
-                                            id: buf.id.clone(),
-                                            name: buf.name.clone(),
-                                        });
-                                    }
-                                }
-                                "response.function_call_arguments.delta" => {
-                                    if let Ok(data) = serde_json::from_str::<FunctionCallDeltaEvent>(&msg.data) {
-                                        // Route to the buffer the event names
-                                        // (output_index), else the one currently
-                                        // open. Never iterate the container —
-                                        // ordering is not a routing signal.
-                                        let target = data
-                                            .output_index
-                                            .filter(|oi| (*oi as usize) < tool_call_buffers.len())
-                                            .map(|oi| oi as usize)
-                                            .unwrap_or_else(|| active_tool_call);
-                                        if let Some(buf) = tool_call_buffers.get_mut(target) {
-                                            buf.arguments.push_str(&data.delta);
-                                            let _ = tx.send(StreamEvent::ToolCallDelta {
-                                                content_index: target,
-                                                delta: data.delta,
-                                            });
-                                        }
-                                    }
-                                }
-                                "response.function_call_arguments.done" => {
-                                    // Tool call complete
-                                }
-                                "response.completed" => {
-                                    if let Ok(data) = serde_json::from_str::<ResponseCompletedEvent>(&msg.data) {
-                                        if let Some(resp) = data.response {
-                                            if let Some(u) = resp.usage {
-                                                usage.input = u.input_tokens;
-                                                usage.output = u.output_tokens;
-                                                usage.total_tokens = u.total_tokens;
-                                            }
-                                            if resp.status == Some("incomplete".to_string()) {
-                                                stop_reason = StopReason::Length;
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                                // Terminal events other than `response.completed`.
-                                // Without these arms the loop never breaks, the
-                                // body closes, and the resulting StreamEnded is
-                                // retryable (#83) — re-running an already-billed
-                                // generation that would fail the same way again.
-                                "response.incomplete" => {
-                                    if let Ok(data) =
-                                        serde_json::from_str::<ResponseCompletedEvent>(&msg.data)
-                                    {
-                                        if let Some(resp) = data.response {
-                                            if let Some(u) = resp.usage {
-                                                usage.input = u.input_tokens;
-                                                usage.output = u.output_tokens;
-                                                usage.total_tokens = u.total_tokens;
-                                            }
-                                        }
-                                    }
-                                    stop_reason = StopReason::Length;
-                                    break;
-                                }
-                                "response.failed" | "error" => {
-                                    let provider_err = classify_sse_error_event(&msg.data);
-                                    warn!("OpenAI Responses error: {}", provider_err);
-                                    return Err(provider_err);
-                                }
-                                _ => {
-                                    debug!("Unknown Responses event: {}", msg.event);
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            let provider_err = classify_eventsource_error(e).await;
-                            warn!("OpenAI Responses SSE error: {}", provider_err);
-                            return Err(provider_err);
-                        }
-                    }
-                }
-            }
-        }
+    fn body(mc: &ModelConfig, level: ThinkingLevel) -> serde_json::Value {
+        let mut config = StreamConfig::new(mc.id.clone(), "key");
+        config.messages = vec![Message::user("hi")];
+        config.thinking_level = level;
+        config.temperature = Some(0.5);
+        config.model_config = Some(mc.clone());
+        build_request_body(&config, ApiProtocol::OpenAiResponses)
+    }
 
-        // Finalize tool calls
-        for buf in tool_call_buffers {
-            let args = serde_json::from_str(&buf.arguments)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            content.push(Content::ToolCall {
-                provider_metadata: None,
-                id: buf.id,
-                name: buf.name,
-                arguments: args,
+    fn effort(mc: &ModelConfig, level: ThinkingLevel) -> serde_json::Value {
+        body(mc, level)["reasoning"]["effort"].clone()
+    }
+
+    #[test]
+    fn without_compat_the_body_has_the_default_effort_ladder() {
+        // Near-miss guard: `openai_responses` carries `compat: None`, so the
+        // whole body is pinned — Off omits `reasoning`, XHigh/Max clamp to
+        // `high`.
+        let mc = ModelConfig::openai_responses("gpt-5.5", "GPT-5.5");
+        assert!(mc.compat.is_none());
+        for level in ALL_LEVELS {
+            let expected_effort = match level {
+                ThinkingLevel::Off => None,
+                ThinkingLevel::Minimal | ThinkingLevel::Low => Some("low"),
+                ThinkingLevel::Medium => Some("medium"),
+                _ => Some("high"),
+            };
+            let got = body(&mc, level);
+            // Encrypted reasoning is opt-in, so no `include` by default; the
+            // empty system prompt derives no cache key.
+            let mut expected = serde_json::json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": [{"role": "user", "content": "hi"}],
+                "temperature": 0.5,
             });
+            if let Some(e) = expected_effort {
+                expected["reasoning"] = serde_json::json!({"effort": e});
+            }
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{level:?}"
+            );
         }
+    }
 
-        if content
-            .iter()
-            .any(|c| matches!(c, Content::ToolCall { .. }))
-        {
-            stop_reason = StopReason::ToolUse;
-        }
-
-        let message = Message::Assistant {
-            content,
-            stop_reason,
-            model: config.model.clone(),
-            provider: model_config.provider.clone(),
-            usage,
-            timestamp: now_ms(),
-            error_message: None,
-        };
-
-        let _ = tx.send(StreamEvent::Done {
-            message: message.clone(),
+    #[test]
+    fn compat_ceiling_is_honoured() {
+        // Positive control: the Responses builder used to ignore
+        // `model_config.compat` entirely.
+        let mut mc = ModelConfig::openai_responses("gpt-5.4", "GPT-5.4");
+        mc.compat = Some(OpenAiCompat {
+            max_reasoning_effort: ReasoningEffortCeiling::XHigh,
+            ..Default::default()
         });
-        Ok(message)
+        assert_eq!(effort(&mc, ThinkingLevel::XHigh), "xhigh");
+        assert_eq!(effort(&mc, ThinkingLevel::Max), "xhigh");
+        assert_eq!(effort(&mc, ThinkingLevel::High), "high");
+        assert!(body(&mc, ThinkingLevel::Off).get("reasoning").is_none());
     }
-}
 
-struct ToolCallBuffer {
-    id: String,
-    name: String,
-    arguments: String,
-}
+    #[test]
+    fn gpt_6_astra_reaches_max_and_never_sends_none() {
+        let mc = ModelConfig::gpt_6_astra();
+        assert_eq!(effort(&mc, ThinkingLevel::Max), "max");
+        assert_eq!(effort(&mc, ThinkingLevel::XHigh), "xhigh");
+        assert_eq!(effort(&mc, ThinkingLevel::High), "high");
+        assert_eq!(effort(&mc, ThinkingLevel::Medium), "medium");
+        // GPT-6 has no `minimal`.
+        assert_eq!(effort(&mc, ThinkingLevel::Minimal), "low");
+        // `none` is an HTTP 400 on Astra: Off omits the effort instead.
+        assert!(body(&mc, ThinkingLevel::Off).get("reasoning").is_none());
+    }
 
-fn build_request_body(config: &StreamConfig, _model_config: &ModelConfig) -> serde_json::Value {
-    let mut input: Vec<serde_json::Value> = Vec::new();
-
-    for msg in &config.messages {
-        match msg {
-            Message::User { content, .. } => {
-                // Build content array for user message (supports text + images)
-                let user_content: Vec<serde_json::Value> = content
-                    .iter()
-                    .filter(|c| !matches!(c, Content::Text { text } if text.is_empty()))
-                    .filter_map(|c| match c {
-                        Content::Text { text } => Some(serde_json::json!({
-                            "type": "input_text",
-                            "text": text,
-                        })),
-                        Content::Image { data, mime_type } => Some(serde_json::json!({
-                            "type": "input_image",
-                            "image_url": format!("data:{};base64,{}", mime_type, data),
-                        })),
-                        _ => None,
-                    })
-                    .collect();
-
-                if user_content.len() == 1 && user_content[0]["type"] == "input_text" {
-                    // Simple text-only message can use shorthand format
-                    input.push(serde_json::json!({
-                        "role": "user",
-                        "content": user_content[0]["text"].as_str().unwrap_or(""),
-                    }));
-                } else {
-                    // Multi-modal content uses array format
-                    input.push(serde_json::json!({
-                        "role": "user",
-                        "content": user_content,
-                    }));
-                }
-            }
-            Message::Assistant { content, .. } => {
-                for c in content {
-                    match c {
-                        Content::Text { text } if text.is_empty() => {}
-                        Content::Text { text } => {
-                            input.push(serde_json::json!({
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": text}],
-                            }));
-                        }
-                        Content::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                            ..
-                        } => {
-                            input.push(serde_json::json!({
-                                "type": "function_call",
-                                "call_id": id,
-                                "name": name,
-                                "arguments": arguments.to_string(),
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Message::ToolResult {
-                tool_call_id,
-                content,
-                ..
-            } => {
-                let output_val = if content.iter().any(|c| matches!(c, Content::Image { .. })) {
-                    // Images present: build content array
-                    let parts: Vec<serde_json::Value> = content
-                        .iter()
-                        .filter(|c| !matches!(c, Content::Text { text } if text.is_empty()))
-                        .filter_map(|c| match c {
-                            Content::Text { text } => Some(serde_json::json!({
-                                "type": "input_text",
-                                "text": text,
-                            })),
-                            Content::Image { data, mime_type } => Some(serde_json::json!({
-                                "type": "input_image",
-                                "image_url": format!("data:{};base64,{}", mime_type, data),
-                            })),
-                            _ => None,
-                        })
-                        .collect();
-                    serde_json::json!(parts)
-                } else {
-                    let text = content
-                        .iter()
-                        .find_map(|c| match c {
-                            Content::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    serde_json::json!(text)
-                };
-                input.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": output_val,
-                }));
-            }
+    #[test]
+    fn gpt_6_sol_and_luna_omit_effort_for_off() {
+        for mc in [ModelConfig::gpt_6_sol(), ModelConfig::gpt_6_luna()] {
+            assert!(body(&mc, ThinkingLevel::Off).get("reasoning").is_none());
+            assert_eq!(effort(&mc, ThinkingLevel::Max), "max", "{}", mc.id);
+            assert_eq!(effort(&mc, ThinkingLevel::XHigh), "xhigh", "{}", mc.id);
+            assert_eq!(effort(&mc, ThinkingLevel::Low), "low", "{}", mc.id);
         }
     }
 
-    let mut body = serde_json::json!({
-        "model": config.model,
-        "stream": true,
-        "input": input,
-    });
-
-    if !config.system_prompt.is_empty() {
-        body["instructions"] = serde_json::json!(config.system_prompt);
+    #[test]
+    fn off_bodies_are_byte_identical_to_the_uncapped_body_for_every_preset() {
+        // `Off` means "send nothing": whatever the preset's ceiling, the body
+        // equals the pre-#176 one (a compat-less config's body with the same
+        // model id), with no `reasoning` key.
+        for mc in [
+            ModelConfig::gpt_6_astra(),
+            ModelConfig::gpt_6_sol(),
+            ModelConfig::gpt_6_luna(),
+            ModelConfig::gpt_5_5(),
+        ] {
+            let mut legacy = mc.clone();
+            legacy.compat = None;
+            let got = body(&mc, ThinkingLevel::Off);
+            assert!(got.get("reasoning").is_none(), "{}", mc.id);
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(&body(&legacy, ThinkingLevel::Off)).unwrap(),
+                "{}",
+                mc.id
+            );
+        }
     }
-
-    if let Some(max) = config.max_tokens {
-        body["max_output_tokens"] = serde_json::json!(max);
-    }
-
-    if !config.tools.is_empty() {
-        let tools: Vec<serde_json::Value> = config
-            .tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                })
-            })
-            .collect();
-        body["tools"] = serde_json::json!(tools);
-    }
-
-    if config.thinking_level != ThinkingLevel::Off {
-        let effort = match config.thinking_level {
-            ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
-            ThinkingLevel::Medium => "medium",
-            ThinkingLevel::High => "high",
-            ThinkingLevel::Off => unreachable!(),
-        };
-        body["reasoning"] = serde_json::json!({"effort": effort});
-    }
-
-    if let Some(temp) = config.temperature {
-        body["temperature"] = serde_json::json!(temp);
-    }
-
-    body
-}
-
-// Event types
-#[derive(Deserialize)]
-struct TextDeltaEvent {
-    delta: String,
-}
-
-#[derive(Deserialize)]
-struct FunctionCallStartEvent {
-    #[serde(default)]
-    call_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct FunctionCallDeltaEvent {
-    delta: String,
-    /// Index of the output item this delta belongs to. Present on the
-    /// Responses API; without it concurrent calls cannot be told apart.
-    #[serde(default)]
-    output_index: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct ResponseCompletedEvent {
-    #[serde(default)]
-    response: Option<ResponseData>,
-}
-
-#[derive(Deserialize)]
-struct ResponseData {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    usage: Option<ResponseUsage>,
-}
-
-#[derive(Deserialize)]
-struct ResponseUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    total_tokens: u64,
 }

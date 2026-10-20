@@ -15,7 +15,7 @@ use std::sync::Arc;
 ///   `#[non_exhaustive]`: their fields grow with provider features (PR #32
 ///   added `provider_metadata`), so downstream constructs them via the
 ///   `Content::tool_call*` / `Content::thinking*` constructors and uses `..`
-///   in patterns. `Text` and `Image` stay literally constructible â€” they are
+///   in patterns. `Text` and `Image` stay literally constructible — they are
 ///   user-facing shapes that do not grow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -35,6 +35,36 @@ pub enum Content {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// Reasoning the provider returned encrypted instead of as text:
+        /// Anthropic's `redacted_thinking` `data`, or Amazon Bedrock's
+        /// `redactedContent` (base64) — `thinking` is empty for such a
+        /// block — or an OpenAI Responses / Azure reasoning item (its `id`,
+        /// `summary` and `encrypted_content` as a JSON object, plus the ids of
+        /// the output items that followed it: `call_ids` and `message_id`),
+        /// whose readable summary, if any, stays in `thinking`.
+        /// It is opaque: replayed unmodified, and only to the protocol named
+        /// by `redacted_protocol`; every other provider skips it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
+        /// The API protocol whose response carried `redacted`, so the
+        /// payload is replayed only where it came from. Encrypted reasoning
+        /// from one API is not documented to be valid on another (Bedrock's
+        /// `redactedContent` is not documented to be Anthropic's
+        /// `redacted_thinking` data, even for Claude on Bedrock), so a
+        /// mismatch — or `None`, which only deserialized data written
+        /// before this field existed can have — is never sent anywhere.
+        /// Set together with `redacted` by [`Content::thinking_redacted`].
+        ///
+        /// An unrecognised value (a protocol added in a newer yoagent) loads
+        /// as `None` rather than failing the whole message.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "redactedProtocol",
+            alias = "redacted_protocol",
+            deserialize_with = "lenient_protocol"
+        )]
+        redacted_protocol: Option<crate::provider::ApiProtocol>,
     },
     #[serde(rename = "toolCall")]
     #[non_exhaustive]
@@ -55,11 +85,24 @@ pub enum Content {
     },
 }
 
+/// `redacted_protocol`: an unknown protocol (written by a newer yoagent,
+/// `ApiProtocol` being `#[non_exhaustive]`) deserializes as `None`, which is
+/// never replayed, instead of failing the whole message.
+fn lenient_protocol<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::provider::ApiProtocol>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 impl Content {
     /// Construct a tool-call content block.
     ///
     /// The `ToolCall` variant is `#[non_exhaustive]` so provider-specific
-    /// fields can be added without breaking downstream crates â€” use this
+    /// fields can be added without breaking downstream crates — use this
     /// constructor instead of a struct literal.
     pub fn tool_call(
         id: impl Into<String>,
@@ -79,6 +122,49 @@ impl Content {
         Self::Thinking {
             thinking: text.into(),
             signature: None,
+            redacted: None,
+            redacted_protocol: None,
+        }
+    }
+
+    /// Construct a redacted (provider-encrypted) thinking block: no text,
+    /// the opaque `data` kept for replay to `protocol` — the API whose
+    /// response carried it — and to no other.
+    ///
+    /// ```
+    /// use agent::provider::ApiProtocol;
+    /// use agent::types::Content;
+    ///
+    /// let block = Content::thinking_redacted(ApiProtocol::AnthropicMessages, "EmwKAhgB...");
+    /// assert!(matches!(
+    ///     block,
+    ///     Content::Thinking { redacted_protocol: Some(ApiProtocol::AnthropicMessages), .. }
+    /// ));
+    /// ```
+    pub fn thinking_redacted(
+        protocol: crate::provider::ApiProtocol,
+        data: impl Into<String>,
+    ) -> Self {
+        Self::Thinking {
+            thinking: String::new(),
+            signature: None,
+            redacted: Some(data.into()),
+            redacted_protocol: Some(protocol),
+        }
+    }
+
+    /// The encrypted reasoning `protocol` may be sent back, if this is a
+    /// redacted thinking block that came from `protocol`. `None` for any
+    /// other block, and for redacted data from another protocol (or of
+    /// unknown origin), which must not be replayed there.
+    pub(crate) fn redacted_for(&self, protocol: crate::provider::ApiProtocol) -> Option<&str> {
+        match self {
+            Self::Thinking {
+                redacted: Some(data),
+                redacted_protocol: Some(p),
+                ..
+            } if *p == protocol => Some(data),
+            _ => None,
         }
     }
 
@@ -87,6 +173,8 @@ impl Content {
         Self::Thinking {
             thinking: text.into(),
             signature: Some(signature.into()),
+            redacted: None,
+            redacted_protocol: None,
         }
     }
 
@@ -159,7 +247,7 @@ impl Message {
 
     /// Construct an assistant message.
     ///
-    /// The `Assistant` variant is `#[non_exhaustive]` â€” its fields grow with
+    /// The `Assistant` variant is `#[non_exhaustive]` — its fields grow with
     /// provider features (`error_message` was itself a later addition), so
     /// custom `StreamProvider` implementations construct it here instead of
     /// with a struct literal. `timestamp` is set to now and `error_message`
@@ -213,31 +301,45 @@ impl Message {
     ///
     /// Some providers (SSE-based: Anthropic, OpenAI) return overflow as a
     /// `StopReason::Error` message rather than an HTTP error. This method
-    /// checks the `error_message` field against known overflow patterns.
+    /// checks the `error_message` field against known overflow patterns, and
+    /// recognizes a turn the loop ended with a [`ProviderError::ContextOverflow`]
+    /// (including one classified from an empty 400/413 body, which has no
+    /// overflow phrase in it).
+    ///
+    /// [`ProviderError::ContextOverflow`]: crate::provider::ProviderError::ContextOverflow
     pub fn is_context_overflow(&self) -> bool {
         match self {
             Self::Assistant {
                 stop_reason: StopReason::Error,
                 error_message: Some(msg),
                 ..
-            } => crate::provider::is_context_overflow_message(msg),
+            } => {
+                msg.starts_with(crate::provider::traits::CONTEXT_OVERFLOW_DISPLAY_PREFIX)
+                    || crate::provider::is_context_overflow_message(msg)
+            }
             _ => false,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// AgentMessage â€” LLM messages + extensible custom types
+// AgentMessage — LLM messages + extensible custom types
 // ---------------------------------------------------------------------------
 
+/// An app-specific message kept in the history but never sent to the model:
+/// UI-only notes, notifications, bookkeeping. Named `ExtensionMessage`
+/// before 0.25 (renamed so it isn't confused with
+/// [`Extension`](crate::Extension), the plug-in contract).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ExtensionMessage {
+pub struct CustomMessage {
     pub role: String,
     pub kind: String,
     pub data: serde_json::Value,
 }
 
-impl ExtensionMessage {
+impl CustomMessage {
+    /// A message of `kind` carrying `data`. Its `role` is `"extension"`, the
+    /// value stored sessions already hold, so saved data reads back the same.
     pub fn new(kind: impl Into<String>, data: impl Serialize) -> Self {
         Self {
             role: "extension".into(),
@@ -252,22 +354,28 @@ impl ExtensionMessage {
 pub enum AgentMessage {
     /// Standard LLM message
     Llm(Message),
-    /// App-specific message (UI-only, notifications, etc.)
-    Extension(ExtensionMessage),
+    /// App-specific message (UI-only, notifications, etc.). Called
+    /// `Extension` before 0.25; the variant name is never serialized
+    /// (`untagged`), so stored sessions are unaffected.
+    Custom(CustomMessage),
 }
+
+/// The pre-0.25 name of [`CustomMessage`].
+#[deprecated(since = "0.25.0", note = "renamed to CustomMessage")]
+pub type ExtensionMessage = CustomMessage;
 
 impl AgentMessage {
     pub fn role(&self) -> &str {
         match self {
             Self::Llm(m) => m.role(),
-            Self::Extension(ext) => &ext.role,
+            Self::Custom(custom) => &custom.role,
         }
     }
 
     pub fn as_llm(&self) -> Option<&Message> {
         match self {
             Self::Llm(m) => Some(m),
-            Self::Extension(_) => None,
+            Self::Custom(_) => None,
         }
     }
 }
@@ -321,7 +429,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Fraction of input tokens served from cache (0.0â€“1.0).
+    /// Fraction of input tokens served from cache (0.0–1.0).
     /// Returns 0.0 if no input tokens were processed.
     pub fn cache_hit_rate(&self) -> f64 {
         let total_input = self.input + self.cache_read + self.cache_write;
@@ -339,14 +447,14 @@ impl Usage {
 /// Controls yoagent-managed prompt caching hints.
 ///
 /// By default, caching is enabled with automatic breakpoint placement. What
-/// that produces on the wire depends on the protocol â€” see [`CacheStrategy`]
+/// that produces on the wire depends on the protocol — see [`CacheStrategy`]
 /// for the per-provider table. `enabled: false` suppresses every hint agent
 /// would otherwise send; it cannot switch off a provider's *automatic*
 /// server-side caching, which is not under client control.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CacheConfig {
-    /// Master switch â€” set to false to disable all caching hints.
+    /// Master switch — set to false to disable all caching hints.
     /// Default: true.
     pub enabled: bool,
     /// How cache breakpoints are placed.
@@ -355,15 +463,16 @@ pub struct CacheConfig {
     /// lookups by key rather than by explicit breakpoints (OpenAI's
     /// `prompt_cache_key`).
     ///
-    /// Leave `None` and one is derived from the request's stable head â€” the
-    /// system prompt plus the first user message. That derivation is correct
-    /// for the common case and costs nothing, but two sessions opening with
-    /// identical text share a key. Set this explicitly when sessions must be
-    /// routed apart, or when the head is not distinctive.
+    /// Leave `None` and one is derived from the system prompt (see
+    /// [`StreamConfig::cache_session_key`](crate::provider::StreamConfig::cache_session_key)).
+    /// That derivation is correct for the common case and costs nothing, but
+    /// sessions sharing a system prompt share a key. Set this explicitly when
+    /// sessions must be routed apart, or to spread a hot key.
     ///
-    /// Ignored everywhere except the key-routed path â€” by Anthropic, which
-    /// takes explicit breakpoints, and by Google, Vertex, Bedrock, Azure and
-    /// Responses, which agent sends no cache hints to at all.
+    /// Read only by the key-routed protocols — OpenAI Chat Completions (when
+    /// the compat flag allows it), the OpenAI Responses API and Azure OpenAI.
+    /// Ignored by Anthropic, which takes explicit breakpoints, and by Google,
+    /// Vertex and Bedrock, which yoagent sends no cache hints to.
     ///
     /// Note for [`crate::SubAgentTool`]: it holds one `CacheConfig` and clones
     /// it into every invocation, so a key set there is shared by every run the
@@ -391,7 +500,7 @@ impl CacheConfig {
 
     /// Set the session key used by key-routed providers.
     ///
-    /// A blank key is treated as unset â€” sending `prompt_cache_key: ""` would
+    /// A blank key is treated as unset — sending `prompt_cache_key: ""` would
     /// route every caller who did that onto one cache, which is worse than
     /// sending nothing. `with_session_key(format!("tenant-{id}"))` with an
     /// empty `id` is the ordinary way to arrive here.
@@ -418,7 +527,7 @@ impl CacheConfig {
     /// Whether agent should emit any caching hint at all.
     ///
     /// Three configurations mean "no": `enabled: false`, `Disabled`, and
-    /// `Manual` with every flag off. The third is easy to miss â€” Anthropic
+    /// `Manual` with every flag off. The third is easy to miss — Anthropic
     /// honours it correctly by placing no breakpoints, so a key-routed
     /// provider that still sent a key would be reading the same value as
     /// "yes". One predicate, so every protocol agrees on what off means.
@@ -463,7 +572,7 @@ pub enum ToolExecutionStrategy {
     /// Use for debugging or tools with shared mutable state.
     Sequential,
     /// Run all tool calls concurrently, check steering after all complete.
-    /// Default â€” most tool calls are independent and this gives the best latency.
+    /// Default — most tool calls are independent and this gives the best latency.
     #[default]
     Parallel,
     /// Run in batches of N, check steering between batches.
@@ -479,9 +588,9 @@ pub enum ToolExecutionStrategy {
 /// | provider | shape | what this enum controls |
 /// |---|---|---|
 /// | Anthropic | explicit breakpoints | where `cache_control` markers are placed |
-/// | OpenAI (native) | key-routed | whether `prompt_cache_key` is sent |
+/// | OpenAI (native), OpenAI Responses, Azure | key-routed | whether `prompt_cache_key` is sent |
 /// | DeepSeek, Gemini, and other automatic backends | automatic, server-side | nothing |
-/// | Azure, OpenAI Responses, Bedrock | supported but **not yet wired** | nothing *yet* |
+/// | Bedrock | supported but **not yet wired** | nothing *yet* |
 ///
 /// **Explicit breakpoints** (Anthropic) are the model this enum was designed
 /// around: the client chooses cache boundaries and pays a write premium for
@@ -490,33 +599,31 @@ pub enum ToolExecutionStrategy {
 ///
 /// **Key-routed** (OpenAI) caches automatically on prefixes of ~1024 tokens or
 /// more; there are no breakpoints to place. `prompt_cache_key` only improves
-/// *routing* â€” it steers requests from one conversation toward the same cache
-/// â€” so the `Auto`/`Manual` distinction has nothing to act on and both send the
+/// *routing* — it steers requests from one conversation toward the same cache
+/// — so the `Auto`/`Manual` distinction has nothing to act on and both send the
 /// key. Only [`Disabled`](Self::Disabled) is meaningful. The key comes from
-/// [`CacheConfig::session_key`], or is derived from the request head. Gated on
+/// [`CacheConfig::session_key`], or is derived from the system prompt. On
+/// Chat Completions it is gated on
 /// [`OpenAiCompat::supports_prompt_cache_key`](crate::provider::OpenAiCompat),
 /// because the field is OpenAI's and a strict compat server may reject unknown
-/// keys outright rather than ignore them.
+/// keys outright rather than ignore them; the Responses API (OpenAI and Azure)
+/// defines the field itself, so it is always sent there.
 ///
 /// **Automatic, server-side** (DeepSeek, Gemini) caches on its own with nothing
 /// to configure. DeepSeek quantises hits to 64-token blocks and charges nothing
 /// to populate; Gemini reports `cachedContentTokenCount` but its explicit
 /// cached-content API is a separate create-then-reference resource with its own
 /// TTL and billing, deliberately not driven from here. For these, this setting
-/// is inert â€” including `Disabled`, which cannot switch off caching the client
+/// is inert — including `Disabled`, which cannot switch off caching the client
 /// never asked for.
 ///
-/// **Not yet wired** is a separate row on purpose. Azure and the OpenAI
-/// Responses API both accept `prompt_cache_key`, and Bedrock accepts explicit
-/// `cachePoint` blocks; agent sends none of them today. That is a gap in this
-/// crate, not a property of those vendors, and conflating the two would make
-/// the omission read as a deliberate design decision.
+/// **Not yet wired** is a separate row on purpose. Bedrock accepts explicit
+/// `cachePoint` blocks; yoagent sends none today. That is a gap in this crate,
+/// not a property of the vendor, and conflating the two would make the
+/// omission read as a deliberate design decision.
 ///
-/// Two practical consequences. A hit rate is not comparable across protocols
-/// without knowing which shape produced it. And only Anthropic, the
-/// OpenAI-compat path and Gemini populate [`Usage::cache_read`] at all â€” on
-/// Azure, Responses and Bedrock there is no hit rate to read. See
-/// `docs/concepts/prompt-caching.md`.
+/// A hit rate is not comparable across protocols without knowing which shape
+/// produced it. See `docs/concepts/prompt-caching.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -524,12 +631,13 @@ pub enum CacheStrategy {
     /// Automatic placement (recommended).
     ///
     /// Anthropic: caches system prompt, tool definitions, and recent history.
-    /// OpenAI: sends `prompt_cache_key`. Elsewhere: no effect.
+    /// OpenAI (Chat Completions and Responses) and Azure: sends
+    /// `prompt_cache_key`. Elsewhere: no effect.
     #[default]
     Auto,
     /// Send no caching hints at all.
     ///
-    /// Does **not** disable a provider's automatic server-side caching â€” that
+    /// Does **not** disable a provider's automatic server-side caching — that
     /// is not client-controllable. On Anthropic this means paying full input
     /// price for every prefix, so reach for it only when a rewrite-heavy
     /// workload makes cache writes pure loss.
@@ -553,15 +661,127 @@ pub enum CacheStrategy {
 // Thinking level
 // ---------------------------------------------------------------------------
 
+/// How hard the model should reason before answering.
+///
+/// A provider-neutral ladder. Each provider maps it onto its own knob, and
+/// where a provider's ladder is shorter than this one the upper levels are
+/// **clamped** to the highest value this crate knows the provider accepts
+/// rather than sent as a value it would reject —
+/// with one exception: Anthropic's adaptive `effort` is passed through
+/// unclamped, so a model with a shorter effort ladder can reject it (see
+/// below). What each level becomes, per provider:
+///
+/// | Level     | Anthropic (adaptive) | Anthropic legacy / Bedrock budget | OpenAI-compat `reasoning_effort`¹ / OpenAI Responses / Azure `reasoning.effort`, by ceiling⁴ | DeepSeek `reasoning_effort`² | Gemini 2.x / Vertex `thinkingBudget`³ |
+/// |-----------|----------|--------|----------|--------|--------|
+/// | `Off`     | (omitted) | (omitted) | (omitted) | (omitted; `thinking: disabled`) | (omitted) |
+/// | `Minimal` | `low`    | 1,024  | `low`    | `low`  | 1,024  |
+/// | `Low`     | `low`    | 1,024  | `low`    | `low`  | 1,024  |
+/// | `Medium`  | `medium` | 2,048  | `medium` | `medium` (DeepSeek rounds up to `high`) | 8,192  |
+/// | `High`    | `high`   | 8,192  | `high`   | `high` | 24,576 |
+/// | `XHigh`   | `xhigh`  | 16,384 | `High`: `high` *(clamped)*; `XHigh`, `Max`: `xhigh` | `high` *(clamped)* | 24,576 *(clamped)* |
+/// | `Max`     | `max`    | 30,720 | `High`: `high` *(clamped)*; `XHigh`: `xhigh` *(clamped)*; `Max`: `max` | `max` | 24,576 *(clamped)* |
+///
+/// ¹ On Chat Completions, only when
+/// [`OpenAiCompat::supports_reasoning_effort`] is set; otherwise no
+/// `reasoning_effort` is sent. The Responses and Azure providers always send
+/// `reasoning.effort`, except for an omitted `Off`. Omitting it does not mean
+/// "no reasoning": an OpenAI reasoning model runs at its default (`medium`),
+/// and xAI's Grok cannot disable reasoning at all, so `Off` leaves it at its
+/// default (`high`). This crate never sends OpenAI's `none` rung, which some
+/// models reject with HTTP 400. A clamp (`XHigh`/`Max` sent lower) is logged
+/// once per process with `tracing::warn!`.
+///
+/// ⁴ The ceiling is [`OpenAiCompat::max_reasoning_effort`], a
+/// [`ReasoningEffortCeiling`] declared per model (default `High`); the
+/// Responses and Azure providers read it from `ModelConfig::compat`.
+/// Presets: `gpt_6_astra`, `gpt_6_sol`, `gpt_6_luna` — `Max`; `gpt_5_5` —
+/// `XHigh`; [`OpenAiCompat::xai`] — `XHigh` (Grok models without the rung
+/// treat `xhigh` as `high`); every other config `High`.
+///
+/// ² "DeepSeek" means any OpenAI-compat provider with both
+/// [`OpenAiCompat::supports_thinking_control`] and
+/// [`OpenAiCompat::supports_reasoning_effort`] set. DeepSeek's
+/// `reasoning_effort` accepts `low`/`high`/`max`
+/// (<https://api-docs.deepseek.com/guides/thinking_mode>), and DeepSeek itself
+/// maps a requested `xhigh` to `high`, so `XHigh` is sent as `high` and only
+/// `Max` selects `max`. `Off` is sent as `thinking: {"type": "disabled"}`
+/// rather than as an effort value.
+///
+/// ³ Gemini 3 and later take `thinkingLevel` instead (never both — Gemini
+/// rejects a request carrying the two). The generation is read from the model
+/// id's version (`gemini-3*`, `gemini-3.8-flash`, `models/…`, Vertex resource
+/// paths); override with [`GoogleCompat::thinking_level`]:
+///
+/// | Level | Gemini 3+ / Vertex `thinkingLevel` |
+/// |-------|-----------|
+/// | `Off` | (omitted — the model runs at its **default** level; see below) |
+/// | `Minimal` | `MINIMAL`, or `LOW` *(clamped)* on 3.7 / 3.8 Flash, 3.x Pro and unlisted models |
+/// | `Low` | `LOW` |
+/// | `Medium` | `MEDIUM` |
+/// | `High`, `XHigh`, `Max` | `HIGH` (`XHigh`/`Max` *clamped*) |
+///
+/// `Off` does **not** disable thinking on Gemini 3: it omits
+/// `thinkingConfig`, so the model thinks at its own default — `HIGH` on
+/// 3.1 Pro, `MEDIUM` on 3.5–3.8 Flash, `MINIMAL` on Flash-Lite. Thinking
+/// cannot be turned off at all on 3 Pro / 3.1 Pro. Use `Minimal` to ask for
+/// the least thinking: `MINIMAL` matches "the "no thinking" setting for most
+/// queries" (Google) where the model accepts it. Image models take only the
+/// levels they list (3.1 Flash / Flash-Lite Image: `MINIMAL`, `HIGH` — `Low`
+/// rounds down, `Medium` up; 3 Pro Image: `HIGH` only), and Gemini 3 TTS
+/// models get no `thinkingConfig`.
+///
+/// Anthropic's adaptive `effort` is passed through as-is, so a model with a
+/// shorter ladder rejects what it does not know: `xhigh` arrived with Opus
+/// 4.7, so Opus 4.6 / Sonnet 4.6 accept `max` but not `xhigh`. The crate has
+/// no per-model effort table; pick a level the model supports.
+///
+/// **`Off` sends nothing** on every provider except DeepSeek (which gets an
+/// explicit `thinking: disabled`), and that means "no thinking" only on
+/// models that think on request. On Anthropic `Off` omits the `thinking`
+/// field (it never sends `disabled`): Claude Opus 5.5 and Fable 5.1 always
+/// think (at their default effort), and Opus 5 thinks whenever the field is
+/// absent. OpenAI reasoning models, Grok and Gemini 3 likewise run at their
+/// own defaults (see ¹ and ³).
+///
+/// Marked `#[non_exhaustive]` so the next rung a vendor adds is not a breaking
+/// change: `match` on it from outside the crate needs a wildcard arm.
+///
+/// [`OpenAiCompat::supports_thinking_control`]: crate::provider::OpenAiCompat::supports_thinking_control
+/// [`OpenAiCompat::supports_reasoning_effort`]: crate::provider::OpenAiCompat::supports_reasoning_effort
+/// [`OpenAiCompat::max_reasoning_effort`]: crate::provider::OpenAiCompat::max_reasoning_effort
+/// [`OpenAiCompat::xai`]: crate::provider::OpenAiCompat::xai
+/// [`ReasoningEffortCeiling`]: crate::provider::ReasoningEffortCeiling
+/// [`GoogleCompat::thinking_level`]: crate::provider::GoogleCompat::thinking_level
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ThinkingLevel {
+    /// Request no reasoning: no thinking or effort field is sent (DeepSeek
+    /// excepted, which gets `thinking: disabled`). A model that always thinks
+    /// then runs at its own default — see the table above.
     #[default]
     Off,
+    /// The least thinking a provider can be asked for. Sent as `MINIMAL` on
+    /// Gemini 3 models that accept it (3.6 / 3.5 Flash, 3.x Flash-Lite,
+    /// 3 Flash, 3.1 Flash / Flash-Lite Image); everywhere else identical to
+    /// `Low`. On Gemini 3 this, not `Off`, is how to ask for least thinking.
     Minimal,
     Low,
     Medium,
     High,
+    /// Above `High`, below `Max` — Anthropic's and OpenAI's `xhigh`. Where a
+    /// provider or model has no `xhigh` rung it is clamped down to that
+    /// provider's `High` value (see the table above), except on Anthropic's
+    /// adaptive path, where `xhigh` is passed through as-is and a model
+    /// without the rung (Opus 4.6 / Sonnet 4.6) rejects it. Serializes as
+    /// `"xhigh"`.
+    XHigh,
+    /// The highest setting this crate sends — Anthropic's, DeepSeek's and
+    /// (on GPT-5.6 / GPT-6) OpenAI's `max`. Elsewhere it is clamped to the
+    /// highest value this crate knows is accepted — for OpenAI-shaped
+    /// providers, the model's declared `max_reasoning_effort` (see the table
+    /// above).
+    Max,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +792,7 @@ pub enum ThinkingLevel {
 ///
 /// Tools call this to emit progress updates (e.g., partial output, status messages)
 /// that are forwarded as `AgentEvent::ToolExecutionUpdate` events for UI consumption.
-/// Partial results are **not** sent to the LLM â€” only the final `ToolResult` is.
+/// Partial results are **not** sent to the LLM — only the final `ToolResult` is.
 pub type ToolUpdateFn = Arc<dyn Fn(ToolResult) + Send + Sync>;
 
 /// Callback for emitting user-facing progress messages during tool execution.
@@ -584,7 +804,7 @@ pub type ProgressFn = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Context passed to tool execution. Bundles all per-invocation state.
 ///
-/// Using a struct instead of individual parameters future-proofs the trait â€”
+/// Using a struct instead of individual parameters future-proofs the trait —
 /// adding fields to `ToolContext` is non-breaking, which `#[non_exhaustive]`
 /// is what actually makes true. Tools receive this rather than build it, so
 /// the attribute costs implementors nothing; it only stops a struct literal in
@@ -595,12 +815,34 @@ pub struct ToolContext {
     pub tool_call_id: String,
     /// The name of the tool being invoked.
     pub tool_name: String,
-    /// Cancellation token â€” check `is_cancelled()` in long-running tools.
+    /// Cancellation token — check `is_cancelled()` in long-running tools.
     pub cancel: tokio_util::sync::CancellationToken,
     /// Optional callback for streaming partial `ToolResult`s (UI/logging only).
     pub on_update: Option<ToolUpdateFn>,
     /// Optional callback for emitting user-facing progress messages.
     pub on_progress: Option<ProgressFn>,
+    /// Set by the loop; delegation tools report their runs' stats here, via
+    /// [`report_delegated_run`](Self::report_delegated_run), so they survive a
+    /// failed delegation.
+    pub(crate) sub_agent_report: Option<SubAgentReport>,
+    /// Set by the loop: the tree extensions a delegated run must apply, its
+    /// depth, and the calling run's label.
+    pub(crate) delegation: Delegation,
+}
+
+/// What a run hands down to the runs it delegates to.
+#[derive(Clone, Default)]
+pub(crate) struct Delegation {
+    pub(crate) tree: Vec<Arc<dyn crate::extension::Extension>>,
+    /// The depth a delegated run has (the calling run's depth + 1).
+    pub(crate) depth: usize,
+    /// The calling run's label, which a delegated run keeps.
+    pub(crate) label: Option<String>,
+    /// The tool call this context belongs to: what a run it delegates to
+    /// was started by.
+    pub(crate) call_id: Option<String>,
+    /// The id the calling run gave its extensions (when it has any).
+    pub(crate) parent_run_id: Option<String>,
 }
 
 impl ToolContext {
@@ -617,6 +859,8 @@ impl ToolContext {
             cancel: tokio_util::sync::CancellationToken::new(),
             on_update: None,
             on_progress: None,
+            sub_agent_report: None,
+            delegation: Delegation::default(),
         }
     }
 
@@ -637,6 +881,53 @@ impl ToolContext {
         self.on_progress = Some(on_progress);
         self
     }
+
+    /// Report one delegated agent run's stats to the loop that invoked this
+    /// tool, so its spend is counted in that loop's
+    /// [`SessionStats::sub_agents`].
+    ///
+    /// [`SubAgentTool`](crate::SubAgentTool) calls this for you; a **custom**
+    /// delegation tool — one that runs its own [`agent_loop`](crate::agent_loop())
+    /// or [`Agent`](crate::Agent) — calls it once per run it started, with that
+    /// run's stats as carried by its [`AgentEvent::AgentEnd`]. Report even
+    /// when the run failed and the tool is about to return `Err`: the spend of
+    /// a failed delegation is still spend, and this is the only way it reaches
+    /// the parent.
+    ///
+    /// **Call it before [`execute`](AgentTool::execute) returns.** The loop
+    /// collects reports as soon as the tool's future completes; a report made
+    /// after that — from a task the tool spawned and did not await, say — is
+    /// silently lost. Clones of this context report to the same place, so a
+    /// tool that fans out to several runs can hand each a clone.
+    ///
+    /// A no-op on a context the loop did not build (e.g. one from
+    /// [`ToolContext::new`]): there is no parent to report to.
+    pub fn report_delegated_run(&self, stats: SessionStats) {
+        if let Some(report) = &self.sub_agent_report {
+            report.lock().unwrap_or_else(|e| e.into_inner()).push(stats);
+        }
+    }
+
+    /// The tree extensions ([`Agent::with_tree_extension`](crate::Agent::with_tree_extension))
+    /// a run this tool delegates to must apply, ahead of its own. A custom
+    /// delegation tool passes them on, with the depth and label, through
+    /// [`Agent::delegated_from`](crate::Agent::delegated_from) or
+    /// [`AgentLoopConfig::delegated_from`](crate::agent_loop::AgentLoopConfig::delegated_from).
+    pub fn tree_extensions(&self) -> &[Arc<dyn crate::extension::Extension>] {
+        &self.delegation.tree
+    }
+
+    /// The depth of a run this tool delegates to: 1 when called by a
+    /// top-level run.
+    pub fn delegation_depth(&self) -> usize {
+        self.delegation.depth.max(1)
+    }
+
+    /// The calling run's label ([`Agent::with_run_label`](crate::Agent::with_run_label)),
+    /// for a run this tool delegates to.
+    pub fn run_label(&self) -> Option<&str> {
+        self.delegation.label.as_deref()
+    }
 }
 
 impl Clone for ToolContext {
@@ -647,6 +938,8 @@ impl Clone for ToolContext {
             cancel: self.cancel.clone(),
             on_update: self.on_update.clone(),
             on_progress: self.on_progress.clone(),
+            sub_agent_report: self.sub_agent_report.clone(),
+            delegation: self.delegation.clone(),
         }
     }
 }
@@ -667,8 +960,9 @@ impl std::fmt::Debug for ToolContext {
 }
 
 /// A tool the agent can call. Implement this trait for your tools.
-#[async_trait::async_trait]
-pub trait AgentTool: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait AgentTool: crate::rt::MaybeSend + crate::rt::MaybeSync {
     /// Unique tool name (used in LLM tool_use)
     fn name(&self) -> &str;
     /// Human-readable label for UI
@@ -680,10 +974,10 @@ pub trait AgentTool: Send + Sync {
     /// Execute the tool.
     ///
     /// The `ctx` parameter provides per-invocation context:
-    /// - `ctx.tool_call_id` / `ctx.tool_name` â€” for correlation and logging
-    /// - `ctx.cancel` â€” cancellation token; check `is_cancelled()` in long-running tools
-    /// - `ctx.on_update` â€” optional callback for streaming partial `ToolResult`s (UI/logging only)
-    /// - `ctx.on_progress` â€” optional callback for user-facing progress text (`ProgressMessage`)
+    /// - `ctx.tool_call_id` / `ctx.tool_name` — for correlation and logging
+    /// - `ctx.cancel` — cancellation token; check `is_cancelled()` in long-running tools
+    /// - `ctx.on_update` — optional callback for streaming partial `ToolResult`s (UI/logging only)
+    /// - `ctx.on_progress` — optional callback for user-facing progress text (`ProgressMessage`)
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -719,8 +1013,8 @@ pub enum ToolError {
 ///
 /// # Wire format (stability contract)
 ///
-/// `AgentEvent` and [`StreamDelta`] serialize as internally-tagged JSON â€”
-/// `{"type": "<camelCase variant>", ...camelCase fields}` â€” so external
+/// `AgentEvent` and [`StreamDelta`] serialize as internally-tagged JSON —
+/// `{"type": "<camelCase variant>", ...camelCase fields}` — so external
 /// frontends (websocket fanout servers, TypeScript clients, JSONL pipes) can
 /// consume the event stream directly:
 ///
@@ -744,7 +1038,7 @@ pub enum AgentEvent {
     /// The run finished. Carries the messages it produced and a
     /// [`SessionStats`] rollup of what they cost.
     ///
-    /// The variant is `#[non_exhaustive]` â€” the payload is expected to grow.
+    /// The variant is `#[non_exhaustive]` — the payload is expected to grow.
     /// Match with `..`.
     #[non_exhaustive]
     AgentEnd {
@@ -793,6 +1087,27 @@ pub enum AgentEvent {
     InputRejected {
         reason: String,
     },
+    /// A provider attempt failed with a retryable error and will be retried.
+    ///
+    /// Sent after that attempt's messages: when the attempt had opened one, a
+    /// `MessageEnd` with [`StopReason::Error`] closes it first, so a streaming
+    /// client discards its partial text. That `MessageEnd` is **not** the
+    /// turn's result — this event is what tells the two apart, so a consumer
+    /// that reacts to an error `MessageEnd` should wait for the next event. A
+    /// final failure is never followed by `ProviderRetry`. If the run is
+    /// cancelled during `delay_ms`, the announced attempt does not happen and
+    /// the turn ends with [`StopReason::Aborted`].
+    #[non_exhaustive]
+    ProviderRetry {
+        /// The attempt that failed, 1-based.
+        attempt: usize,
+        /// Attempts allowed in total: `RetryConfig::max_retries + 1`.
+        max_attempts: usize,
+        /// The provider error, as text.
+        error: String,
+        /// How long the loop waits before the next attempt.
+        delay_ms: u64,
+    },
     /// A tool was called repeatedly with identical arguments.
     ///
     /// Emitted on both escalations: the first trip steers the model and
@@ -808,7 +1123,7 @@ pub enum AgentEvent {
     /// History was compacted before a turn.
     ///
     /// Emitted by [`LlmCompaction`](crate::LlmCompaction) on both of its paths
-    /// â€” the spliced summary and the deterministic fallback â€” so a consumer can
+    /// — the spliced summary and the deterministic fallback — so a consumer can
     /// tell which one ran and what it cost. The built-in
     /// [`DefaultCompaction`](crate::context::DefaultCompaction) does not emit
     /// this; it has no event channel and never issues a request.
@@ -832,10 +1147,25 @@ pub enum AgentEvent {
 impl AgentEvent {
     /// Construct an [`AgentEvent::AgentEnd`].
     ///
-    /// The variant is `#[non_exhaustive]` â€” its payload grows â€” so downstream
+    /// The variant is `#[non_exhaustive]` — its payload grows — so downstream
     /// crates (and tests) build it here rather than with a struct literal.
     pub fn agent_end(messages: Vec<AgentMessage>, stats: SessionStats) -> Self {
         Self::AgentEnd { messages, stats }
+    }
+
+    /// Construct an [`AgentEvent::ProviderRetry`].
+    pub fn provider_retry(
+        attempt: usize,
+        max_attempts: usize,
+        error: impl Into<String>,
+        delay: std::time::Duration,
+    ) -> Self {
+        Self::ProviderRetry {
+            attempt,
+            max_attempts,
+            error: error.into(),
+            delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        }
     }
 
     /// Construct an [`AgentEvent::LoopDetected`].
@@ -853,8 +1183,8 @@ impl AgentEvent {
 
 /// Session-level rollup carried by [`AgentEvent::AgentEnd`].
 ///
-/// The per-turn numbers already existed â€” `Usage` on every assistant message,
-/// `tokens_cached` on the `llm_stream` span, `cache_read` in the GASP record â€”
+/// The per-turn numbers already existed — `Usage` on every assistant message,
+/// `tokens_cached` on the `llm_stream` span, `cache_read` in the GASP record —
 /// but nothing summed them, so answering "what was this run's cache hit rate"
 /// meant replaying the whole event stream. Any change that moves caching
 /// (breakpoint placement, compaction strategy, model choice) had to be judged
@@ -867,7 +1197,7 @@ impl AgentEvent {
 /// println!("{:.1}% cached over {} turns", stats.cache_hit_rate() * 100.0, stats.turns);
 /// ```
 ///
-/// **Hit rate is `cache_read / (input + cache_read + cache_write)`** â€” cache
+/// **Hit rate is `cache_read / (input + cache_read + cache_write)`** — cache
 /// writes count against you, because they are prompt tokens the provider
 /// processed and billed. Counting only `input` shrinks the denominator and so
 /// **overstates** the rate for a write-charging provider: Anthropic books a
@@ -876,7 +1206,7 @@ impl AgentEvent {
 /// `docs/evals/llm-compaction-live.md`, where that error was made and caught.
 ///
 /// Read a rate against its session length, not against 100%: every turn's new
-/// content is necessarily a miss, so the ceiling is about `(n-1)/(n+1)` â€” ~88%
+/// content is necessarily a miss, so the ceiling is about `(n-1)/(n+1)` — ~88%
 /// at 15 turns, ~96% only past 49.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -884,10 +1214,9 @@ impl AgentEvent {
 pub struct SessionStats {
     /// Provider usage summed over every LLM turn in this run.
     ///
-    /// `total_tokens` is **not** summed and stays 0 â€” see [`record_turn`] for
-    /// why. Derive a total from the four components instead.
-    ///
-    /// [`record_turn`]: SessionStats::record_turn
+    /// `total_tokens` is **not** summed and stays 0: providers disagree on what
+    /// it counts, and some never set it. Derive a total from the four
+    /// components instead.
     #[serde(default)]
     pub usage: Usage,
     /// LLM turns taken. Tool executions are not turns; an errored turn counts,
@@ -896,14 +1225,23 @@ pub struct SessionStats {
     #[serde(default)]
     pub turns: u32,
     /// Dollar cost of [`usage`](Self::usage), when the model's rates are
-    /// configured (see [`CostConfig`](crate::provider::CostConfig)).
+    /// known (see [`ModelConfig::cost`](crate::provider::ModelConfig::cost)).
     ///
-    /// `None` means "cannot price this", never "free" â€” all-zero rates mean
-    /// pricing is unknown, which is the case for custom and local models.
+    /// `None` is never "free", but it means one of two things: the spend
+    /// **cannot be priced** (a turn with non-zero usage came from a model with
+    /// `cost: None`, which is what gateways and custom endpoints return, and
+    /// first-party constructors for a model the price table does not list),
+    /// or there was **nothing to price** (a run that
+    /// took no turns, or whose turns reported no usage on an unpriced model;
+    /// on a priced model a zero-usage turn makes this `Some(0.0)`).
+    /// [`is_unpriced`](Self::is_unpriced) tells them apart. A model configured
+    /// as free (`Some` with zero rates) reports `Some(0.0)`. Unpriced is
+    /// sticky: once any turn cannot be priced this stays `None`, because a
+    /// sum that silently skips the unpriced part under-reports.
     ///
-    /// Scope: this run's own turns. A [`SubAgentTool`](crate::SubAgentTool)
-    /// runs its own loop on a private channel, so a delegating agent's real
-    /// spend is higher than this reports.
+    /// Scope: this run's own turns. What [`SubAgentTool`](crate::SubAgentTool)s
+    /// spent is kept apart in [`sub_agents`](Self::sub_agents); use
+    /// [`total_cost_usd`](Self::total_cost_usd) for the whole bill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     /// Times the loop observed compaction rewrite history.
@@ -917,16 +1255,226 @@ pub struct SessionStats {
     /// [`context::total_tokens`]: crate::context::total_tokens
     ///
     /// Deliberately **not** split into spliced-summary vs deterministic
-    /// fallback, and carrying no summarization spend. That detail exists â€” on
-    /// [`AgentEvent::ContextCompacted`], with its [`SummaryStats`] â€” but
+    /// fallback. That detail exists — on [`AgentEvent::ContextCompacted`],
+    /// with its [`SummaryStats`] — but
     /// [`CompactionStrategy::compact`](crate::context::CompactionStrategy::compact)
     /// is synchronous and has no event channel, so the loop cannot see it. Wire
-    /// `LlmCompaction::with_event_sender` to the same channel and aggregate the
-    /// two together â€” the events *describe* the same compactions this counts,
-    /// with the breakdown attached, so do not sum the two. Folding a guess in
-    /// here would be worse than the gap.
+    /// `LlmCompaction::with_event_sender` to the same channel for the
+    /// breakdown — the events *describe* the same compactions this counts.
+    ///
+    /// What the summarization requests cost is in
+    /// [`compaction`](Self::compaction), not here.
     #[serde(default)]
     pub compactions: u32,
+    /// What this run's [`SubAgentTool`](crate::SubAgentTool) delegations
+    /// spent, summed over the whole delegation tree — a sub-agent's nested
+    /// sub-agents included.
+    ///
+    /// A **separate bucket**: [`usage`](Self::usage), [`turns`](Self::turns)
+    /// and [`cost_usd`](Self::cost_usd) stay this agent's own, so delegation
+    /// remains attributable. Sub-agents run their own loop on a private
+    /// channel, and before this field existed their spend reached the parent
+    /// nowhere, so every total silently under-reported delegation. Read
+    /// [`total_usage`](Self::total_usage) / [`total_cost_usd`](Self::total_cost_usd)
+    /// for the whole bill.
+    ///
+    /// Omitted from the wire when nothing was delegated, so a run without
+    /// sub-agents serializes exactly as it did before.
+    #[serde(default, skip_serializing_if = "SubAgentSpend::is_empty")]
+    pub sub_agents: SubAgentSpend,
+    /// Decision-model requests made during this run — the advisory hints and
+    /// the tool gate (feature `decision`), including those of sub-agents it
+    /// delegated to. Always empty without the feature, and omitted from the
+    /// wire when empty.
+    ///
+    /// Its dollar cost is part of [`total_cost_usd`](Self::total_cost_usd);
+    /// its tokens are not part of [`total_usage`](Self::total_usage), which
+    /// counts LLM tokens only.
+    #[serde(default, skip_serializing_if = "DecisionStats::is_empty")]
+    pub decision: DecisionStats,
+    /// What compaction's own model requests cost —
+    /// [`LlmCompaction`](crate::LlmCompaction)'s summarization requests —
+    /// including those of sub-agents this run delegated to. Empty with the
+    /// deterministic strategies, which make no request, and omitted from the
+    /// wire when empty.
+    ///
+    /// A **separate bucket**, like [`decision`](Self::decision):
+    /// [`usage`](Self::usage), [`turns`](Self::turns) and
+    /// [`cost_usd`](Self::cost_usd) stay the agent's own turns, and
+    /// [`sub_agents`](Self::sub_agents) what the sub-agents' own turns spent.
+    /// Its tokens are part of [`total_usage`](Self::total_usage) and its
+    /// dollar cost part of [`total_cost_usd`](Self::total_cost_usd), each
+    /// request priced at the summarization model's own rates.
+    ///
+    /// Summarization runs in the background, so a request is counted by the
+    /// run whose compaction step first finds it finished — usually the run
+    /// that started it, but a request still in flight when a run ends is
+    /// counted by the next run that uses the same strategy (and never, if
+    /// there is none). Each request is counted once, whether its briefing was
+    /// spliced, discarded or rejected; a request that failed or timed out
+    /// reported no usage and adds nothing.
+    #[serde(default, skip_serializing_if = "CompactionSpend::is_empty")]
+    pub compaction: CompactionSpend,
+}
+
+/// What compaction's model requests cost; see [`SessionStats::compaction`]
+/// and [`Agent::compaction_spend`](crate::Agent::compaction_spend).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct CompactionSpend {
+    /// Provider usage summed over the summarization requests. `total_tokens`
+    /// stays 0, as in [`SessionStats::usage`].
+    #[serde(default)]
+    pub usage: Usage,
+    /// Dollar cost of [`usage`](Self::usage) at the summarization model's
+    /// rates, with the crate's rule: `None` once any request with non-zero
+    /// usage could not be priced (a summarizer with `cost: None`), and when
+    /// nothing was priced. [`is_unpriced`](Self::is_unpriced) tells them
+    /// apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Summarization requests that returned a response, accepted or not.
+    #[serde(default)]
+    pub requests: u32,
+}
+
+impl CompactionSpend {
+    /// Whether no summarization request was counted.
+    pub fn is_empty(&self) -> bool {
+        self.requests == 0 && usage_is_zero(&self.usage) && self.cost_usd.is_none()
+    }
+
+    /// Whether compaction spend happened that cannot be priced: non-zero
+    /// [`usage`](Self::usage) with no [`cost_usd`](Self::cost_usd). `false`
+    /// for an empty bucket.
+    pub fn is_unpriced(&self) -> bool {
+        is_unpriced(&self.usage, self.cost_usd)
+    }
+
+    /// Fold another bucket into this one — for a caller accumulating across
+    /// runs. Keeps [`cost_usd`](Self::cost_usd) `None` once any part is
+    /// unpriced.
+    pub fn merge(&mut self, other: &CompactionSpend) {
+        self.cost_usd = combine_cost(&self.usage, self.cost_usd, &other.usage, other.cost_usd);
+        self.usage = add_usage(&self.usage, &other.usage);
+        self.requests = self.requests.saturating_add(other.requests);
+    }
+
+    /// One summarization response, priced with the summarizer's rates
+    /// (`None` = an unpriced model).
+    pub(crate) fn record_request(
+        &mut self,
+        usage: &Usage,
+        cost: Option<&crate::provider::CostConfig>,
+    ) {
+        self.merge(&CompactionSpend {
+            // Through `add_usage` so `total_tokens` is dropped here too.
+            usage: add_usage(&Usage::default(), usage),
+            cost_usd: cost.map(|c| c.cost_usd(usage)),
+            requests: 1,
+        });
+    }
+}
+
+/// What decision-model requests cost during a run; see
+/// [`SessionStats::decision`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct DecisionStats {
+    /// Evaluations attempted.
+    #[serde(default)]
+    pub requests: u32,
+    /// Evaluations that produced no usable answer — errors, invalid or
+    /// unusable responses, a missing API key, and timeouts.
+    #[serde(default)]
+    pub failures: u32,
+    /// The subset of `failures` that timed out.
+    #[serde(default)]
+    pub timeouts: u32,
+    /// Tokens of the successful evaluations (`input` and `output` only).
+    #[serde(default)]
+    pub usage: Usage,
+    /// Their dollar cost, with the crate's rule: `None` once any evaluation
+    /// could not be priced, and when nothing was priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Successful evaluations whose cost is unknown — an unpriced model, or a
+    /// response that reported no usage. Any makes [`cost_usd`](Self::cost_usd)
+    /// `None` for good.
+    #[serde(default)]
+    pub unpriced: u32,
+}
+
+impl DecisionStats {
+    /// Whether no evaluation was attempted.
+    pub fn is_empty(&self) -> bool {
+        self.requests == 0 && usage_is_zero(&self.usage) && self.cost_usd.is_none()
+    }
+
+    /// Whether some decision spend cannot be priced: an evaluation on an
+    /// unpriced model, one that reported no usage, or tokens without a cost.
+    pub fn is_unpriced(&self) -> bool {
+        self.unpriced > 0 || is_unpriced(&self.usage, self.cost_usd)
+    }
+
+    /// Fold another rollup into this one.
+    pub fn merge(&mut self, other: &DecisionStats) {
+        self.cost_usd = if self.unpriced > 0 || other.unpriced > 0 {
+            None
+        } else {
+            combine_cost(&self.usage, self.cost_usd, &other.usage, other.cost_usd)
+        };
+        self.usage = add_usage(&self.usage, &other.usage);
+        self.requests = self.requests.saturating_add(other.requests);
+        self.failures = self.failures.saturating_add(other.failures);
+        self.timeouts = self.timeouts.saturating_add(other.timeouts);
+        self.unpriced = self.unpriced.saturating_add(other.unpriced);
+    }
+
+    /// One successful evaluation; `cost_usd: None` counts it as unpriced.
+    #[cfg_attr(not(feature = "decision"), allow(dead_code))]
+    pub(crate) fn record_success(&mut self, input: u64, output: u64, cost_usd: Option<f64>) {
+        self.merge(&DecisionStats {
+            requests: 1,
+            usage: Usage {
+                input,
+                output,
+                ..Default::default()
+            },
+            cost_usd,
+            unpriced: u32::from(cost_usd.is_none()),
+            ..Default::default()
+        });
+    }
+
+    /// Spend already billed by a request that then failed (a non-batching
+    /// backend that answered some questions before one failed). Not a
+    /// request of its own; the failure is recorded separately.
+    #[cfg_attr(not(feature = "decision"), allow(dead_code))]
+    pub(crate) fn record_billed(&mut self, input: u64, output: u64, cost_usd: Option<f64>) {
+        self.merge(&DecisionStats {
+            usage: Usage {
+                input,
+                output,
+                ..Default::default()
+            },
+            cost_usd,
+            unpriced: u32::from(cost_usd.is_none()),
+            ..Default::default()
+        });
+    }
+
+    /// One failed evaluation.
+    #[cfg_attr(not(feature = "decision"), allow(dead_code))]
+    pub(crate) fn record_failure(&mut self, timed_out: bool) {
+        self.requests = self.requests.saturating_add(1);
+        self.failures = self.failures.saturating_add(1);
+        if timed_out {
+            self.timeouts = self.timeouts.saturating_add(1);
+        }
+    }
 }
 
 impl SessionStats {
@@ -941,11 +1489,112 @@ impl SessionStats {
             turns,
             cost_usd,
             compactions,
+            sub_agents: SubAgentSpend::default(),
+            decision: DecisionStats::default(),
+            compaction: CompactionSpend::default(),
         }
     }
 
+    /// Whether this run's **own** spend cannot be priced: non-zero
+    /// [`usage`](Self::usage) with no [`cost_usd`](Self::cost_usd). `false`
+    /// when there is simply nothing to price. Delegated spend is judged
+    /// separately by [`SubAgentSpend::is_unpriced`].
+    pub fn is_unpriced(&self) -> bool {
+        is_unpriced(&self.usage, self.cost_usd)
+    }
+
+    /// This run's own usage plus everything its sub-agents spent, plus what
+    /// compaction's summarization requests used
+    /// ([`compaction`](Self::compaction)). Decision-model tokens are not
+    /// included (see [`decision`](Self::decision)).
+    ///
+    /// `total_tokens` stays 0, as in [`usage`](Self::usage), and for the same
+    /// reason: providers disagree on what it counts.
+    pub fn total_usage(&self) -> Usage {
+        add_usage(
+            &add_usage(&self.usage, &self.sub_agents.usage),
+            &self.compaction.usage,
+        )
+    }
+
+    /// Dollar cost of this run plus its sub-agents, each priced at its **own**
+    /// model's rates.
+    ///
+    /// `None` when any part of that spend cannot be priced — an unpriced
+    /// sub-agent makes the whole figure unknown rather than silently low — and
+    /// also when no part carries a cost at all (nothing was spent and nothing
+    /// was priced): a priced turn that reported no usage makes it
+    /// `Some(0.0)`, not `None`. Spend of zero tokens needs no price, so a
+    /// zero-usage part never poisons the rest.
+    ///
+    /// Decision-model spend ([`decision`](Self::decision)) and compaction
+    /// spend ([`compaction`](Self::compaction)) are included, under the same
+    /// rule.
+    pub fn total_cost_usd(&self) -> Option<f64> {
+        let own_and_delegated = combine_cost(
+            &self.usage,
+            self.cost_usd,
+            &self.sub_agents.usage,
+            self.sub_agents.cost_usd,
+        );
+        let turns_usage = add_usage(&self.usage, &self.sub_agents.usage);
+        let with_compaction = combine_cost(
+            &turns_usage,
+            own_and_delegated,
+            &self.compaction.usage,
+            self.compaction.cost_usd,
+        );
+        if self.decision.is_unpriced() {
+            return None;
+        }
+        let llm_usage = add_usage(&turns_usage, &self.compaction.usage);
+        combine_cost(
+            &llm_usage,
+            with_compaction,
+            &self.decision.usage,
+            self.decision.cost_usd,
+        )
+    }
+
+    /// Fold another run's stats into this one — own figures into own, the
+    /// delegated bucket into the delegated bucket — with the same unpriced
+    /// rule as [`SubAgentSpend::merge`].
+    pub(crate) fn merge(&mut self, other: &SessionStats) {
+        self.cost_usd = combine_cost(&self.usage, self.cost_usd, &other.usage, other.cost_usd);
+        self.usage = add_usage(&self.usage, &other.usage);
+        self.turns = self.turns.saturating_add(other.turns);
+        self.compactions = self.compactions.saturating_add(other.compactions);
+        self.sub_agents.merge(&other.sub_agents);
+        self.decision.merge(&other.decision);
+        self.compaction.merge(&other.compaction);
+    }
+
+    /// The [`SessionStats`] of a sub-agent run, if `result` came from a
+    /// [`SubAgentTool`](crate::SubAgentTool).
+    ///
+    /// Present on the tool's own return value and on
+    /// [`AgentEvent::ToolExecutionEnd`] — including when the sub-agent
+    /// **failed**: the loop attaches what it spent before failing to the error
+    /// result. Its [`usage`](Self::usage) is the sub-agent's own spend and its
+    /// [`sub_agents`](Self::sub_agents) what *it* delegated, so own and nested
+    /// spend stay distinguishable; [`total_usage`](Self::total_usage) covers the
+    /// subtree.
+    ///
+    /// A custom tool that reported **several** runs from one call (see
+    /// [`ToolContext::report_delegated_run`]) gets their combination: `usage`,
+    /// `turns` and `cost_usd` summed over those runs' own turns, `sub_agents`
+    /// over what they in turn delegated. The subtree totals stay exact; only
+    /// the split between the individual runs is not kept.
+    ///
+    /// Do not add these to [`AgentEvent::AgentEnd`]'s stats as well: the loop
+    /// already folds every delegation into that run's
+    /// [`sub_agents`](Self::sub_agents).
+    pub fn from_sub_agent_result(result: &ToolResult) -> Option<SessionStats> {
+        serde_json::from_value(result.details.get(SUB_AGENT_STATS_KEY)?.clone()).ok()
+    }
+
     /// Fraction of prompt tokens served from cache across the whole session
-    /// (0.0â€“1.0). Delegates to [`Usage::cache_hit_rate`] so there is one
+    /// (0.0–1.0). Delegates to [`Usage::cache_hit_rate`] so there is one
     /// definition of the metric rather than two that can drift.
     pub fn cache_hit_rate(&self) -> f64 {
         self.usage.cache_hit_rate()
@@ -962,26 +1611,287 @@ impl SessionStats {
     /// components sum cleanly; derive a total from those.
     ///
     /// Cost accrues per turn rather than once at the end. Today that is
-    /// arithmetically identical â€” `CostConfig::cost_usd` is linear in every
+    /// arithmetically identical — `CostConfig::cost_usd` is linear in every
     /// `Usage` field and `config.model_config` is fixed for the life of a run
     /// (`run_loop` holds `&AgentLoopConfig`, and `set_model` needs `&mut self`).
     /// It is written this way so a per-turn model override stays correct if one
     /// is ever introduced, and so `cost_usd` reflects whether any turn was
     /// priceable rather than requiring a separate check.
+    ///
+    /// Pricing follows [`combine_cost`]: a turn with non-zero usage and no
+    /// configured rates makes [`cost_usd`](Self::cost_usd) `None` for the rest
+    /// of the run, rather than leaving a partial sum that reads as the whole.
     pub(crate) fn record_turn(
         &mut self,
         usage: &Usage,
         cost: Option<&crate::provider::CostConfig>,
     ) {
-        self.usage.input += usage.input;
-        self.usage.output += usage.output;
-        self.usage.cache_read += usage.cache_read;
-        self.usage.cache_write += usage.cache_write;
-        self.turns += 1;
+        let turn_cost = cost.map(|c| c.cost_usd(usage));
+        self.cost_usd = combine_cost(&self.usage, self.cost_usd, usage, turn_cost);
+        self.usage = add_usage(&self.usage, usage);
+        self.turns = self.turns.saturating_add(1);
+    }
+}
 
-        if let Some(cost) = cost.filter(|c| c.is_configured()) {
-            *self.cost_usd.get_or_insert(0.0) += cost.cost_usd(usage);
+/// Key under which a sub-agent's [`SessionStats`] ride in
+/// [`ToolResult::details`]. Read it with
+/// [`SessionStats::from_sub_agent_result`] rather than by hand.
+pub const SUB_AGENT_STATS_KEY: &str = "sub_agent_stats";
+
+fn add_usage(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        input: a.input.saturating_add(b.input),
+        output: a.output.saturating_add(b.output),
+        cache_read: a.cache_read.saturating_add(b.cache_read),
+        cache_write: a.cache_write.saturating_add(b.cache_write),
+        // Not summed — see `SessionStats::record_turn`.
+        total_tokens: 0,
+    }
+}
+
+fn usage_is_zero(u: &Usage) -> bool {
+    u.input == 0 && u.output == 0 && u.cache_read == 0 && u.cache_write == 0
+}
+
+/// Spend that happened but has no price: non-zero usage, no cost.
+fn is_unpriced(usage: &Usage, cost: Option<f64>) -> bool {
+    cost.is_none() && !usage_is_zero(usage)
+}
+
+/// The cost of two pieces of spend together — the one rule every rollup
+/// shares ([`SessionStats::record_turn`], [`SessionStats::total_cost_usd`],
+/// [`SubAgentSpend::merge`], `Agent::total_cost_usd`).
+///
+/// `None` if either piece is unpriced — sticky, so a later priced piece never
+/// revives a sum that silently skipped part of the bill. A zero-usage piece
+/// with no cost needs no price and does not poison the other. `None` too when
+/// neither piece carries a cost at all (nothing was spent and nothing was
+/// priced); a priced piece that spent nothing contributes `Some(0.0)`.
+///
+/// Both naive `Option` sums are wrong: `zip` drops a priced piece when the
+/// other merely spent nothing, and `unwrap_or(0.0)` turns unpriced into free.
+pub(crate) fn combine_cost(
+    a_usage: &Usage,
+    a_cost: Option<f64>,
+    b_usage: &Usage,
+    b_cost: Option<f64>,
+) -> Option<f64> {
+    if is_unpriced(a_usage, a_cost) || is_unpriced(b_usage, b_cost) {
+        return None;
+    }
+    match (a_cost, b_cost) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+    }
+}
+
+/// Spend of delegated [`SubAgentTool`](crate::SubAgentTool) runs, carried as
+/// [`SessionStats::sub_agents`] and returned by
+/// [`Agent::sub_agent_spend`](crate::Agent::sub_agent_spend).
+///
+/// Every figure covers the whole delegation tree: a sub-agent's own nested
+/// sub-agents are included, so one top-level number accounts for all of it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SubAgentSpend {
+    /// Provider usage summed over every delegated run. `total_tokens` stays 0,
+    /// as in [`SessionStats::usage`].
+    #[serde(default)]
+    pub usage: Usage,
+    /// Dollar cost of [`usage`](Self::usage), each run priced at its own
+    /// model's rates — a sub-agent on a cheaper model is billed as such, never
+    /// re-priced at the parent's.
+    ///
+    /// `None` is never "free", but it means one of two things: the delegated
+    /// spend **cannot be priced** — sticky as soon as any delegated spend came
+    /// from a model with `cost: None`, because a sum that silently
+    /// skips the unpriced part is the under-report this field exists to
+    /// remove — or there was **nothing to price** (no delegation, or runs that
+    /// reported no usage). [`is_unpriced`](Self::is_unpriced) tells them
+    /// apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Sub-agent invocations, nested ones included. Non-zero means delegation
+    /// happened even when it cost nothing measurable.
+    #[serde(default)]
+    pub runs: u32,
+}
+
+impl SubAgentSpend {
+    /// Whether nothing was delegated.
+    pub fn is_empty(&self) -> bool {
+        self.runs == 0 && usage_is_zero(&self.usage) && self.cost_usd.is_none()
+    }
+
+    /// Whether delegated spend happened that cannot be priced: non-zero
+    /// [`usage`](Self::usage) with no [`cost_usd`](Self::cost_usd). `false`
+    /// for an empty bucket, where `cost_usd` is `None` because there is
+    /// nothing to price.
+    pub fn is_unpriced(&self) -> bool {
+        is_unpriced(&self.usage, self.cost_usd)
+    }
+
+    /// Fold another bucket into this one — for a caller accumulating across
+    /// runs.
+    ///
+    /// Use this rather than adding fields by hand: it keeps
+    /// [`cost_usd`](Self::cost_usd) `None` once any part is unpriced, which a
+    /// plain `Option` sum gets wrong in both directions.
+    pub fn merge(&mut self, other: &SubAgentSpend) {
+        self.cost_usd = combine_cost(&self.usage, self.cost_usd, &other.usage, other.cost_usd);
+        self.usage = add_usage(&self.usage, &other.usage);
+        self.runs = self.runs.saturating_add(other.runs);
+    }
+
+    /// Fold in one sub-agent run, given that run's own stats — its own spend
+    /// and, recursively, everything it delegated.
+    pub(crate) fn record_run(&mut self, child: &SessionStats) {
+        let mut subtree = SubAgentSpend {
+            usage: child.usage.clone(),
+            cost_usd: child.cost_usd,
+            runs: 1,
+        };
+        subtree.merge(&child.sub_agents);
+        self.merge(&subtree);
+    }
+}
+
+/// Where a [`SubAgentTool`](crate::SubAgentTool) reports its run's stats to the
+/// loop that invoked it. A side channel rather than the tool's return value
+/// because a failed delegation returns `Err(ToolError)`, which has nowhere to
+/// carry them — and the spend of a failed run is still spend.
+///
+/// A `Vec` because [`ToolContext`] is `Clone`: a custom tool may hand clones to
+/// several sub-agents within one call, and each run must be counted.
+pub(crate) type SubAgentReport = Arc<std::sync::Mutex<Vec<SessionStats>>>;
+
+#[cfg(test)]
+mod spend_rollup_tests {
+    use super::*;
+    use crate::provider::CostConfig;
+
+    fn u(input: u64) -> Usage {
+        Usage {
+            input,
+            ..Usage::default()
         }
+    }
+
+    /// $1 per million input tokens, so `u(1_000_000)` costs exactly $1.
+    fn priced() -> CostConfig {
+        CostConfig::new(1.0, 0.0)
+    }
+
+    /// An unpriced turn that spent tokens poisons the run's cost, and a
+    /// priced turn after it must not revive a partial sum — the same rule as
+    /// `SubAgentSpend::merge`.
+    #[test]
+    fn record_turn_unpriced_then_priced_is_unknown() {
+        let mut stats = SessionStats::default();
+        stats.record_turn(&u(1_000_000), None);
+        assert_eq!(stats.cost_usd, None);
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+        assert_eq!(stats.cost_usd, None, "a partial sum would under-report");
+        assert!(stats.is_unpriced());
+        assert_eq!(stats.usage, u(2_000_000));
+        assert_eq!(stats.turns, 2);
+    }
+
+    #[test]
+    fn record_turn_priced_then_unpriced_is_unknown() {
+        let mut stats = SessionStats::default();
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+        assert_eq!(stats.cost_usd, Some(1.0));
+        stats.record_turn(&u(1), None);
+        assert_eq!(stats.cost_usd, None);
+    }
+
+    /// A zero-rate config means free, not unknown: it prices at 0.0 and does
+    /// not poison the sum.
+    #[test]
+    fn record_turn_free_model_prices_at_zero() {
+        let mut stats = SessionStats::default();
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+        stats.record_turn(&u(1_000_000), Some(&CostConfig::default()));
+        assert_eq!(stats.cost_usd, Some(1.0));
+        assert!(!stats.is_unpriced());
+    }
+
+    #[test]
+    fn record_turn_sums_priced_turns_and_ignores_empty_unpriced_ones() {
+        let mut stats = SessionStats::default();
+        // No usage reported: nothing to price, so no poison.
+        stats.record_turn(&Usage::default(), None);
+        assert_eq!(stats.cost_usd, None);
+        assert!(!stats.is_unpriced(), "nothing spent is not unpriced");
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+        stats.record_turn(&u(2_000_000), Some(&priced()));
+        assert_eq!(stats.cost_usd, Some(3.0));
+        assert!(!stats.is_unpriced());
+    }
+
+    #[test]
+    fn usage_sums_saturate_instead_of_overflowing() {
+        let mut a = SubAgentSpend {
+            usage: u(u64::MAX - 1),
+            cost_usd: Some(1.0),
+            runs: u32::MAX,
+        };
+        a.merge(&a.clone());
+        assert_eq!(a.usage.input, u64::MAX);
+        assert_eq!(a.runs, u32::MAX);
+    }
+
+    /// Compaction spend is part of both totals, priced with its own rates,
+    /// and leaves the run's own figures alone.
+    #[test]
+    fn compaction_spend_counts_in_the_totals() {
+        let mut stats = SessionStats::default();
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+        stats
+            .compaction
+            .record_request(&u(1_000_000), Some(&CostConfig::new(3.0, 0.0)));
+        assert_eq!(stats.cost_usd, Some(1.0));
+        assert_eq!(stats.usage.input, 1_000_000);
+        assert_eq!(stats.total_cost_usd(), Some(4.0));
+        assert_eq!(stats.total_usage().input, 2_000_000);
+        assert_eq!(stats.compaction.requests, 1);
+    }
+
+    /// An unpriced summarizer makes the whole bill unknown — and stays
+    /// unknown after a later priced request — while a zero-usage unpriced
+    /// response needs no price.
+    #[test]
+    fn unpriced_compaction_poisons_the_total() {
+        let mut stats = SessionStats::default();
+        stats.record_turn(&u(1_000_000), Some(&priced()));
+
+        stats.compaction.record_request(&u(0), None);
+        assert_eq!(stats.total_cost_usd(), Some(1.0));
+        assert!(!stats.compaction.is_unpriced());
+
+        stats.compaction.record_request(&u(10), None);
+        stats.compaction.record_request(&u(10), Some(&priced()));
+        assert!(stats.compaction.is_unpriced());
+        assert_eq!(stats.compaction.cost_usd, None);
+        assert_eq!(stats.total_cost_usd(), None);
+        assert_eq!(stats.compaction.requests, 3);
+    }
+
+    /// Merging runs (the `Agent` window) keeps the compaction bucket apart.
+    #[test]
+    fn merge_folds_the_compaction_bucket() {
+        let mut run = SessionStats::default();
+        run.compaction
+            .record_request(&u(1_000_000), Some(&priced()));
+        let mut total = SessionStats::default();
+        total.merge(&run);
+        total.merge(&run);
+        assert_eq!(total.compaction.requests, 2);
+        assert_eq!(total.compaction.cost_usd, Some(2.0));
+        assert_eq!(total.usage, Usage::default());
+        assert_eq!(total.total_cost_usd(), Some(2.0));
     }
 }
 
@@ -996,7 +1906,7 @@ impl SessionStats {
 pub struct SummaryStats {
     /// Messages the briefing replaced.
     ///
-    /// Zero when a briefing was produced but could not be kept â€” the request
+    /// Zero when a briefing was produced but could not be kept — the request
     /// was still paid for, so the event still reports it, but `method` will be
     /// [`CompactionMethod::Deterministic`].
     pub messages_summarized: usize,
@@ -1026,10 +1936,10 @@ impl SummaryStats {
 pub enum CompactionMethod {
     /// History was replaced by an LLM-written summary.
     Summarized,
-    /// Deterministic tiered compaction ran: truncate â†’ summarize â†’ drop.
+    /// Deterministic tiered compaction ran: truncate → summarize → drop.
     ///
     /// On [`LlmCompaction`](crate::LlmCompaction) this means no briefing made
-    /// it into the result â€” none was ready, one was discarded as stale, or one
+    /// it into the result — none was ready, one was discarded as stale, or one
     /// was produced but could not be kept within the budget. The loop stayed
     /// unblocked; the compaction was lossy. Check `summary` to tell a free
     /// fallback from one that still paid for a request.
@@ -1081,10 +1991,351 @@ pub enum FilterResult {
 /// Synchronous filter applied to user input before the LLM call.
 ///
 /// Implement this for injection detection, content moderation, PII redaction, etc.
-/// Filters run in the hot path and must be fast â€” use `before_turn` callbacks
-/// for async moderation (external API calls).
-pub trait InputFilter: Send + Sync {
+/// Filters run in the hot path and must be fast. For a filter that awaits
+/// something (a moderation API, a classifier), implement
+/// [`AsyncInputFilter`] instead and register it with
+/// [`Agent::with_async_input_filter`](crate::Agent::with_async_input_filter)
+/// (or push an [`AsyncFilter`] onto
+/// [`AgentLoopConfig::input_filters`](crate::agent_loop::AgentLoopConfig)).
+pub trait InputFilter: crate::rt::MaybeSend + crate::rt::MaybeSync {
     fn filter(&self, text: &str) -> FilterResult;
+
+    /// The async filter behind this one, if any. The loop awaits it instead
+    /// of calling [`filter`](Self::filter).
+    ///
+    /// Provided (returns `None`), so existing filters are unaffected; only
+    /// [`AsyncFilter`] overrides it.
+    fn as_async(&self) -> Option<&dyn AsyncInputFilter> {
+        None
+    }
+}
+
+/// An input filter that may await — the async counterpart of
+/// [`InputFilter`], with the same [`FilterResult`] semantics.
+///
+/// It runs in the same place and order as the sync filters (they share one
+/// list), before the prompt reaches the model.
+///
+/// **You own the timeout.** The loop awaits the filter as long as it takes,
+/// and a slow filter delays every prompt: bound it yourself (e.g.
+/// `tokio::time::timeout`) and decide there whether a timeout passes or
+/// rejects. A filter that **panics** is contained and treated as a
+/// `Reject` (fail closed): the run ends with an
+/// [`AgentEvent::InputRejected`] and the agent keeps its state.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait AsyncInputFilter: crate::rt::MaybeSend + crate::rt::MaybeSync {
+    /// Judge the prompt's text (every user text block, joined by newlines).
+    async fn filter(&self, text: &str) -> FilterResult;
+}
+
+/// Adapts an [`AsyncInputFilter`] into the [`InputFilter`] list.
+///
+/// The loop recognises it through [`InputFilter::as_async`] and awaits the
+/// inner filter. Its synchronous [`InputFilter::filter`] cannot await, so it
+/// fails closed: called directly, it rejects.
+pub struct AsyncFilter<F>(F);
+
+impl<F: AsyncInputFilter> AsyncFilter<F> {
+    /// Wrap `filter` for an [`InputFilter`] list.
+    pub fn new(filter: F) -> Self {
+        Self(filter)
+    }
+}
+
+impl<F: AsyncInputFilter> InputFilter for AsyncFilter<F> {
+    fn filter(&self, _text: &str) -> FilterResult {
+        FilterResult::Reject(
+            "an async input filter was called synchronously; await it via InputFilter::as_async"
+                .into(),
+        )
+    }
+
+    fn as_async(&self) -> Option<&dyn AsyncInputFilter> {
+        Some(&self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the user's request out of a conversation
+// ---------------------------------------------------------------------------
+
+/// Whether a user-role text was written by the loop or by compaction rather
+/// than by the user: compaction summaries and markers, execution-limit and
+/// loop-abort notes, the loop-detection nudge, and extension continue
+/// messages.
+///
+/// Use it to skip those messages when reading "what the user said" out of
+/// [`ToolCallRequest::messages`] or [`TurnContext::messages`]. The one list,
+/// built from the constants where each message is written, so it cannot
+/// drift; [`ToolCallRequest::user_request`] uses it.
+pub fn is_loop_injected(text: &str) -> bool {
+    [
+        crate::context::SUMMARY_PREFIX,
+        crate::context::COMPACTION_MARKER,
+        crate::llm_compaction::SUMMARY_MARKER,
+        crate::agent_loop::AGENT_STOPPED_PREFIX,
+        crate::agent_loop::LOOP_ABORT_PREFIX,
+        crate::agent_loop::LOOP_NUDGE_PREFIX,
+        crate::extension::EXTENSION_MESSAGE_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn text_blocks(content: &[Content]) -> Option<String> {
+    let text: Vec<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n"))
+}
+
+/// The text of a message the user wrote: `None` for other roles, for user
+/// messages without text, and for loop-injected ones.
+fn real_user_text(m: &Message) -> Option<String> {
+    match m {
+        Message::User { content, .. } if is_real_user(m) => text_blocks(content),
+        _ => None,
+    }
+}
+
+/// Whether `m` is a message the user wrote — not loop-injected — with or
+/// without text (an image-only prompt counts).
+fn is_real_user(m: &Message) -> bool {
+    match m {
+        Message::User { content, .. } => !content
+            .iter()
+            .find_map(|c| match c {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .is_some_and(is_loop_injected),
+        _ => false,
+    }
+}
+
+/// Whether a message marks where compaction removed or rewrote history:
+/// the drop marker, an `LlmCompaction` summary, or a level-2 `[Summary]`.
+/// Nothing before one can be trusted to belong to the current request.
+fn is_compaction_boundary(m: &Message) -> bool {
+    let Message::User { content, .. } = m else {
+        return false;
+    };
+    content.iter().any(|c| {
+        matches!(c, Content::Text { text } if
+            text.starts_with(crate::context::COMPACTION_MARKER)
+                || text.starts_with(crate::llm_compaction::SUMMARY_MARKER)
+                || text.starts_with(crate::context::SUMMARY_PREFIX))
+    })
+}
+
+/// Below this many characters a user message may be a reply ("yes, go
+/// ahead") that needs the question it answers.
+const SHORT_REPLY_CHARS: usize = 40;
+
+/// Whether assistant text ends by asking a question: its final sentence
+/// ends in `?` once fenced code blocks and inline code are removed and
+/// trailing whitespace and closing markup are trimmed. A `?` inside code
+/// (Rust's `?`, a regex, a URL query) does not count.
+pub(crate) fn ends_with_question(text: &str) -> bool {
+    let mut prose = String::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // Drop inline code spans: every other backtick-delimited segment.
+        for (i, part) in line.split('`').enumerate() {
+            if i % 2 == 0 {
+                prose.push_str(part);
+            }
+        }
+        prose.push('\n');
+    }
+    let trimmed = prose
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | ')' | '"' | '\''));
+    trimmed.ends_with('?')
+}
+
+/// The most recent message the user wrote, not looking back past a
+/// compaction boundary — and not past that message either: if it has no
+/// text (an image-only prompt), the answer is `None`.
+pub(crate) fn latest_user_text_of(messages: &[&Message]) -> Option<String> {
+    let start = messages
+        .iter()
+        .rposition(|m| is_compaction_boundary(m))
+        .map_or(0, |b| b + 1);
+    messages[start..]
+        .iter()
+        .rev()
+        .find(|m| is_real_user(m))
+        .and_then(|m| real_user_text(m))
+}
+
+/// What the user is asking for, as a decision policy should judge it.
+///
+/// 1. The latest message the user wrote **after the most recent compaction
+///    boundary** — nothing before a boundary is trusted, because
+///    compaction keeps the session's head, which may hold an unrelated,
+///    older request. Loop-injected messages are skipped. The search stops at
+///    that message even when it has no text (an image-only prompt): an
+///    earlier message is never promoted in its place.
+///    - When that message is short (under 40 characters) **and** the
+///      assistant text before it ends with a question, the assistant text
+///      and the user's earlier request (both after the boundary) are
+///      included, labelled, so "yes, go ahead" carries what it confirms.
+/// 2. When there is no such message, or it has no text: the text of the
+///    run's own prompts (`run_prompts`: the messages this run was given,
+///    which compaction cannot remove).
+/// 3. Otherwise `None`.
+pub(crate) fn user_request_of(messages: &[&Message], run_prompts: &[Message]) -> Option<String> {
+    user_request_parts_of(messages, run_prompts).map(|p| p.to_prose())
+}
+
+/// The pieces [`ToolCallRequest::user_request`] joins into prose, for
+/// policies that want them separately; see
+/// [`ToolCallRequest::user_request_parts`].
+///
+/// Marked `#[non_exhaustive]`: fields may be added in minor releases. Read
+/// it; [`ToolCallRequest`] and [`TurnContext`] build it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UserRequestParts {
+    /// The request's text: the latest message the user wrote after the most
+    /// recent compaction boundary — or, from [`UserRequestSource::RunPrompts`],
+    /// the last of the run's prompts (all of them are in
+    /// [`run_prompts`](Self::run_prompts)).
+    pub latest: String,
+    /// When `latest` is a short reply (under 40 characters) to an assistant
+    /// message ending with a question: that question and the request before
+    /// it.
+    pub reply: Option<ReplyContext>,
+    /// Where `latest` came from.
+    pub source: UserRequestSource,
+    /// From [`UserRequestSource::RunPrompts`]: the text of each of the run's
+    /// prompts, in order. Empty for [`UserRequestSource::Conversation`].
+    pub run_prompts: Vec<String>,
+}
+
+/// What a short reply answers; see [`UserRequestParts::reply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReplyContext {
+    /// The assistant text the reply answers (it ends with a question).
+    pub question: String,
+    /// The user's message before that question (after the same compaction
+    /// boundary), when there is one.
+    pub earlier_request: Option<String>,
+}
+
+/// Where [`UserRequestParts::latest`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UserRequestSource {
+    /// A message the user wrote, found in the conversation.
+    Conversation,
+    /// The run's own prompts: the conversation showed no usable user message
+    /// (compacted away, or image-only).
+    RunPrompts,
+}
+
+impl UserRequestParts {
+    /// The prose form [`ToolCallRequest::user_request`] returns. Not a
+    /// stable format.
+    fn to_prose(&self) -> String {
+        if self.source == UserRequestSource::RunPrompts && self.run_prompts.len() > 1 {
+            return self
+                .run_prompts
+                .iter()
+                .map(|t| format!("User: {t}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+        }
+        let Some(reply) = &self.reply else {
+            return self.latest.clone();
+        };
+        let mut parts = Vec::new();
+        if let Some(e) = &reply.earlier_request {
+            parts.push(format!("Earlier user request: {e}"));
+        }
+        parts.push(format!("Assistant: {}", reply.question));
+        parts.push(format!("Latest user message: {}", self.latest));
+        parts.join("\n\n")
+    }
+}
+
+/// [`user_request_of`], in parts.
+pub(crate) fn user_request_parts_of(
+    messages: &[&Message],
+    run_prompts: &[Message],
+) -> Option<UserRequestParts> {
+    let from_prompts = || {
+        let texts: Vec<String> = run_prompts.iter().filter_map(real_user_text).collect();
+        texts.last().cloned().map(|latest| UserRequestParts {
+            latest,
+            reply: None,
+            source: UserRequestSource::RunPrompts,
+            run_prompts: texts,
+        })
+    };
+    let start = messages
+        .iter()
+        .rposition(|m| is_compaction_boundary(m))
+        .map_or(0, |b| b + 1);
+    let window = &messages[start..];
+
+    let Some(at) = window.iter().rposition(|m| is_real_user(m)) else {
+        return from_prompts();
+    };
+    let Some(latest) = real_user_text(window[at]) else {
+        return from_prompts();
+    };
+    let short = latest.chars().count() < SHORT_REPLY_CHARS;
+    let mut parts = UserRequestParts {
+        latest,
+        reply: None,
+        source: UserRequestSource::Conversation,
+        run_prompts: Vec::new(),
+    };
+    if !short {
+        return Some(parts);
+    }
+
+    // The assistant text the reply answers: the nearest assistant message
+    // with text, not looking past the user's previous message.
+    let mut asked: Option<(usize, String)> = None;
+    for (i, m) in window[..at].iter().enumerate().rev() {
+        if is_real_user(m) {
+            break;
+        }
+        if let Message::Assistant { content, .. } = m {
+            if let Some(text) = text_blocks(content) {
+                asked = Some((i, text));
+                break;
+            }
+        }
+    }
+    let Some((asked_at, question)) = asked.filter(|(_, a)| ends_with_question(a)) else {
+        return Some(parts);
+    };
+    let earlier_request = window[..asked_at]
+        .iter()
+        .rev()
+        .find(|m| is_real_user(m))
+        .and_then(|m| real_user_text(m));
+    parts.reply = Some(ReplyContext {
+        question,
+        earlier_request,
+    });
+    Some(parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +2345,7 @@ pub trait InputFilter: Send + Sync {
 /// Decision returned by a [`ToolMiddleware`] before a tool executes.
 ///
 /// Deliberately NOT `#[non_exhaustive]` (same policy as [`StopReason`]):
-/// this is a control-flow enum â€” a new variant should be a compile error for
+/// this is a control-flow enum — a new variant should be a compile error for
 /// matchers, not a silent wildcard fallthrough. Interactive flows like
 /// "ask the user" need no variant: the hook is `async`, so prompt inside the
 /// middleware and return `Allow`/`Deny`.
@@ -1110,26 +2361,15 @@ pub enum ToolDecision {
     Deny(String),
 }
 
-/// Async hook that gates every tool call â€” the mechanism behind permission
-/// prompts, policy engines, and argument rewriting.
-///
-/// agent ships the mechanism, not a policy: install middleware via
-/// [`Agent::with_tool_middleware`](crate::Agent::with_tool_middleware) (or
-/// [`AgentLoopConfig::tool_middleware`](crate::agent_loop::AgentLoopConfig))
-/// and decide per call. Middleware run in a chain: each may rewrite the
-/// arguments seen by later ones; the first `Deny` wins. With no middleware
-/// installed, every call is allowed â€” behavior is unchanged.
-///
-/// The hook is `async` so an interactive app can prompt a human. Under the
-/// default [`ToolExecutionStrategy::Parallel`], middleware for parallel tool
-/// calls runs concurrently â€” serialize approval prompts inside your
-/// implementation (or use `Sequential`) if you need one-at-a-time UX.
 /// Borrowed view of a pending tool call, passed to
 /// [`ToolMiddleware::before_tool`].
 ///
 /// Marked `#[non_exhaustive]`: fields may be added in minor releases (turn
 /// number, history access, ...) without breaking middleware implementations.
-/// Constructed by the loop; middleware only reads it.
+/// Constructed by the loop; middleware only reads it. To unit-test a
+/// middleware, build one with [`ToolCallRequest::new`] plus
+/// [`with_messages`](Self::with_messages) /
+/// [`with_run_prompts`](Self::with_run_prompts).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ToolCallRequest<'a> {
@@ -1140,11 +2380,215 @@ pub struct ToolCallRequest<'a> {
     /// Arguments as the model provided them (possibly rewritten by earlier
     /// middleware in the chain).
     pub args: &'a serde_json::Value,
+    /// The loop's conversation context at the time of the call: history
+    /// *before* `transform_context` / `convert_to_llm`, so it may differ from
+    /// what the model saw, ending with the assistant message carrying this
+    /// call. For policies that depend on what the user asked — see
+    /// [`user_request`](Self::user_request).
+    pub messages: &'a [AgentMessage],
+    /// The user messages this run was given — its prompts, steering and
+    /// follow-ups — which compaction cannot remove from here. Used by
+    /// [`user_request`](Self::user_request) when the conversation no longer
+    /// shows what the user asked.
+    pub run_prompts: &'a [Message],
 }
 
-#[async_trait::async_trait]
-pub trait ToolMiddleware: Send + Sync {
+impl<'a> ToolCallRequest<'a> {
+    /// A request for one call with no conversation (see
+    /// [`with_messages`](Self::with_messages) and
+    /// [`with_run_prompts`](Self::with_run_prompts)) — for testing a
+    /// [`ToolMiddleware`] outside the loop; the loop builds the real one.
+    ///
+    /// ```
+    /// use agent::{Message, ToolCallRequest};
+    /// let args = serde_json::json!({"path": "/tmp/x"});
+    /// let prompts = [Message::user("delete /tmp/x")];
+    /// let call = ToolCallRequest::new("call-1", "rm", &args).with_run_prompts(&prompts);
+    /// assert_eq!(call.user_request().as_deref(), Some("delete /tmp/x"));
+    /// ```
+    pub fn new(tool_call_id: &'a str, tool_name: &'a str, args: &'a serde_json::Value) -> Self {
+        Self {
+            tool_call_id,
+            tool_name,
+            args,
+            messages: &[],
+            run_prompts: &[],
+        }
+    }
+
+    /// Set the conversation the call is made in (see
+    /// [`messages`](Self::messages)).
+    pub fn with_messages(mut self, messages: &'a [AgentMessage]) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// Set the run's prompts (see [`run_prompts`](Self::run_prompts)).
+    pub fn with_run_prompts(mut self, run_prompts: &'a [Message]) -> Self {
+        self.run_prompts = run_prompts;
+        self
+    }
+
+    fn llm_messages(&self) -> Vec<&Message> {
+        self.messages
+            .iter()
+            .filter_map(AgentMessage::as_llm)
+            .collect()
+    }
+
+    /// The text of the most recent message the user wrote, not looking back
+    /// past a compaction boundary. Loop-injected user-role messages
+    /// (compaction summaries, limit notes, the loop-detection nudge) are
+    /// skipped.
+    pub fn latest_user_text(&self) -> Option<String> {
+        latest_user_text_of(&self.llm_messages())
+    }
+
+    /// What the user is asking for: the latest user message after the most
+    /// recent compaction boundary — with, when it is a short reply to an
+    /// assistant question, that question and the earlier request — else the
+    /// run's own prompts ([`run_prompts`](Self::run_prompts)), else `None`.
+    ///
+    /// Including the assistant's question widens what counts as requested,
+    /// and that text can itself be steered by injected content.
+    ///
+    /// The prose (its `Earlier user request:` / `Assistant:` / `Latest user
+    /// message:` labels and separators) is **not a stable format**; parse
+    /// [`user_request_parts`](Self::user_request_parts) instead.
+    pub fn user_request(&self) -> Option<String> {
+        user_request_of(&self.llm_messages(), self.run_prompts)
+    }
+
+    /// [`user_request`](Self::user_request) as structured parts: the same
+    /// selection, before it is joined into prose.
+    pub fn user_request_parts(&self) -> Option<UserRequestParts> {
+        user_request_parts_of(&self.llm_messages(), self.run_prompts)
+    }
+}
+
+/// Async hook that gates every tool call — the mechanism behind permission
+/// prompts, policy engines, and argument rewriting.
+///
+/// agent ships the mechanism, not a policy: install middleware via
+/// [`Agent::with_tool_middleware`](crate::Agent::with_tool_middleware) (or
+/// [`AgentLoopConfig::tool_middleware`](crate::agent_loop::AgentLoopConfig))
+/// and decide per call. Middleware run in a chain: each may rewrite the
+/// arguments seen by later ones; the first `Deny` wins. With no middleware
+/// installed, every call is allowed — behavior is unchanged.
+///
+/// The hook is `async` so an interactive app can prompt a human. Under the
+/// default [`ToolExecutionStrategy::Parallel`], middleware for parallel tool
+/// calls runs concurrently — serialize approval prompts inside your
+/// implementation (or use `Sequential`) if you need one-at-a-time UX.
+///
+/// Middleware never sees a call whose arguments failed to resolve to a JSON
+/// object (cut off mid-stream, or not an object — see
+/// [`parse_tool_arguments`](crate::provider::parse_tool_arguments)). The loop
+/// answers such a call with an error tool result *before* the chain runs, so
+/// there is no real call to approve, deny or rewrite.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait ToolMiddleware: crate::rt::MaybeSend + crate::rt::MaybeSync {
     async fn before_tool(&self, call: &ToolCallRequest<'_>) -> ToolDecision;
+}
+
+// ---------------------------------------------------------------------------
+// Turn hooks
+// ---------------------------------------------------------------------------
+
+/// Borrowed view of the request about to be sent for one turn, passed to
+/// [`TurnHook::before_turn`].
+///
+/// Marked `#[non_exhaustive]`: fields may be added in minor releases. Build
+/// one with [`TurnContext::new`] to test a hook.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TurnContext<'a> {
+    /// The system prompt of the request.
+    pub system_prompt: &'a str,
+    /// The messages being sent, after `transform_context`/`convert_to_llm`
+    /// and before any hook's note.
+    pub messages: &'a [Message],
+    /// The tools offered this turn.
+    pub tools: &'a [crate::provider::ToolDefinition],
+    /// The model id.
+    pub model: &'a str,
+    /// The user messages this run was given (prompts, steering,
+    /// follow-ups), which compaction cannot remove; see
+    /// [`ToolCallRequest::run_prompts`].
+    pub run_prompts: &'a [Message],
+}
+
+impl<'a> TurnContext<'a> {
+    /// A context with no run prompts (see [`with_run_prompts`](Self::with_run_prompts)),
+    /// for testing a [`TurnHook`]; the loop builds the real one.
+    pub fn new(
+        system_prompt: &'a str,
+        messages: &'a [Message],
+        tools: &'a [crate::provider::ToolDefinition],
+        model: &'a str,
+    ) -> Self {
+        Self {
+            system_prompt,
+            messages,
+            tools,
+            model,
+            run_prompts: &[],
+        }
+    }
+
+    /// Set the run's prompts (the loop does this for you).
+    pub fn with_run_prompts(mut self, run_prompts: &'a [Message]) -> Self {
+        self.run_prompts = run_prompts;
+        self
+    }
+
+    /// The text of the most recent message the user wrote (loop-injected
+    /// messages skipped, not looking back past a compaction boundary).
+    pub fn latest_user_text(&self) -> Option<String> {
+        latest_user_text_of(&self.messages.iter().collect::<Vec<_>>())
+    }
+
+    /// What the user is asking for; see [`ToolCallRequest::user_request`]
+    /// (the prose is not a stable format).
+    pub fn user_request(&self) -> Option<String> {
+        user_request_of(&self.messages.iter().collect::<Vec<_>>(), self.run_prompts)
+    }
+
+    /// [`user_request`](Self::user_request) as structured parts; see
+    /// [`ToolCallRequest::user_request_parts`].
+    pub fn user_request_parts(&self) -> Option<UserRequestParts> {
+        user_request_parts_of(&self.messages.iter().collect::<Vec<_>>(), self.run_prompts)
+    }
+}
+
+/// An async hook run before every LLM request, able to add one transient
+/// note to that request's **latest user turn**.
+///
+/// The note is for **this request only**: it is appended as a text block to
+/// the last user message being sent, never stored in history, and a hook
+/// that returns `None` leaves the request byte-for-byte unchanged. Notes from
+/// several hooks are joined in installation order.
+///
+/// **Prompt caching.** The note is on the latest user message; everything
+/// before that message is unchanged, so the provider's cached prefix up to
+/// it survives. (During tool turns, assistant and tool-result messages
+/// follow the note.) On the next user prompt the previous user message is
+/// sent without its note, so that last exchange is re-processed — a cache
+/// miss from there. Keep the note stable within one request (derive it from
+/// the user's request, not from every tool result) so its tool-calling
+/// turns cache too.
+///
+/// Install via [`Agent::with_turn_hook`](crate::Agent::with_turn_hook), or
+/// for a raw loop wrap the provider in
+/// [`TurnHookProvider`](crate::provider::TurnHookProvider). The hook runs
+/// once per provider call, so a retried request runs it again; memoize if it
+/// is expensive. A panicking hook is contained and contributes nothing.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait TurnHook: crate::rt::MaybeSend + crate::rt::MaybeSync {
+    /// Return a note to append to this request's latest user turn, or `None`.
+    async fn before_turn(&self, turn: &TurnContext<'_>) -> Option<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,8 +2596,10 @@ pub trait ToolMiddleware: Send + Sync {
 // ---------------------------------------------------------------------------
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // web_time: std::time on native targets; the host clock on wasm32, where
+    // std::time::SystemTime::now() panics.
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
@@ -1186,7 +2632,7 @@ impl fmt::Display for StopReason {
 ///
 /// This lives in the defining crate on purpose. Both enums are
 /// `#[non_exhaustive]`, so an integration test *cannot* match them
-/// exhaustively â€” its match needs a `_` arm, and a wildcard turns "adding a
+/// exhaustively — its match needs a `_` arm, and a wildcard turns "adding a
 /// variant fails to compile" into "adding a variant is silently untested".
 /// Inside this crate exhaustiveness still applies.
 #[cfg(test)]
@@ -1201,7 +2647,7 @@ mod wire_tag_freeze {
     /// hand-written sample list and a hand-written variant count could never
     /// notice a *new* variant, because a new variant appears in neither. Here
     /// the generated match has no wildcard, so adding a variant fails to
-    /// compile â€” and the only way to fix that is to add a line below, which
+    /// compile — and the only way to fix that is to add a line below, which
     /// supplies the sample in the same breath.
     ///
     /// Three mistakes are caught by the compiler rather than by luck: a
@@ -1212,19 +2658,19 @@ mod wire_tag_freeze {
     /// The specifier is `pat_param`, not `pat`, and that is load-bearing: `pat`
     /// would accept an or-pattern, letting someone answer the compile error by
     /// widening an unrelated arm (`TurnStart | NewVariant => "turnStart"`)
-    /// instead of adding a line â€” leaving the new variant with no sample and no
+    /// instead of adding a line — leaving the new variant with no sample and no
     /// coverage, which is exactly the hole this macro exists to close. No arm
     /// can legitimately need one, since two variants cannot share a tag.
     macro_rules! wire_freeze {
         ($ty:ty, $tag_of:ident, $samples:ident, $($pat:pat_param => $tag:literal = $sample:expr),+ $(,)?) => {
             /// The frozen `"type"` tag per variant. Changing one breaks every
-            /// deployed wire client â€” do not edit casually.
+            /// deployed wire client — do not edit casually.
             fn $tag_of(v: &$ty) -> &'static str {
                 match v { $($pat => $tag,)+ }
             }
 
             /// One sample per variant, in declaration order. The tests re-derive
-            /// each tag from its sample rather than trusting that order â€” see
+            /// each tag from its sample rather than trusting that order — see
             /// [`assert_frozen`].
             fn $samples() -> Vec<$ty> { vec![$($sample,)+] }
         };
@@ -1284,6 +2730,39 @@ mod wire_tag_freeze {
                 turns: 3,
                 cost_usd: Some(0.02),
                 compactions: 1,
+                sub_agents: SubAgentSpend {
+                    usage: Usage {
+                        input: 50,
+                        output: 60,
+                        cache_read: 70,
+                        cache_write: 80,
+                        total_tokens: 0,
+                    },
+                    cost_usd: Some(0.2),
+                    runs: 2,
+                },
+                decision: DecisionStats {
+                    requests: 3,
+                    failures: 1,
+                    timeouts: 1,
+                    usage: Usage {
+                        input: 900,
+                        ..Default::default()
+                    },
+                    cost_usd: Some(0.0000378),
+                    unpriced: 0,
+                },
+                compaction: CompactionSpend {
+                    usage: Usage {
+                        input: 1_000,
+                        output: 100,
+                        cache_read: 10,
+                        cache_write: 1,
+                        total_tokens: 0,
+                    },
+                    cost_usd: Some(0.012),
+                    requests: 2,
+                },
             },
         ),
         AgentEvent::TurnStart => "turnStart" = AgentEvent::TurnStart,
@@ -1326,6 +2805,8 @@ mod wire_tag_freeze {
             },
         AgentEvent::InputRejected { .. } => "inputRejected"
             = AgentEvent::InputRejected { reason: "injection detected".into() },
+        AgentEvent::ProviderRetry { .. } => "providerRetry"
+            = AgentEvent::provider_retry(1, 4, "rate limited", std::time::Duration::from_millis(1500)),
         AgentEvent::LoopDetected { .. } => "loopDetected"
             = AgentEvent::loop_detected("bash", 3, false),
         AgentEvent::ContextCompacted { .. } => "contextCompacted"
@@ -1361,7 +2842,7 @@ mod wire_tag_freeze {
     /// Every key in `v`, recursively, as `path -> key` pairs.
     ///
     /// Recursive on purpose. Checking only the top level would pass a
-    /// snake_case key one level down â€” `message.usage.total_tokens` reaches
+    /// snake_case key one level down — `message.usage.total_tokens` reaches
     /// clients just as surely as `turnEnd.toolResults` does, and the nested
     /// payload structs carry their own `rename_all`, which nothing else here
     /// would notice going missing.
@@ -1387,7 +2868,7 @@ mod wire_tag_freeze {
     /// underscore, and the value survives a JSON round-trip.
     ///
     /// `seen` collects tags so a mis-paired sample is caught **when it
-    /// duplicates another variant** â€” which is the case that costs coverage,
+    /// duplicates another variant** — which is the case that costs coverage,
     /// since some variant is then left unsampled. Two samples swapped between
     /// lines is invisible here, and harmless: the set of samples is unchanged
     /// and every tag is still checked against serde.
@@ -1400,7 +2881,7 @@ mod wire_tag_freeze {
         assert_eq!(
             v["type"], declared,
             "wire tag drifted: {sample:?} serializes as {} but wire_freeze! declares {declared}. \
-             Changing a tag breaks every deployed client â€” if this is intentional it is a \
+             Changing a tag breaks every deployed client — if this is intentional it is a \
              breaking change, not a test fix",
             v["type"]
         );
@@ -1424,7 +2905,7 @@ mod wire_tag_freeze {
 
         assert!(
             seen.insert(declared),
-            "two samples serialize as {declared} â€” a sample in wire_freeze! does not match \
+            "two samples serialize as {declared} — a sample in wire_freeze! does not match \
              the pattern on its own line, so some variant has no sample at all"
         );
     }
@@ -1442,6 +2923,29 @@ mod wire_tag_freeze {
         let mut seen = BTreeSet::new();
         for sample in &delta_samples() {
             assert_frozen(sample, expected_delta_tag(sample), &mut seen);
+        }
+    }
+}
+
+#[cfg(test)]
+mod thinking_level_tests {
+    use super::ThinkingLevel;
+
+    #[test]
+    fn serde_names_are_lowercase_and_old_values_still_load() {
+        for (level, name) in [
+            (ThinkingLevel::Off, "off"),
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            let back: ThinkingLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
         }
     }
 }

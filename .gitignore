@@ -1,6 +1,10 @@
 /target
+# Build output of the nested integration crates (not workspace members).
+integrations/*/target
 Cargo.lock
 .DS_Store
 # mdbook build output (`mdbook build`); the site is published by CI
 /book
 .claude/worktrees/
+# cargo-mutants output (`cargo mutants`; see .cargo/mutants.toml)
+mutants.out*

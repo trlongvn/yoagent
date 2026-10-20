@@ -32,7 +32,7 @@ pub fn message_tokens(msg: &AgentMessage) -> usize {
                 content, tool_name, ..
             } => content_tokens(content) + estimate_tokens(tool_name) + 8,
         },
-        AgentMessage::Extension(ext) => estimate_tokens(&ext.data.to_string()) + 4,
+        AgentMessage::Custom(ext) => estimate_tokens(&ext.data.to_string()) + 4,
     }
 }
 
@@ -48,7 +48,17 @@ fn content_tokens(content: &[Content]) -> usize {
                 let raw_bytes = data.len() * 3 / 4;
                 (raw_bytes / 750).clamp(85, 16_000)
             }
-            Content::Thinking { thinking, .. } => estimate_tokens(thinking),
+            Content::Thinking {
+                thinking, redacted, ..
+            } => {
+                // Redacted reasoning is replayed and billed as input too.
+                // Both kinds are base64-like text (Bedrock's `redactedContent`
+                // is base64; Anthropic's opaque `redacted_thinking` data is
+                // base64-alphabet ciphertext), so len * 3/4 ≈ encrypted
+                // bytes, at ~4 bytes per token. A rough estimate: the real
+                // count is the hidden reasoning's, which only usage reports.
+                estimate_tokens(thinking) + redacted.as_ref().map_or(0, |r| r.len() * 3 / 4 / 4)
+            }
             Content::ToolCall {
                 name, arguments, ..
             } => estimate_tokens(name) + estimate_tokens(&arguments.to_string()) + 8,
@@ -223,7 +233,7 @@ pub struct ContextConfig {
     /// had room for it — which is why tools that tolerate it badly are exempted
     /// via `tool_output_max_lines_overrides` rather than by turning this off.
     /// The full output is always visible in the
-    /// [`AgentEvent`](crate::types::AgentEvent) stream either way.
+    /// [`AgentEvent`] stream either way.
     ///
     /// On by default. Only honoured by the agent loop when a `ContextConfig`
     /// is set.
@@ -250,7 +260,16 @@ impl Default for ContextConfig {
 ///
 /// A session whose growth per turn approaches the whole budget would otherwise
 /// ask compaction to discard essentially everything.
-pub const MIN_HEADROOM_RATIO: f32 = 0.15;
+///
+/// 0.30 since 0.22 (0.15 before). Measured offline with
+/// `examples/compaction_sweep` (see `docs/evals/compaction-defaults.md`): at
+/// the default 96K budget, tool-heavy sessions compacted to the 0.15 floor lost
+/// the opening task prompt in 91% of compactions and the latest request in
+/// 41%; at 0.30, 0% and 2%, for about 7% more input tokens and no measurable
+/// change in compaction count or prefix-cache hit rate. It does not prevent
+/// collapse at small budgets (around 26K), where the newest turn alone can
+/// exceed any target.
+pub const MIN_HEADROOM_RATIO: f32 = 0.30;
 
 fn default_headroom_turns() -> Option<usize> {
     Some(30)
@@ -349,11 +368,18 @@ impl ContextConfig {
 ///
 /// See the [Custom Compaction](https://yologdev.github.io/yoagent/concepts/agent-loop.html#custom-compaction)
 /// docs for examples.
-pub trait CompactionStrategy: Send + Sync {
+pub trait CompactionStrategy: crate::rt::MaybeSend + crate::rt::MaybeSync {
     /// Compact messages to fit within the token budget defined by `config`.
     ///
     /// Called before each LLM turn when `context_config` is set.
     fn compact(&self, messages: Vec<AgentMessage>, config: &ContextConfig) -> Vec<AgentMessage>;
+
+    /// Re-price any model this strategy calls against the process-wide
+    /// price table now. Called by [`Agent::reprice`](crate::Agent::reprice);
+    /// [`LlmCompaction`](crate::LlmCompaction) re-prices its summarization
+    /// model. The default does nothing: a strategy that makes no model
+    /// request has nothing to price.
+    fn reprice(&self) {}
 }
 
 /// Default 3-level compaction: truncate tool outputs → summarize turns → drop middle.
@@ -739,7 +765,7 @@ fn level2_summarize_old_turns(messages: &[AgentMessage], keep_recent: usize) -> 
                 // every pass.
                 result.push(AgentMessage::Llm(Message::User {
                     content: vec![Content::Text {
-                        text: format!("[Summary] {}", summary),
+                        text: format!("{SUMMARY_PREFIX}{summary}"),
                     }],
                     timestamp: *timestamp,
                 }));
@@ -773,6 +799,10 @@ fn level2_summarize_old_turns(messages: &[AgentMessage], keep_recent: usize) -> 
     result
 }
 
+/// Prefix of the user-role message that replaces a summarized old turn
+/// (level-2 compaction).
+pub(crate) const SUMMARY_PREFIX: &str = "[Summary] ";
+
 /// Marker left in place of dropped history.
 ///
 /// The text is constant on purpose. It sits near the front of the message list,
@@ -797,7 +827,7 @@ pub(crate) fn message_timestamp(msg: &AgentMessage) -> u64 {
             | Message::Assistant { timestamp, .. }
             | Message::ToolResult { timestamp, .. },
         ) => *timestamp,
-        AgentMessage::Extension(_) => 0,
+        AgentMessage::Custom(_) => 0,
     }
 }
 
@@ -947,9 +977,20 @@ fn keep_within_budget(messages: &[AgentMessage], budget: usize) -> Vec<AgentMess
 pub struct ExecutionLimits {
     /// Maximum number of turns (LLM calls)
     pub max_turns: usize,
-    /// Maximum total tokens consumed
+    /// Maximum tokens the model processes in one run (each `prompt` /
+    /// `continue_loop` starts again at 0): every turn adds its whole prompt
+    /// (`input + cache_read + cache_write`) plus its output.
+    ///
+    /// The prompt resends the conversation each turn, so the total is about
+    /// turns × context size — quadratic in turns while the conversation is
+    /// still growing. At a 60K-token context the 1M default is reached around
+    /// turn 16, cached or not. It is checked before each turn, so the last
+    /// turn can go over by one turn's tokens. For long agentic runs raise it
+    /// (or set `usize::MAX` and rely on `max_turns`).
     pub max_total_tokens: usize,
-    /// Maximum wall-clock time
+    /// Maximum wall-clock time of one run (default 10 minutes); checked
+    /// between turns. A single long agentic run reaches it; raise it for
+    /// those.
     pub max_duration: std::time::Duration,
     /// Consecutive identical tool calls tolerated before intervening.
     ///
@@ -991,7 +1032,9 @@ impl ExecutionLimits {
         self
     }
 
-    /// Cap on total tokens across the run.
+    /// Cap on tokens processed in one run — every turn's whole prompt plus
+    /// its output, so it grows much faster than the conversation. See
+    /// [`max_total_tokens`](Self::max_total_tokens).
     pub fn with_max_total_tokens(mut self, tokens: usize) -> Self {
         self.max_total_tokens = tokens;
         self
@@ -1062,7 +1105,7 @@ pub struct ExecutionTracker {
     pub limits: ExecutionLimits,
     pub turns: usize,
     pub tokens_used: usize,
-    pub started_at: std::time::Instant,
+    pub started_at: web_time::Instant,
     /// The tool signature seen most recently, and how many times in a row.
     ///
     /// A signature is `(name, arguments)` compared as `serde_json::Value`, not
@@ -1095,7 +1138,7 @@ impl ExecutionTracker {
             limits,
             turns: 0,
             tokens_used: 0,
-            started_at: std::time::Instant::now(),
+            started_at: web_time::Instant::now(),
             last_signature: None,
             consecutive: 0,
             steered: Vec::new(),
@@ -1214,6 +1257,52 @@ mod tests {
     }
 
     #[test]
+    fn extension_message_token_estimate_includes_message_overhead() {
+        let extension = CustomMessage::new("status", serde_json::json!({"state": "ready"}));
+        let expected = estimate_tokens(&extension.data.to_string()) + 4;
+        assert_eq!(message_tokens(&AgentMessage::Custom(extension)), expected);
+    }
+
+    #[test]
+    fn level2_summary_keeps_short_assistant_text() {
+        let messages = vec![
+            AgentMessage::Llm(Message::user("request")),
+            AgentMessage::Llm(
+                Message::assistant(
+                    vec![Content::Text {
+                        text: "the parser is ready".into(),
+                    }],
+                    StopReason::Stop,
+                    "test",
+                    "test",
+                    Usage::default(),
+                )
+                .with_timestamp(7),
+            ),
+            AgentMessage::Llm(Message::user("recent")),
+        ];
+
+        let compacted = level2_summarize_old_turns(&messages, 1);
+        assert!(matches!(
+            compacted.get(1),
+            Some(AgentMessage::Llm(Message::User { content, timestamp }))
+                if *timestamp == 7
+                    && content.iter().any(|content| matches!(
+                        content,
+                        Content::Text { text } if text == "[Summary] the parser is ready"
+                    ))
+        ));
+        assert!(matches!(
+            compacted.last(),
+            Some(AgentMessage::Llm(Message::User { content, .. }))
+                if content.iter().any(|content| matches!(
+                    content,
+                    Content::Text { text } if text == "recent"
+                ))
+        ));
+    }
+
+    #[test]
     fn test_context_config_from_context_window() {
         let config = ContextConfig::from_context_window(200_000);
         assert_eq!(config.max_context_tokens, 160_000); // 80% of 200K
@@ -1308,6 +1397,14 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn tool_boundaries_never_split_an_open_call_from_its_result() {
+        let messages = tool_turn(0, 1);
+        assert_eq!(safe_head_end(&messages, 1), 0);
+        assert_eq!(safe_head_end(&messages, 2), 2);
+        assert_eq!(safe_turn_start(&messages, 1), 0);
+    }
+
     fn tool_session(turns: usize, output_lines: usize) -> Vec<AgentMessage> {
         let mut messages = vec![AgentMessage::Llm(Message::user("start"))];
         for i in 0..turns {
@@ -1362,6 +1459,27 @@ mod tests {
             config.effective_target_ratio(1_000_000.0),
             MIN_HEADROOM_RATIO
         );
+    }
+
+    #[test]
+    fn test_floor_overrides_a_lower_target_ratio_only_under_headroom() {
+        let config = ContextConfig {
+            max_context_tokens: 100_000,
+            system_prompt_tokens: 0,
+            compact_target_ratio: 0.2,
+            compact_headroom_turns: Some(30),
+            ..Default::default()
+        };
+        // Under the headroom policy a ratio below the floor is raised to it.
+        assert_eq!(config.effective_target_ratio(5_000.0), MIN_HEADROOM_RATIO);
+        assert_ne!(config.effective_target_ratio(5_000.0), 0.2);
+        // Without the policy the configured ratio is used as-is, so the floor
+        // never stops a caller who asks to compact harder.
+        let unfloored = ContextConfig {
+            compact_headroom_turns: None,
+            ..config
+        };
+        assert_eq!(unfloored.effective_target_ratio(5_000.0), 0.2);
     }
 
     #[test]

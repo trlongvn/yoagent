@@ -11,7 +11,7 @@
 //!
 //! Real isolation belongs outside this tool: run the agent in a container or
 //! VM, or gate every call through
-//! [`ToolMiddleware`](crate::types::ToolMiddleware), which sees the arguments
+//! [`ToolMiddleware`], which sees the arguments
 //! before execution and can deny them. For credentials specifically, see
 //! [`BashTool::env_allowlist`].
 //!
@@ -31,7 +31,9 @@ pub struct BashTool {
     pub cwd: Option<String>,
     /// Max execution time per command
     pub timeout: Duration,
-    /// Max output bytes to capture (prevents OOM on huge outputs)
+    /// Max bytes captured from each of stdout and stderr. Reading stops
+    /// keeping bytes past this (the rest is drained and discarded), so memory
+    /// stays bounded however much a command prints.
     pub max_output_bytes: usize,
     /// Substrings that block a command outright.
     ///
@@ -159,7 +161,13 @@ impl AgentTool for BashTool {
             }
         }
 
-        let mut cmd = Command::new("bash");
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cmd = std::process::Command::new("bash");
+        // std's `process_group` (Rust 1.64): tokio's own needs tokio 1.40,
+        // newer than the `tokio = "1"` this crate asks for.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut cmd = Command::from(cmd);
         cmd.arg("-c").arg(command);
 
         // Keep credentials out of model-authored commands when configured.
@@ -179,62 +187,178 @@ impl AgentTool for BashTool {
             cmd.current_dir(cwd);
         }
 
+        // No stdin: a command that reads input gets EOF at once instead of
+        // the agent's terminal (`spawn` inherits stdin; `output` did not).
+        cmd.stdin(std::process::Stdio::null());
         // Capture output
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // `Command::output()` spawns eagerly and owns the Child. Dropping that
-        // future (which `select!` does on the cancel/timeout arm) leaves the
-        // process running detached unless kill_on_drop is set — orphan per
-        // cancelled call, still holding a pipe and the full env.
+        // A timeout or cancel must not leave the command running. On Unix
+        // `bash` leads its own process group and `GroupKill` kills the whole
+        // group: non-interactive bash has no job control, so pipeline stages,
+        // `;` / `&&` lists and background jobs stay in it. Only a process that
+        // starts its own session (`setsid`) escapes. Elsewhere this kills the
+        // `bash` process only.
         cmd.kill_on_drop(true);
 
         let timeout = self.timeout;
         let max_bytes = self.max_output_bytes;
 
-        // Run with timeout and cancellation
-        let result = tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err(ToolError::Cancelled);
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?;
+        // Declared after `child`, so it is dropped first: the group is killed
+        // while `bash` is not yet reaped, and its id cannot have been reused.
+        let mut group = GroupKill::new(child.id());
+        let (Some(child_out), Some(child_err)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err(ToolError::Failed("Failed to capture output".into()));
+        };
+
+        // The captures live outside the race, so a timeout still has what the
+        // command printed before it, and whether it was cut.
+        let mut out = Capture::default();
+        let mut err = Capture::default();
+        let outcome = {
+            let run = async {
+                tokio::join!(
+                    out.read(child_out, max_bytes),
+                    err.read(child_err, max_bytes),
+                );
+                child.wait().await
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => None,
+                _ = tokio::time::sleep(timeout) => Some(Err(())),
+                status = run => Some(Ok(status)),
             }
-            _ = tokio::time::sleep(timeout) => {
+        };
+        let status = match outcome {
+            None => return Err(ToolError::Cancelled),
+            Some(Err(())) => {
+                let _ = child.start_kill();
                 return Err(ToolError::Failed(format!(
-                    "Command timed out after {}s",
-                    timeout.as_secs()
+                    "Command timed out after {}s. Output so far:\n{}",
+                    timeout.as_secs(),
+                    render_output(&out, &err)
                 )));
             }
-            result = cmd.output() => {
-                result.map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?
+            Some(Ok(status)) => {
+                // Finished on its own: what it left running in the background
+                // (a server it started, say) is the command's business.
+                group.disarm();
+                status.map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?
             }
         };
-
-        let mut stdout = String::from_utf8_lossy(&result.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&result.stderr).to_string();
-
-        // Truncate if too large
-        if stdout.len() > max_bytes {
-            stdout.truncate(max_bytes);
-            stdout.push_str("\n... (output truncated)");
-        }
-        if stderr.len() > max_bytes {
-            stderr.truncate(max_bytes);
-            stderr.push_str("\n... (output truncated)");
-        }
-
-        let exit_code = result.status.code().unwrap_or(-1);
-
-        let output = if stderr.is_empty() {
-            format!("Exit code: {}\n{}", exit_code, stdout)
-        } else {
-            format!(
-                "Exit code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-                exit_code, stdout, stderr
-            )
-        };
+        let exit_code = status.code().unwrap_or(-1);
+        let output = format!("Exit code: {}\n{}", exit_code, render_output(&out, &err));
 
         // Return output even on failure — LLMs need error output to self-correct
         Ok(ToolResult {
             content: vec![Content::Text { text: output }],
             details: serde_json::json!({ "exit_code": exit_code, "success": exit_code == 0 }),
         })
+    }
+}
+
+/// Kills the command's process group when dropped — on a timeout, a cancel,
+/// or the tool's future being dropped — unless the command finished first.
+struct GroupKill {
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+}
+
+impl GroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(not(unix))]
+        let _ = pid;
+        Self {
+            #[cfg(unix)]
+            pgid: pid.and_then(|p| libc::pid_t::try_from(p).ok()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: `killpg` takes two integers and touches no memory of
+            // ours; a failure (the group already gone) is fine to ignore.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// One output stream: the bytes kept, whether more were discarded, and a
+/// read error if the stream ended on one.
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    cut: bool,
+    read_error: Option<String>,
+}
+
+impl Capture {
+    /// Read `from` to the end, keeping at most `cap` bytes; the rest is
+    /// drained and discarded so the child never blocks on a full pipe.
+    async fn read<R>(&mut self, mut from: R, cap: usize)
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match from.read(&mut chunk).await {
+                Ok(0) => return,
+                Err(e) => {
+                    self.read_error = Some(e.to_string());
+                    return;
+                }
+                Ok(n) => {
+                    let room = cap.saturating_sub(self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..n.min(room)]);
+                    self.cut |= n > room;
+                }
+            }
+        }
+    }
+
+    /// The text, with a note when bytes were discarded or reading failed.
+    /// Bytes are cut before decoding, so a multi-byte character split by the
+    /// cap becomes U+FFFD, never a panic.
+    fn text(&self) -> String {
+        let mut s = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.cut {
+            s.push_str("\n... (output truncated)");
+        }
+        if let Some(e) = &self.read_error {
+            s.push_str(&format!("\n... (output incomplete: read error: {e})"));
+        }
+        s
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty() && !self.cut && self.read_error.is_none()
+    }
+}
+
+/// Stdout alone, or both streams labelled.
+fn render_output(out: &Capture, err: &Capture) -> String {
+    if err.is_empty() {
+        out.text()
+    } else {
+        format!("STDOUT:\n{}\nSTDERR:\n{}", out.text(), err.text())
     }
 }

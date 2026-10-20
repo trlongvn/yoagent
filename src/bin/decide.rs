@@ -17,9 +17,9 @@
 //!   kind=$(decide --input "$text" --options "bug,feature,question")
 //!
 //! Flags:
-//!   --input <text>      the input to classify (required, or piped on stdin)
+//!   --input TEXT      the input to classify (required, or piped on stdin)
 //!   --options <a,b,c>   comma-separated options (required)
-//!   --config <file>     override AGENT_CONFIG
+//!   --config FILE     override AGENT_CONFIG
 //!   --json              print the full Decision as JSON instead of the bare choice
 //!   --stdin             read the input from stdin (default when --input is absent)
 //!   -h, --help          usage

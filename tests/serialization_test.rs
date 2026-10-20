@@ -75,11 +75,41 @@ fn test_agent_message_roundtrip() {
 
 #[test]
 fn test_extension_message_roundtrip() {
-    let ext = ExtensionMessage::new("status_update", serde_json::json!({"status": "running"}));
+    let ext = CustomMessage::new("status_update", serde_json::json!({"status": "running"}));
     roundtrip(&ext);
 
-    let am = AgentMessage::Extension(ext);
+    let am = AgentMessage::Custom(ext);
     roundtrip(&am);
+}
+
+/// A custom message saved before the 0.25 rename (as `AgentMessage::Extension`)
+/// reads back unchanged: the enum is untagged and the role stays "extension".
+#[test]
+fn a_custom_message_saved_before_the_rename_still_loads() {
+    let saved = r#"{"role":"extension","kind":"status_update","data":{"status":"running"}}"#;
+    let am: AgentMessage = serde_json::from_str(saved).expect("deserialize");
+    assert_eq!(
+        am,
+        AgentMessage::Custom(CustomMessage::new(
+            "status_update",
+            serde_json::json!({"status": "running"})
+        ))
+    );
+    assert_eq!(serde_json::to_string(&am).unwrap(), saved);
+    // Positive control: an LLM message is not taken for a custom one.
+    let user: AgentMessage = serde_json::from_str(
+        &serde_json::to_string(&AgentMessage::Llm(Message::user("hi"))).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(user, AgentMessage::Llm(_)));
+}
+
+/// The old struct name still compiles, as a deprecated alias.
+#[test]
+#[allow(deprecated)]
+fn the_old_message_name_is_an_alias() {
+    let old: ExtensionMessage = ExtensionMessage::new("k", 1);
+    let _: CustomMessage = old;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +131,85 @@ fn test_content_variants_roundtrip() {
         "tc-1",
         "bash",
         serde_json::json!({"command": "ls"}),
+    ));
+}
+
+/// #197: a redacted block records which API produced it, and that survives a
+/// session file. Files without redacted content are byte-identical to the
+/// format before the field existed, and that older format still loads.
+#[test]
+fn redacted_thinking_provenance_roundtrips_and_old_format_loads() {
+    use agent::provider::ApiProtocol;
+
+    let msg = Message::assistant(
+        vec![
+            Content::thinking_signed("hmm", "sig"),
+            Content::thinking_redacted(ApiProtocol::AnthropicMessages, "EmwKAhgB"),
+            Content::tool_call("tu_1", "bash", serde_json::json!({})),
+        ],
+        StopReason::ToolUse,
+        "claude-opus-5-5",
+        "anthropic",
+        Usage::default(),
+    );
+    roundtrip(&msg);
+    let json = serde_json::to_value(&msg).unwrap();
+    assert_eq!(
+        json["content"][1],
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": "",
+            "redacted": "EmwKAhgB",
+            "redactedProtocol": "anthropic_messages",
+        })
+    );
+
+    // Unredacted thinking serializes exactly as before.
+    assert_eq!(
+        serde_json::to_string(&Content::thinking_signed("hmm", "sig")).unwrap(),
+        r#"{"type":"thinking","thinking":"hmm","signature":"sig"}"#
+    );
+
+    // The old format: no provenance. It loads, with none recorded (so no
+    // provider replays it).
+    let old: Content =
+        serde_json::from_str(r#"{"type":"thinking","thinking":"","redacted":"AAEC"}"#).unwrap();
+    assert!(matches!(
+        &old,
+        Content::Thinking { redacted: Some(r), redacted_protocol: None, .. } if r == "AAEC"
+    ));
+    // snake_case is accepted too, like `provider_metadata`.
+    let snake: Content = serde_json::from_str(
+        r#"{"type":"thinking","thinking":"","redacted":"AAEC","redacted_protocol":"bedrock_converse_stream"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        snake,
+        Content::thinking_redacted(ApiProtocol::BedrockConverseStream, "AAEC")
+    );
+
+    // A protocol this version does not know (written by a newer yoagent)
+    // loads as no provenance, so the block is kept but sent nowhere, instead
+    // of failing the whole message.
+    let newer: Content = serde_json::from_str(
+        r#"{"type":"thinking","thinking":"","redacted":"AAEC","redactedProtocol":"some_future_protocol"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &newer,
+        Content::Thinking { redacted: Some(r), redacted_protocol: None, .. } if r == "AAEC"
+    ));
+    // Explicit null behaves like absence.
+    let null: Content = serde_json::from_str(
+        r#"{"type":"thinking","thinking":"","redacted":"AAEC","redactedProtocol":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        null,
+        Content::Thinking {
+            redacted_protocol: None,
+            ..
+        }
     ));
 }
 
@@ -147,7 +256,7 @@ fn test_full_conversation_roundtrip() {
             )
             .with_timestamp(300),
         ),
-        AgentMessage::Extension(ExtensionMessage::new(
+        AgentMessage::Custom(CustomMessage::new(
             "ui_event",
             serde_json::json!({"action": "scroll"}),
         )),
@@ -367,7 +476,26 @@ fn all_agent_events() -> Vec<AgentEvent> {
             )),
         },
         AgentEvent::loop_detected("bash", 3, false),
+        AgentEvent::provider_retry(1, 4, "rate limited", std::time::Duration::from_millis(1500)),
     ]
+}
+
+/// `providerRetry` is part of the frozen wire format: its tag and camelCase
+/// fields are what a client keys on to tell a retried attempt from a failure.
+#[test]
+fn test_provider_retry_payload_shape_is_frozen() {
+    let event =
+        AgentEvent::provider_retry(2, 4, "HTTP 529", std::time::Duration::from_millis(2000));
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        serde_json::json!({
+            "type": "providerRetry",
+            "attempt": 2,
+            "maxAttempts": 4,
+            "error": "HTTP 529",
+            "delayMs": 2000,
+        })
+    );
 }
 
 /// The deterministic half of the same variant. Sampled separately because it
@@ -463,6 +591,7 @@ fn expected_event_tag(event: &AgentEvent) -> &'static str {
         AgentEvent::InputRejected { .. } => "inputRejected",
         AgentEvent::ContextCompacted { .. } => "contextCompacted",
         AgentEvent::LoopDetected { .. } => "loopDetected",
+        AgentEvent::ProviderRetry { .. } => "providerRetry",
         _ => "unknown",
     }
 }
@@ -486,7 +615,7 @@ fn expected_delta_tag(delta: &StreamDelta) -> &'static str {
 /// forces no edit to this file at all — but deleting a sample here quietly
 /// removes the payload coverage below, and that it does catch. Adding a variant
 /// is `wire_tag_freeze`'s job, where the compiler enforces it.
-const SAMPLED_EVENT_COUNT: usize = 14;
+const SAMPLED_EVENT_COUNT: usize = 15;
 
 #[test]
 fn test_agent_event_type_tags_are_frozen() {

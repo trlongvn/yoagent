@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -87,8 +88,9 @@ impl From<std::io::Error> for SharedStateError {
 ///
 /// Implement this trait to back shared state with a custom store
 /// (database, Redis, HTTP service, etc.).
-#[async_trait::async_trait]
-pub trait SharedStateBackend: Send + Sync {
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait SharedStateBackend: crate::rt::MaybeSend + crate::rt::MaybeSync {
     /// Get a value by key. Returns `None` if the key doesn't exist.
     async fn get(&self, key: &str) -> Result<Option<String>, SharedStateError>;
 
@@ -142,7 +144,8 @@ impl MemoryBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl SharedStateBackend for MemoryBackend {
     async fn get(&self, key: &str) -> Result<Option<String>, SharedStateError> {
         Ok(self.inner.read().await.get(key).map(|(_, v)| v.clone()))
@@ -241,11 +244,14 @@ impl SharedStateBackend for MemoryBackend {
 /// // Creates /tmp/agent-state/summary with the content
 /// # }
 /// ```
+#[cfg(feature = "native")]
+#[cfg_attr(docsrs, doc(cfg(feature = "native")))]
 pub struct FileBackend {
     dir: PathBuf,
     max_bytes: usize,
 }
 
+#[cfg(feature = "native")]
 impl FileBackend {
     /// Create a new filesystem backend. The directory is created lazily on first write.
     ///
@@ -253,7 +259,7 @@ impl FileBackend {
     /// regular files it finds there, so pointing this at a directory holding
     /// anything else will lose those files.
     ///
-    /// Capped at [`DEFAULT_MAX_BYTES`], matching [`MemoryBackend`]. Without a
+    /// Capped at the same 10 MiB default as [`MemoryBackend`]. Without a
     /// cap an agent that stashes truncated tool output would grow the directory
     /// without bound; with one, the oldest entries are evicted and a stale key
     /// simply fails to read, which a model handles as an ordinary tool error.
@@ -398,6 +404,7 @@ impl FileBackend {
     }
 }
 
+#[cfg(feature = "native")]
 #[async_trait::async_trait]
 impl SharedStateBackend for FileBackend {
     async fn get(&self, key: &str) -> Result<Option<String>, SharedStateError> {
@@ -827,6 +834,7 @@ mod tests {
         assert_eq!(state.keys().await.len(), 10);
     }
 
+    #[cfg(feature = "native")]
     #[tokio::test]
     async fn test_file_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -860,6 +868,7 @@ mod tests {
         assert!(!state.remove("report").await);
     }
 
+    #[cfg(feature = "native")]
     #[tokio::test]
     async fn test_file_backend_key_encoding() {
         let dir = tempfile::tempdir().unwrap();

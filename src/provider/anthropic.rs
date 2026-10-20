@@ -1,11 +1,13 @@
 //! Anthropic Claude provider (Messages API with streaming)
 
+use super::tool_args::UNPARSED_ARGUMENTS_KEY;
 use super::traits::*;
+use crate::provider::ApiProtocol;
 use crate::types::*;
-use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
+use reqwest_eventsource::Event;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -104,7 +106,8 @@ fn anthropic_compat(config: &StreamConfig) -> crate::provider::AnthropicCompat {
 
 pub struct AnthropicProvider;
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl StreamProvider for AnthropicProvider {
     fn protocol(&self) -> Option<crate::provider::ApiProtocol> {
         Some(crate::provider::ApiProtocol::AnthropicMessages)
@@ -164,8 +167,7 @@ impl StreamProvider for AnthropicProvider {
 
         let request = builder.json(&body);
 
-        let mut es =
-            EventSource::new(request).map_err(|e| ProviderError::Network(e.to_string()))?;
+        let mut es = super::sse::open_event_source(request)?;
 
         let mut content: Vec<Content> = Vec::new();
         let mut usage = Usage::default();
@@ -176,6 +178,15 @@ impl StreamProvider for AnthropicProvider {
         // delta without a stop_reason: that proves nothing about completeness.
         let mut saw_stop_reason = false;
         let mut error_message: Option<String> = None;
+        // Anthropic's block `index` → position in `content`. A block this
+        // provider does not surface gets no entry and no placeholder, so the
+        // blocks after it keep their order and their deltas still land on
+        // the right block.
+        let mut positions: HashMap<u64, usize> = HashMap::new();
+        // Blocks that were skipped at `content_block_start` (already warned
+        // about), so their deltas and stop are dropped quietly.
+        let mut skipped: HashSet<u64> = HashSet::new();
+        let mut warned: HashSet<String> = HashSet::new();
 
         let _ = tx.send(StreamEvent::Start);
 
@@ -198,42 +209,64 @@ impl StreamProvider for AnthropicProvider {
                                         usage.cache_write = data.message.usage.cache_creation_input_tokens;
                                     }
                                 }
-                                "content_block_start" => {
-                                    if let Ok(data) = serde_json::from_str::<AnthropicContentBlockStart>(&msg.data) {
-                                        let idx = data.index as usize;
-                                        match data.content_block {
-                                            AnthropicContentBlock::Text { .. } => {
-                                                while content.len() <= idx {
-                                                    content.push(Content::Text { text: String::new() });
-                                                }
-                                            }
-                                            AnthropicContentBlock::Thinking { .. } => {
-                                                while content.len() <= idx {
-                                                    content.push(Content::Thinking { thinking: String::new(), signature: None });
-                                                }
-                                            }
-                                            AnthropicContentBlock::ToolUse { id, name, .. } => {
-                                                while content.len() <= idx {
-                                                    content.push(Content::ToolCall { provider_metadata: None,
+                                "content_block_start" => match serde_json::from_str::<AnthropicContentBlockStart>(&msg.data) {
+                                    Err(e) => warn!(
+                                        "content_block_start does not parse ({e}); the block is dropped: {}",
+                                        truncate_for_error(&msg.data)
+                                    ),
+                                    Ok(data) if positions.contains_key(&data.index) || skipped.contains(&data.index) => warn!(
+                                        "duplicate content_block_start for block {}; ignored",
+                                        data.index
+                                    ),
+                                    Ok(data) => {
+                                        let idx = data.index;
+                                        let ci = content.len();
+                                        match start_block(data.content_block) {
+                                            StartedBlock::Content(block) => {
+                                                if let Content::ToolCall { id, name, .. } = &block {
+                                                    let _ = tx.send(StreamEvent::ToolCallStart {
+                                                        content_index: ci,
                                                         id: id.clone(),
                                                         name: name.clone(),
-                                                        arguments: serde_json::Value::Object(Default::default()),
                                                     });
                                                 }
-                                                let _ = tx.send(StreamEvent::ToolCallStart {
-                                                    content_index: idx,
-                                                    id,
-                                                    name,
+                                                content.push(block);
+                                                positions.insert(idx, ci);
+                                            }
+                                            StartedBlock::Skipped { key, reason } => {
+                                                skipped.insert(idx);
+                                                warn_once(&mut warned, key, || {
+                                                    format!("Anthropic: skipping content block {idx}: {reason}")
                                                 });
                                             }
                                         }
                                     }
-                                }
-                                "content_block_delta" => {
-                                    if let Ok(data) = serde_json::from_str::<AnthropicContentBlockDelta>(&msg.data) {
-                                        let idx = data.index as usize;
-                                        match data.delta {
-                                            AnthropicDelta::TextDelta { text } => {
+                                },
+                                "content_block_delta" => match serde_json::from_str::<AnthropicContentBlockDelta>(&msg.data) {
+                                    Err(e) => warn!(
+                                        "content_block_delta does not parse ({e}); the delta is dropped: {}",
+                                        truncate_for_error(&msg.data)
+                                    ),
+                                    Ok(data) => match positions.get(&data.index).copied() {
+                                        None => {
+                                            let idx = data.index;
+                                            if !skipped.contains(&idx) {
+                                                warn_once(&mut warned, format!("orphan:{idx}"), || {
+                                                    format!("content_block_delta for block {idx}, which never started; dropped")
+                                                });
+                                            }
+                                        }
+                                        Some(idx) => match parse_delta(data.delta) {
+                                            Err(DeltaError::Unknown(kind)) => {
+                                                warn_once(&mut warned, format!("delta:{kind}"), || {
+                                                    format!("Anthropic: dropping `{kind}` deltas (not surfaced by this provider)")
+                                                });
+                                            }
+                                            Err(DeltaError::Malformed(e)) => warn!(
+                                                "content_block_delta for block {} does not parse ({e}); dropped",
+                                                data.index
+                                            ),
+                                            Ok(AnthropicDelta::TextDelta { text }) => {
                                                 if let Some(Content::Text { text: ref mut t }) = content.get_mut(idx) {
                                                     t.push_str(&text);
                                                 }
@@ -242,7 +275,7 @@ impl StreamProvider for AnthropicProvider {
                                                     delta: text,
                                                 });
                                             }
-                                            AnthropicDelta::ThinkingDelta { thinking } => {
+                                            Ok(AnthropicDelta::ThinkingDelta { thinking }) => {
                                                 if let Some(Content::Thinking { thinking: ref mut t, .. }) = content.get_mut(idx) {
                                                     t.push_str(&thinking);
                                                 }
@@ -251,18 +284,18 @@ impl StreamProvider for AnthropicProvider {
                                                     delta: thinking,
                                                 });
                                             }
-                                            AnthropicDelta::InputJsonDelta { partial_json } => {
+                                            Ok(AnthropicDelta::InputJsonDelta { partial_json }) => {
                                                 // Accumulate JSON into a buffer for this tool call
                                                 if let Some(Content::ToolCall { ref mut arguments, .. }) = content.get_mut(idx) {
                                                     // Append to string buffer stored in arguments
                                                     // We accumulate the raw JSON string and parse it at content_block_stop
                                                     let buf = arguments
                                                         .as_object_mut()
-                                                        .and_then(|o| o.get_mut("__partial_json"))
+                                                        .and_then(|o| o.get_mut(UNPARSED_ARGUMENTS_KEY))
                                                         .and_then(|v| v.as_str().map(|s| s.to_string()));
                                                     let new_buf = format!("{}{}", buf.unwrap_or_default(), partial_json);
                                                     if let Some(obj) = arguments.as_object_mut() {
-                                                        obj.insert("__partial_json".into(), serde_json::Value::String(new_buf));
+                                                        obj.insert(UNPARSED_ARGUMENTS_KEY.into(), serde_json::Value::String(new_buf));
                                                     }
                                                 }
                                                 let _ = tx.send(StreamEvent::ToolCallDelta {
@@ -270,14 +303,14 @@ impl StreamProvider for AnthropicProvider {
                                                     delta: partial_json,
                                                 });
                                             }
-                                            AnthropicDelta::SignatureDelta { signature } => {
+                                            Ok(AnthropicDelta::SignatureDelta { signature }) => {
                                                 if let Some(Content::Thinking { signature: ref mut s, .. }) = content.get_mut(idx) {
                                                     *s = Some(signature);
                                                 }
                                             }
-                                        }
-                                    }
-                                }
+                                        },
+                                    },
+                                },
                                 "content_block_stop" => match serde_json::from_str::<serde_json::Value>(&msg.data) {
                                     // Skipping this silently would leave a tool
                                     // call's accumulator unparsed *and* never emit
@@ -297,8 +330,9 @@ impl StreamProvider for AnthropicProvider {
                                              refusing to guess which block it closes: {}",
                                             msg.data
                                         ),
-                                        Some(idx) => {
-                                            let idx = idx as usize;
+                                        // A block that was skipped at its start (or
+                                        // never started) has nothing to close.
+                                        Some(idx) => if let Some(idx) = positions.get(&idx).copied() {
                                             // A block whose accumulator does not
                                             // parse is left carrying it. The sweep
                                             // after the loop is what fails the
@@ -308,7 +342,7 @@ impl StreamProvider for AnthropicProvider {
                                             // index), which leak the same way.
                                             if let Some(Content::ToolCall { name, arguments, .. }) = content.get_mut(idx) {
                                                 if let Some(partial) = arguments.as_object()
-                                                    .and_then(|o| o.get("__partial_json"))
+                                                    .and_then(|o| o.get(UNPARSED_ARGUMENTS_KEY))
                                                     .and_then(|v| v.as_str())
                                                     .map(|s| s.to_string())
                                                 {
@@ -323,7 +357,9 @@ impl StreamProvider for AnthropicProvider {
                                                 }
                                             }
                                             let _ = tx.send(StreamEvent::ToolCallEnd { content_index: idx });
-                                        }
+                                        } else if !skipped.contains(&idx) {
+                                            debug!("content_block_stop for block {idx}, which never started");
+                                        },
                                     },
                                 },
                                 "message_delta" => {
@@ -382,7 +418,7 @@ impl StreamProvider for AnthropicProvider {
                             // sentinel key as its input — treat as truncation.
                             if content.iter().any(|c| {
                                 matches!(c, Content::ToolCall { arguments, .. }
-                                    if arguments.get("__partial_json").is_some())
+                                    if arguments.get(UNPARSED_ARGUMENTS_KEY).is_some())
                             }) {
                                 warn!(
                                     "stream ended after message_delta with an unterminated \
@@ -421,7 +457,7 @@ impl StreamProvider for AnthropicProvider {
                 Content::ToolCall {
                     name, arguments, ..
                 } => arguments
-                    .get("__partial_json")
+                    .get(UNPARSED_ARGUMENTS_KEY)
                     .and_then(|v| v.as_str())
                     .map(|partial| (name.clone(), partial.to_string())),
                 _ => None,
@@ -451,8 +487,8 @@ impl StreamProvider for AnthropicProvider {
             // none of them, so any that survived would return to the API as a
             // `tool_use` with no `tool_result` and be rejected on the *next*
             // request — breaking the conversation rather than just this turn.
-            // Replacing in place keeps `content.len()` aligned with the
-            // provider's block indices.
+            // Replacing in place keeps every block at its position, so the
+            // `content_index` already reported in stream events stays valid.
             for block in content.iter_mut() {
                 if let Content::ToolCall { name, .. } = block {
                     let name = name.clone();
@@ -684,50 +720,78 @@ fn build_request_body(config: &StreamConfig, is_oauth: bool) -> serde_json::Valu
         body["tools"] = serde_json::json!(tools);
     }
 
-    // Structured outputs via tool-forcing: append a synthetic tool built from
-    // the schema and force the model to call it. The loop unwraps the forced
-    // call back into plain text (`unwrap_structured_tool_call`).
+    // `output_config` collects every key this request sends there — the
+    // native structured-output `format` and the adaptive-thinking `effort` —
+    // so neither overwrites the other.
+    let mut output_config = serde_json::Map::new();
+
+    // Structured outputs, two ways:
+    // - native (`AnthropicCompat::native_structured_output`): the API
+    //   constrains the reply text to the schema via `output_config.format`.
+    //   No tool is added or forced, so this also works on models that reject
+    //   forced `tool_choice` (Fable 5.1, Opus 5.5) and composes with thinking.
+    // - tool-forcing (default): append a synthetic tool built from the schema
+    //   and force the model to call it. The loop unwraps the forced call back
+    //   into plain text (`unwrap_structured_tool_call`).
+    let forced_structured_tool = config.output_schema.is_some() && !compat.native_structured_output;
     if let Some(schema) = &config.output_schema {
-        let synthetic = serde_json::json!({
-            "name": schema.name,
-            "description": "Produce the final answer in the required schema.",
-            "input_schema": schema.schema,
-        });
-        match body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-            Some(arr) => arr.push(synthetic),
-            None => body["tools"] = serde_json::json!([synthetic]),
+        if compat.native_structured_output {
+            output_config.insert(
+                "format".into(),
+                serde_json::json!({ "type": "json_schema", "schema": schema.schema }),
+            );
+        } else {
+            let synthetic = serde_json::json!({
+                "name": schema.name,
+                "description": "Produce the final answer in the required schema.",
+                "input_schema": schema.schema,
+            });
+            match body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                Some(arr) => arr.push(synthetic),
+                None => body["tools"] = serde_json::json!([synthetic]),
+            }
+            body["tool_choice"] = serde_json::json!({ "type": "tool", "name": schema.name });
         }
-        body["tool_choice"] = serde_json::json!({ "type": "tool", "name": schema.name });
     }
 
     // Forced tool_choice and extended thinking are mutually exclusive at the
-    // API level — a structured-output request wins and thinking is skipped
-    // for this call (warned, not silent).
+    // API level — a tool-forced structured-output request wins and thinking
+    // is skipped for this call (warned, not silent). The native path forces
+    // nothing, so thinking proceeds as requested.
     let thinking_requested = config.thinking_level != ThinkingLevel::Off;
-    if thinking_requested && config.output_schema.is_some() {
+    if thinking_requested && forced_structured_tool {
         tracing::warn!(
             "structured outputs force tool_choice, which Anthropic rejects with \
              extended thinking; thinking is disabled for this request"
         );
     }
-    if thinking_requested && config.output_schema.is_none() {
+    if thinking_requested && !forced_structured_tool {
         if compat.adaptive_thinking {
             // Current generation (Claude 4.6+ / Fable 5): adaptive thinking with
-            // an effort hint. Budget-based thinking is rejected with a 400.
+            // an effort hint. Budget-based thinking is deprecated on 4.6 and
+            // rejected with a 400 from 4.7 on.
             let effort = match config.thinking_level {
                 ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
                 ThinkingLevel::Medium => "medium",
                 ThinkingLevel::High => "high",
+                // Passed through, not clamped: the effort ladder is per model
+                // (`xhigh` arrived with Opus 4.7) and the crate has no table
+                // of it, so a model that lacks a rung rejects it visibly.
+                ThinkingLevel::XHigh => "xhigh",
+                ThinkingLevel::Max => "max",
                 ThinkingLevel::Off => unreachable!(),
             };
             body["thinking"] = serde_json::json!({ "type": "adaptive" });
-            body["output_config"] = serde_json::json!({ "effort": effort });
+            output_config.insert("effort".into(), serde_json::json!(effort));
         } else {
             body["thinking"] = serde_json::json!({
                 "type": "enabled",
                 "budget_tokens": legacy_thinking_budget(config.thinking_level),
             });
         }
+    }
+    if !output_config.is_empty() {
+        body["output_config"] = serde_json::Value::Object(output_config);
     }
 
     if let Some(temp) = config.temperature {
@@ -739,13 +803,22 @@ fn build_request_body(config: &StreamConfig, is_oauth: bool) -> serde_json::Valu
 
 /// Budget tokens for legacy (pre-4.6) extended thinking. The API requires a
 /// minimum of 1024. (`Off` returns 0 but never reaches a thinking-enabled
-/// request — both call sites guard on `!= ThinkingLevel::Off`.)
-fn legacy_thinking_budget(level: ThinkingLevel) -> u32 {
+/// request — all call sites guard on `!= ThinkingLevel::Off`.)
+///
+/// `Max` is 30,720 rather than a rounder 32K: the first-party request raises
+/// `max_tokens` to `budget + 1024` when it is too small, and the smallest
+/// output ceiling among budget-thinking models is Opus 4/4.1's 32,000 — so
+/// 30,720 + 1,024 still fits where 32,768 + 1,024 would be rejected. Also used
+/// by Bedrock, which does **not** raise `maxTokens`: Bedrock callers must set
+/// `max_tokens` above the budget themselves (for `Max`, above 30,720).
+pub(crate) fn legacy_thinking_budget(level: ThinkingLevel) -> u32 {
     match level {
         ThinkingLevel::Off => 0,
         ThinkingLevel::Minimal | ThinkingLevel::Low => 1024,
         ThinkingLevel::Medium => 2048,
         ThinkingLevel::High => 8192,
+        ThinkingLevel::XHigh => 16_384,
+        ThinkingLevel::Max => 30_720,
     }
 }
 
@@ -753,8 +826,32 @@ fn content_to_anthropic(content: &[Content]) -> Vec<serde_json::Value> {
     content
         .iter()
         .filter(|c| !matches!(c, Content::Text { text } if text.is_empty()))
+        // Redacted reasoning is replayed only if this API produced it. Any
+        // other (Bedrock's `redactedContent`, or data of unknown origin) is
+        // opaque here; replaying it as a `thinking` block would send empty
+        // text with a bogus signature.
+        .filter(|c| {
+            let foreign = matches!(
+                c,
+                Content::Thinking {
+                    redacted: Some(_),
+                    ..
+                }
+            ) && c.redacted_for(ApiProtocol::AnthropicMessages).is_none();
+            if foreign {
+                debug!("skipping a redacted thinking block from another provider");
+            }
+            !foreign
+        })
         .map(|c| match c {
             Content::Text { text } => serde_json::json!({"type": "text", "text": text}),
+            // Anthropic's own `redacted_thinking`, sent back unmodified and in
+            // place: the API rejects a tool-use turn whose thinking blocks
+            // (redacted ones included) were dropped, reordered or edited.
+            Content::Thinking {
+                redacted: Some(data),
+                ..
+            } => serde_json::json!({"type": "redacted_thinking", "data": data}),
             Content::Image { data, mime_type } => serde_json::json!({
                 "type": "image",
                 "source": {"type": "base64", "media_type": mime_type, "data": data},
@@ -762,6 +859,7 @@ fn content_to_anthropic(content: &[Content]) -> Vec<serde_json::Value> {
             Content::Thinking {
                 thinking,
                 signature,
+                ..
             } => serde_json::json!({
                 "type": "thinking",
                 "thinking": thinking,
@@ -805,33 +903,96 @@ struct AnthropicUsage {
     cache_creation_input_tokens: u64,
 }
 
+/// `content_block_start`. The block stays raw JSON until [`start_block`]
+/// looks at its `type`, so a type this provider does not know is reported by
+/// name instead of failing the whole event.
 #[derive(Deserialize)]
 struct AnthropicContentBlockStart {
     index: u64,
-    content_block: AnthropicContentBlock,
+    content_block: serde_json::Value,
 }
 
+/// The `content_block` types this provider surfaces. A block's opening
+/// `text` / `thinking` is not read: the API sends it empty and fills it
+/// with deltas.
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum AnthropicContentBlock {
     #[serde(rename = "text")]
-    Text {
-        #[allow(dead_code)]
-        text: String,
-    },
+    Text {},
     #[serde(rename = "thinking")]
-    Thinking {
-        #[allow(dead_code)]
-        thinking: String,
-    },
+    Thinking {},
+    /// Safety-redacted reasoning. `data` is opaque and arrives whole here:
+    /// the API defines no delta type for it (the SDKs' delta union is text,
+    /// input JSON, citations, thinking and signature), so the block is
+    /// complete at its start.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
+}
+
+enum StartedBlock {
+    Content(Content),
+    /// Not surfaced; `key` deduplicates the warning within a stream.
+    Skipped {
+        key: String,
+        reason: String,
+    },
+}
+
+/// Turn a `content_block_start` payload into the block it opens.
+///
+/// Types added to the API later (and server-side blocks this provider never
+/// requests, such as `server_tool_use` or `fallback`) are skipped by name.
+fn start_block(block: serde_json::Value) -> StartedBlock {
+    let kind = block
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("<missing type>")
+        .to_string();
+    match serde_json::from_value::<AnthropicContentBlock>(block) {
+        Ok(AnthropicContentBlock::Text {}) => StartedBlock::Content(Content::Text {
+            text: String::new(),
+        }),
+        Ok(AnthropicContentBlock::Thinking {}) => {
+            StartedBlock::Content(Content::thinking(String::new()))
+        }
+        Ok(AnthropicContentBlock::RedactedThinking { data }) => StartedBlock::Content(
+            Content::thinking_redacted(ApiProtocol::AnthropicMessages, data),
+        ),
+        Ok(AnthropicContentBlock::ToolUse { id, name }) => {
+            StartedBlock::Content(Content::ToolCall {
+                provider_metadata: None,
+                id,
+                name,
+                arguments: serde_json::Value::Object(Default::default()),
+            })
+        }
+        Err(_) if !KNOWN_BLOCK_TYPES.contains(&kind.as_str()) => StartedBlock::Skipped {
+            reason: format!("`{kind}` blocks are not surfaced by this provider"),
+            key: format!("block:{kind}"),
+        },
+        Err(e) => StartedBlock::Skipped {
+            reason: format!("malformed `{kind}` block ({e})"),
+            key: format!("malformed:{kind}"),
+        },
+    }
+}
+
+const KNOWN_BLOCK_TYPES: &[&str] = &["text", "thinking", "redacted_thinking", "tool_use"];
+
+/// Log `message` the first time `key` is seen in this stream.
+fn warn_once(warned: &mut HashSet<String>, key: String, message: impl FnOnce() -> String) {
+    if warned.insert(key) {
+        warn!("{}", message());
+    }
 }
 
 #[derive(Deserialize)]
 struct AnthropicContentBlockDelta {
     index: u64,
-    delta: AnthropicDelta,
+    delta: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -847,6 +1008,36 @@ enum AnthropicDelta {
     #[serde(rename = "signature_delta")]
     SignatureDelta { signature: String },
 }
+
+enum DeltaError {
+    /// A delta type this provider does not surface (`citations_delta`, and
+    /// types added to the API later), by name.
+    Unknown(String),
+    /// A known delta type whose payload does not parse.
+    Malformed(serde_json::Error),
+}
+
+fn parse_delta(delta: serde_json::Value) -> Result<AnthropicDelta, DeltaError> {
+    let kind = delta
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("<missing type>")
+        .to_string();
+    serde_json::from_value(delta).map_err(|e| {
+        if KNOWN_DELTA_TYPES.contains(&kind.as_str()) {
+            DeltaError::Malformed(e)
+        } else {
+            DeltaError::Unknown(kind)
+        }
+    })
+}
+
+const KNOWN_DELTA_TYPES: &[&str] = &[
+    "text_delta",
+    "thinking_delta",
+    "input_json_delta",
+    "signature_delta",
+];
 
 #[derive(Deserialize)]
 struct AnthropicMessageDelta {
@@ -888,6 +1079,21 @@ fn resolve_tool_arguments(partial: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::provider::traits::ToolDefinition;
+    use crate::provider::ModelConfig;
+
+    /// Bedrock's redacted reasoning is opaque here: it is skipped rather
+    /// than sent as a `thinking` block with an empty text and signature.
+    #[test]
+    fn redacted_thinking_from_another_provider_is_not_replayed() {
+        let blocks = content_to_anthropic(&[
+            Content::thinking_redacted(ApiProtocol::BedrockConverseStream, "AAEC"),
+            Content::thinking_signed("t", "s"),
+        ]);
+        assert_eq!(
+            blocks,
+            vec![serde_json::json!({"type": "thinking", "thinking": "t", "signature": "s"})]
+        );
+    }
 
     fn make_config(cache: CacheConfig) -> StreamConfig {
         StreamConfig {
@@ -1046,6 +1252,207 @@ mod tests {
         );
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "structured_output");
+    }
+
+    fn structured_schema() -> crate::provider::OutputSchema {
+        crate::provider::OutputSchema::new(
+            "structured_output",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false,
+            }),
+        )
+    }
+
+    /// A config on `mc` (model id taken from it) with a structured schema.
+    fn structured_config(mc: ModelConfig, level: ThinkingLevel) -> StreamConfig {
+        let mut config = make_config(CacheConfig::default());
+        config.model = mc.id.clone();
+        config.model_config = Some(mc);
+        config.thinking_level = level;
+        config.output_schema = Some(structured_schema());
+        config
+    }
+
+    /// The whole tool-forced request, pinned. With the flag off (the default,
+    /// and what every config persisted before the flag deserializes to) the
+    /// body is exactly what it was before `native_structured_output` existed:
+    /// synthetic tool appended, tool forced, thinking dropped, no
+    /// `output_config`.
+    #[test]
+    fn tool_forced_structured_body_is_unchanged() {
+        let expected = serde_json::json!({
+            "model": "claude-fable-5",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [{"type": "text", "text": "What is 2+2?"}]},
+            ],
+            "system": [
+                {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}},
+            ],
+            "tools": [
+                {
+                    "name": "bash",
+                    "description": "Run commands",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "name": "structured_output",
+                    "description": "Produce the final answer in the required schema.",
+                    "input_schema": structured_schema().schema,
+                },
+            ],
+            "tool_choice": {"type": "tool", "name": "structured_output"},
+        });
+        let mut no_compat = ModelConfig::claude_fable_5();
+        no_compat.anthropic = None;
+        let mut flag_off = ModelConfig::claude_fable_5();
+        flag_off.anthropic = Some(crate::provider::AnthropicCompat::default());
+        for mc in [no_compat, flag_off] {
+            let body = build_request_body(&structured_config(mc, ThinkingLevel::High), false);
+            assert_eq!(body, expected);
+            assert_eq!(
+                serde_json::to_string(&body).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
+    }
+
+    /// #175: Fable 5.1 and Opus 5.5 reject forced `tool_choice`, so their
+    /// presets constrain the reply natively: `output_config.format`, no
+    /// synthetic tool, no `tool_choice`, user tools left alone.
+    #[test]
+    fn native_structured_output_sends_output_config_format() {
+        for mc in [
+            ModelConfig::claude_fable_5_1(),
+            ModelConfig::claude_opus_5_5(),
+        ] {
+            let id = mc.id.clone();
+            let body = build_request_body(&structured_config(mc, ThinkingLevel::Off), false);
+            assert_eq!(
+                body["output_config"],
+                serde_json::json!({
+                    "format": {"type": "json_schema", "schema": structured_schema().schema},
+                }),
+                "{id}"
+            );
+            assert!(body.get("tool_choice").is_none(), "{id}: {body}");
+            let tools = body["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1, "{id}: only the user's tool");
+            assert_eq!(tools[0]["name"], "bash");
+            // Off omits the field (never `disabled`, which both reject).
+            assert!(body.get("thinking").is_none(), "{id}");
+        }
+    }
+
+    /// Near miss for #175: the same model and schema, differing only in the
+    /// flag. Off forces the tool; on sends the format. Nothing else moves.
+    #[test]
+    fn native_flag_is_the_only_switch() {
+        let native = ModelConfig::claude_fable_5_1();
+        let mut forced = ModelConfig::claude_fable_5_1();
+        forced.anthropic.as_mut().unwrap().native_structured_output = false;
+
+        let n = build_request_body(&structured_config(native, ThinkingLevel::Off), false);
+        let f = build_request_body(&structured_config(forced, ThinkingLevel::Off), false);
+        assert_eq!(f["tool_choice"]["name"], "structured_output");
+        assert_eq!(f["tools"].as_array().unwrap().len(), 2);
+        assert!(f.get("output_config").is_none());
+        assert!(n.get("tool_choice").is_none());
+        assert_eq!(n["tools"].as_array().unwrap().len(), 1);
+
+        let strip = |mut v: serde_json::Value| {
+            let o = v.as_object_mut().unwrap();
+            o.remove("tools");
+            o.remove("tool_choice");
+            o.remove("output_config");
+            v
+        };
+        assert_eq!(strip(n), strip(f));
+    }
+
+    /// The native path forces no tool, so thinking is not dropped, and the
+    /// effort must share `output_config` with the format rather than
+    /// overwrite it.
+    #[test]
+    fn native_structured_output_merges_with_effort() {
+        for (level, effort) in [
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            let body = build_request_body(
+                &structured_config(ModelConfig::claude_opus_5_5(), level),
+                false,
+            );
+            assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+            assert_eq!(
+                body["output_config"],
+                serde_json::json!({
+                    "effort": effort,
+                    "format": {"type": "json_schema", "schema": structured_schema().schema},
+                })
+            );
+            assert!(body.get("tool_choice").is_none());
+        }
+    }
+
+    /// Legacy budget thinking has no `effort`; the format stands alone and
+    /// the budget is still sent.
+    #[test]
+    fn native_structured_output_with_legacy_thinking() {
+        let mut mc = ModelConfig::anthropic("claude-opus-4-5", "Claude Opus 4.5");
+        mc.anthropic =
+            Some(crate::provider::AnthropicCompat::legacy().with_native_structured_output(true));
+        let body = build_request_body(&structured_config(mc, ThinkingLevel::Medium), false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            legacy_thinking_budget(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            body["output_config"],
+            serde_json::json!({
+                "format": {"type": "json_schema", "schema": structured_schema().schema},
+            })
+        );
+    }
+
+    /// Haiku 4.5 supports only budget thinking (`type: "adaptive"` is a 400),
+    /// so its preset sends `enabled` + `budget_tokens` even alongside the
+    /// native format — and `output_config` carries no `effort`.
+    #[test]
+    fn haiku_4_5_structured_with_thinking_uses_budget() {
+        let body = build_request_body(
+            &structured_config(ModelConfig::claude_haiku_4_5(), ThinkingLevel::Medium),
+            false,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            legacy_thinking_budget(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            body["output_config"],
+            serde_json::json!({
+                "format": {"type": "json_schema", "schema": structured_schema().schema},
+            })
+        );
+        assert!(body.get("tool_choice").is_none());
+
+        // Without a schema, too: never adaptive on Haiku 4.5.
+        let mut plain = structured_config(ModelConfig::claude_haiku_4_5(), ThinkingLevel::High);
+        plain.output_schema = None;
+        let body = build_request_body(&plain, false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("output_config").is_none(), "{body}");
     }
 
     #[test]
@@ -1293,11 +1700,48 @@ mod tests {
             (ThinkingLevel::Low, "low"),
             (ThinkingLevel::Medium, "medium"),
             (ThinkingLevel::High, "high"),
+            (ThinkingLevel::XHigh, "xhigh"),
+            (ThinkingLevel::Max, "max"),
         ] {
             let mut config = make_config(CacheConfig::default());
             config.thinking_level = level;
             let body = build_request_body(&config, false);
             assert_eq!(body["output_config"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_thinking_xhigh_and_max_pass_through() {
+        // Anthropic's effort ladder is low/medium/high/xhigh/max; the two top
+        // rungs were unreachable before XHigh/Max existed (#171).
+        for (level, effort) in [(ThinkingLevel::XHigh, "xhigh"), (ThinkingLevel::Max, "max")] {
+            let mut config = make_config(CacheConfig::default());
+            config.thinking_level = level;
+            let body = build_request_body(&config, false);
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert_eq!(body["output_config"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn test_legacy_thinking_budget_for_xhigh_and_max() {
+        let mut mc = crate::provider::ModelConfig::anthropic("claude-opus-4-1", "Opus 4.1");
+        mc.anthropic = Some(crate::provider::AnthropicCompat::legacy());
+        for (level, budget) in [
+            (ThinkingLevel::High, 8192),
+            (ThinkingLevel::XHigh, 16_384),
+            (ThinkingLevel::Max, 30_720),
+        ] {
+            let mut config = make_config(CacheConfig::default());
+            config.thinking_level = level;
+            config.max_tokens = Some(1024);
+            config.model_config = Some(mc.clone());
+            let body = build_request_body(&config, false);
+            assert_eq!(body["thinking"]["budget_tokens"], budget);
+            // Raised above the budget, and still inside Opus 4/4.1's 32,000
+            // output ceiling (the smallest among budget-thinking models).
+            let max_tokens = body["max_tokens"].as_u64().unwrap();
+            assert!(max_tokens > budget && max_tokens <= 32_000);
         }
     }
 
