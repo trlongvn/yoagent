@@ -25,6 +25,11 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::process::Command;
 
+/// How long the output is still read after `bash` exits, for what is
+/// buffered in the pipes: past it, a background job that holds them is left
+/// running, its later output discarded, and the result says so.
+const READ_GRACE: Duration = Duration::from_secs(1);
+
 /// Execute shell commands. Captures stdout + stderr.
 pub struct BashTool {
     /// Working directory for commands
@@ -213,7 +218,8 @@ impl AgentTool for BashTool {
         // Declared after `child`, so it is dropped first: the group is killed
         // while `bash` is not yet reaped, and its id cannot have been reused.
         let mut group = GroupKill::new(child.id());
-        let (Some(child_out), Some(child_err)) = (child.stdout.take(), child.stderr.take()) else {
+        let (Some(mut child_out), Some(mut child_err)) = (child.stdout.take(), child.stderr.take())
+        else {
             return Err(ToolError::Failed("Failed to capture output".into()));
         };
 
@@ -221,23 +227,44 @@ impl AgentTool for BashTool {
         // command printed before it, and whether it was cut.
         let mut out = Capture::default();
         let mut err = Capture::default();
+        // Set once `bash` has exited, so a timeout or cancel that fires during
+        // the read grace still sees a finished command (a cancel is still
+        // reported, but leaves the command's jobs running).
+        let mut exited = None;
         let outcome = {
+            // Wait for `bash` itself, not for the pipes: a background job
+            // inherits them, and one still running would keep them open until
+            // the timeout. Once `bash` exits, what is buffered is read for
+            // `READ_GRACE`; whether both pipes reached their end is returned.
             let run = async {
-                tokio::join!(
-                    out.read(child_out, max_bytes),
-                    err.read(child_err, max_bytes),
-                );
-                child.wait().await
+                let reads = async {
+                    tokio::join!(
+                        out.read(&mut child_out, max_bytes),
+                        err.read(&mut child_err, max_bytes),
+                    );
+                };
+                tokio::pin!(reads);
+                let mut drained = false;
+                exited = Some(tokio::select! {
+                    () = &mut reads => {
+                        drained = true;
+                        child.wait().await
+                    }
+                    status = child.wait() => status,
+                });
+                drained || tokio::time::timeout(READ_GRACE, &mut reads).await.is_ok()
             };
             tokio::select! {
                 _ = cancel.cancelled() => None,
-                _ = tokio::time::sleep(timeout) => Some(Err(())),
-                status = run => Some(Ok(status)),
+                _ = tokio::time::sleep(timeout) => Some(None),
+                drained = run => Some(Some(drained)),
             }
         };
-        let status = match outcome {
-            None => return Err(ToolError::Cancelled),
-            Some(Err(())) => {
+        let cancelled = outcome.is_none();
+        let drained = match (outcome, &exited) {
+            (None, None) => return Err(ToolError::Cancelled),
+            // The timeout fired before `bash` exited.
+            (Some(None), None) => {
                 let _ = child.start_kill();
                 return Err(ToolError::Failed(format!(
                     "Command timed out after {}s. Output so far:\n{}",
@@ -245,20 +272,50 @@ impl AgentTool for BashTool {
                     render_output(&out, &err)
                 )));
             }
-            Some(Ok(status)) => {
-                // Finished on its own: what it left running in the background
-                // (a server it started, say) is the command's business.
-                group.disarm();
-                status.map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?
-            }
+            (Some(Some(drained)), _) => drained,
+            // A timeout or cancel during the read grace: `bash` had finished.
+            (_, Some(_)) => false,
         };
+        let status = exited
+            .expect("`bash` has exited")
+            .map_err(|e| ToolError::Failed(format!("Failed to execute: {}", e)))?;
+        // Finished on its own: what it left running in the background (a
+        // server it started, say) is the command's business. (A cancel
+        // during the grace still leaves it: `bash` is reaped, so its group id
+        // is no longer ours to signal.)
+        group.disarm();
+        if !drained {
+            // Keep reading what such a job prints, and discard it: closing
+            // the pipes under it would kill it with SIGPIPE at its next write.
+            // The task ends when the job closes them (it exits).
+            tokio::spawn(async move {
+                let (mut sink_out, mut sink_err) = (tokio::io::sink(), tokio::io::sink());
+                let _ = tokio::join!(
+                    tokio::io::copy(&mut child_out, &mut sink_out),
+                    tokio::io::copy(&mut child_err, &mut sink_err),
+                );
+            });
+        }
+        if cancelled {
+            return Err(ToolError::Cancelled);
+        }
         let exit_code = status.code().unwrap_or(-1);
-        let output = format!("Exit code: {}\n{}", exit_code, render_output(&out, &err));
+        let mut output = format!("Exit code: {}\n{}", exit_code, render_output(&out, &err));
+        if !drained {
+            output.push_str(
+                "\n\nNOTE: a background process still holds the command's output and was \
+                 left running; what it prints from now on is discarded.",
+            );
+        }
 
         // Return output even on failure — LLMs need error output to self-correct
         Ok(ToolResult {
             content: vec![Content::Text { text: output }],
-            details: serde_json::json!({ "exit_code": exit_code, "success": exit_code == 0 }),
+            details: serde_json::json!({
+                "exit_code": exit_code,
+                "success": exit_code == 0,
+                "output_still_open": !drained,
+            }),
         })
     }
 }

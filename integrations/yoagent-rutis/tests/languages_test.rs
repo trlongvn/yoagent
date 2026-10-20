@@ -1,15 +1,15 @@
 //! TypeScript and Python plugins, end to end: real Node, Bun and Python
-//! runtimes (rutis-bridge 0.9), loaded as rows by rutis-loader, registering
+//! runtimes (rutis-bridge 0.12), loaded as rows by rutis-loader, registering
 //! handlers through the `yoagent` host service. The TypeScript fixtures run
 //! on Node and, for the hooks, fail-closed policies and cancel handles, on
 //! Bun too.
 //!
 //! Needs Node 22.19+ with `npm ci` run in `plugins/` (for `@arcships/rutis` and
-//! `@arcships/rutis-runtime` 0.9.1), and Python 3.10+ with `rutis` 0.9 —
+//! `@arcships/rutis-runtime` 0.12.0), and Python 3.10+ with `rutis` 0.12 —
 //! `plugins/.venv/bin/python` (`uv venv plugins/.venv --python 3.12 && uv pip
-//! install --python plugins/.venv/bin/python rutis==0.9.1`), or the
+//! install --python plugins/.venv/bin/python rutis==0.12.0`), or the
 //! interpreter in `YOAGENT_RUTIS_PYTHON`; Bun 1.4+ (`YOAGENT_RUTIS_BUN`, else
-//! `bun` on `PATH`) with `@arcships/rutis-bun` 0.9 from that `npm ci`. A test
+//! `bun` on `PATH`) with `@arcships/rutis-bun` 0.12 from that `npm ci`. A test
 //! whose runtime is missing
 //! prints why and passes; set `YOAGENT_RUTIS_REQUIRE_RUNTIMES=1` (CI does) to
 //! make a missing runtime fail instead.
@@ -72,25 +72,25 @@ fn node_runtime() -> Option<PathBuf> {
         _ => None,
     };
     match version {
-        // pi needs 22.19 (rutis 0.9: 22).
+        // pi needs 22.19 (rutis: 22).
         Some(version) if version >= (22, 19) => {}
         Some((major, minor)) => {
             return skip("Node", format!("Node {major}.{minor} found, 22.19+ needed"))
         }
         None => return skip("Node", "no `node` on PATH".into()),
     }
-    // The version too, as for Python: a stale install would run the 0.9
+    // The version too, as for Python: a stale install would run an older
     // bridge against an older runtime and pass or fail for the wrong reason.
     let installed = std::fs::read_to_string(runtime.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|manifest| manifest["version"].as_str().map(str::to_owned));
     match installed {
-        Some(version) if version.starts_with("0.9.") => Some(runtime),
+        Some(version) if version.starts_with("0.12.") => Some(runtime),
         Some(version) => skip(
             "Node",
             format!(
-                "{} is {version}, 0.9 needed: run `npm ci` in plugins/",
+                "{} is {version}, 0.12 needed: run `npm ci` in plugins/",
                 runtime.display()
             ),
         ),
@@ -106,19 +106,19 @@ fn node_runtime() -> Option<PathBuf> {
 /// `PATH`.
 fn bun_runtime() -> Option<(PathBuf, PathBuf)> {
     let package = plugins_dir().join("node_modules/@arcships/rutis-bun");
-    // The version too, as for Node: a stale install would run the 0.9
+    // The version too, as for Node: a stale install would run an older
     // bridge against another runtime and pass or fail for the wrong reason.
     let installed = std::fs::read_to_string(package.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|manifest| manifest["version"].as_str().map(str::to_owned));
     match installed {
-        Some(version) if version.starts_with("0.9.") => {}
+        Some(version) if version.starts_with("0.12.") => {}
         Some(version) => {
             return skip(
                 "Bun",
                 format!(
-                    "{} is {version}, 0.9 needed: run `npm ci` in plugins/",
+                    "{} is {version}, 0.12 needed: run `npm ci` in plugins/",
                     package.display()
                 ),
             )
@@ -160,7 +160,7 @@ fn bun_runtime() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-/// A Python 3.10+ interpreter with rutis 0.9.
+/// A Python 3.10+ interpreter with rutis 0.12.
 fn python() -> Option<PathBuf> {
     let python = std::env::var_os("YOAGENT_RUTIS_PYTHON")
         .map(PathBuf::from)
@@ -176,11 +176,11 @@ fn python() -> Option<PathBuf> {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             match text.split_once(' ') {
-                Some(("True", version)) if version.starts_with("0.9.") => Some(python),
+                Some(("True", version)) if version.starts_with("0.12.") => Some(python),
                 _ => skip(
                     "Python",
                     format!(
-                        "{} reports `{text}`: Python 3.10+ and rutis 0.9 needed",
+                        "{} reports `{text}`: Python 3.10+ and rutis 0.12 needed",
                         python.display()
                     ),
                 ),
@@ -744,8 +744,46 @@ def apply(ctx, config):
     ctx.effect(ctx.use("yoagent").register("py-cancel", Handler(ctx.use("probe"))))
 "#;
 
+/// Registers `config.name` offering `config.tool`, and does **not** hand the
+/// disposer to `ctx.effect`: only the host can tie it to the row.
+const JS_ROW: &str = r#"
+import { definePlugin } from 'RUTIS'
+export default definePlugin({
+  inject: ['yoagent'],
+  apply(ctx, config) {
+    ctx.use('yoagent').register(config.name, {
+      async tools() { return [{ name: config.tool }] },
+      async call_tool() { return `${config.tool} ran` },
+    })
+  },
+})
+"#;
+
+/// Injects a service no host provides: under rutis 0.12's default catalog
+/// its row waits for good.
+const JS_NEEDS: &str = r#"
+import { definePlugin } from 'RUTIS'
+export default definePlugin({
+  inject: ['yoagent', 'yoagentNoSuchService'],
+  apply() {},
+})
+"#;
+
+/// Takes 1.5 s in `apply`: its row reads loading meanwhile.
+const JS_SLOW: &str = r#"
+import { definePlugin } from 'RUTIS'
+export default definePlugin({
+  async apply() {
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  },
+})
+"#;
+
 struct Fixtures {
     js: PathBuf,
+    row: PathBuf,
+    needs: PathBuf,
+    slow: PathBuf,
     strict: PathBuf,
     cancel: PathBuf,
     images: PathBuf,
@@ -764,6 +802,12 @@ fn fixtures() -> Fixtures {
     std::fs::write(&js, JS_HOOKS.replace("RUTIS", &rutis)).unwrap();
     let strict = dir.path().join("strict.mjs");
     std::fs::write(&strict, JS_STRICT.replace("RUTIS", &rutis)).unwrap();
+    let row = dir.path().join("row.mjs");
+    std::fs::write(&row, JS_ROW.replace("RUTIS", &rutis)).unwrap();
+    let needs = dir.path().join("needs.mjs");
+    std::fs::write(&needs, JS_NEEDS.replace("RUTIS", &rutis)).unwrap();
+    let slow = dir.path().join("slow.mjs");
+    std::fs::write(&slow, JS_SLOW.replace("RUTIS", &rutis)).unwrap();
     let cancel = dir.path().join("cancel.mjs");
     std::fs::write(&cancel, JS_CANCEL.replace("RUTIS", &rutis)).unwrap();
     let images = dir.path().join("images.mjs");
@@ -785,6 +829,9 @@ fn fixtures() -> Fixtures {
     .unwrap();
     Fixtures {
         js,
+        row,
+        needs,
+        slow,
         strict,
         cancel,
         images,
@@ -1053,6 +1100,252 @@ async fn unloading_a_row_unregisters_its_handler() {
     host.root.shutdown().await.unwrap();
 }
 
+/// rutis 0.12's caller row: a language handler's owner is the row that
+/// registered it (two rows of one Node runtime are two owners), and unloading
+/// one row removes its handler while the runtime and the other row run on,
+/// even though the plugin never handed its disposer to `ctx.effect`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_belongs_to_its_row_and_goes_with_it() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let alpha = ts_row(
+        "alpha",
+        &fixtures.row,
+        json!({ "name": "row-a", "tool": "a_tool" }),
+    );
+    let beta = ts_row(
+        "beta",
+        &fixtures.row,
+        json!({ "name": "row-b", "tool": "b_tool" }),
+    );
+    host.load(vec![alpha, beta.clone()]).await;
+    host.until_handlers(&["row-a", "row-b"]).await;
+    let owner = |name: &str| {
+        host.bridge
+            .registry()
+            .handlers()
+            .into_iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.owner().to_string())
+    };
+    assert_eq!(owner("row-a").as_deref(), Some("alpha"));
+    assert_eq!(owner("row-b").as_deref(), Some("beta"));
+
+    // Only beta stays: alpha's row unloads, its runtime does not.
+    let patches: Vec<Patch> = serde_json::from_value(json!([{ "insert": [beta] }])).unwrap();
+    let report = host
+        .loader
+        .reconcile(vec![Layer::new("rows", patches)], None)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report:?}");
+    host.until_no_handler("row-a").await;
+    assert_eq!(owner("row-b").as_deref(), Some("beta"));
+
+    // A policy sees the row as the tool's owner, end to end.
+    let owners = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = owners.clone();
+    let watch = host
+        .root
+        .plugin(plugin(handler("watch").with_before_tool(move |call| {
+            record.lock().unwrap().push(call.offered_by.clone());
+            ToolDecision::Allow
+        })));
+    wait_active(&watch).await;
+    let (agent, seen) = agent(vec![call("b_tool", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(seen.lock().unwrap()[0].tools, vec!["b_tool".to_string()]);
+    let owners = owners.lock().unwrap().clone();
+    assert_eq!(owners.len(), 1, "{owners:?}");
+    let offered = owners[0].as_ref().expect("offered by a plugin");
+    assert_eq!((offered.handler(), offered.owner()), ("row-b", "beta"));
+    assert_eq!(
+        results,
+        vec![("b_tool".into(), "b_tool ran".into(), false)],
+        "the other row's handler still answers"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
+/// A row restarted by a config change: its old handler is gone before the
+/// new generation registers the same name, which keeps the row as owner and
+/// serves the new config.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_row_registers_its_handler_again() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let row = |tool: &str| {
+        ts_row(
+            "alpha",
+            &fixtures.row,
+            json!({ "name": "row-a", "tool": tool }),
+        )
+    };
+    host.load(vec![row("a_tool")]).await;
+    host.until_handlers(&["row-a"]).await;
+    let patches: Vec<Patch> =
+        serde_json::from_value(json!([{ "insert": [row("a2_tool")] }])).unwrap();
+    let report = host
+        .loader
+        .reconcile(vec![Layer::new("rows", patches)], None)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report:?}");
+    // The new generation serves the new config, under the same owner.
+    let mut tools = Vec::new();
+    for _ in 0..150 {
+        let (agent, seen) = agent(vec![text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        run(&mut agent, "go").await;
+        tools = seen.lock().unwrap()[0].tools.clone();
+        if tools == vec!["a2_tool".to_string()] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(tools, vec!["a2_tool".to_string()]);
+    let handlers = host.bridge.registry().handlers();
+    assert_eq!(handlers.len(), 1, "the old generation's entry is gone");
+    assert_eq!(handlers[0].owner(), "alpha");
+    host.root.shutdown().await.unwrap();
+}
+
+/// `rows::wait_running`: a row that runs passes; one injecting a service
+/// nobody provides still waits when the wait ends, and is reported with the
+/// service it lacks.
+#[cfg(feature = "loader")]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_running_names_the_services_a_waiting_row_lacks() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let rows = vec![
+        ts_row(
+            "runs",
+            &fixtures.row,
+            json!({ "name": "row-r", "tool": "r_tool" }),
+        ),
+        ts_row("needs", &fixtures.needs, json!({})),
+    ];
+    let patches: Vec<Patch> = serde_json::from_value(json!([{ "insert": rows }])).unwrap();
+    let layers = vec![Layer::new("rows", patches)];
+    let report = host.loader.reconcile(layers.clone(), None).await.unwrap();
+    assert!(
+        report.failures.is_empty(),
+        "reconcile sees no failure: {report:?}"
+    );
+
+    yoagent_rutis::rows::wait_running(
+        &host.loader,
+        &host.root,
+        &layers,
+        &["runs"],
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("the row that runs");
+    let error = yoagent_rutis::rows::wait_running(
+        &host.loader,
+        &host.root,
+        &layers,
+        &["runs", "needs"],
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("the row that waits");
+    assert_eq!(error.rows.len(), 1, "{error}");
+    assert_eq!(error.rows[0].id, "needs");
+    assert_eq!(error.rows[0].state, yoagent_rutis::rows::RowState::Waiting);
+    assert_eq!(
+        error.rows[0].missing,
+        Some(vec!["yoagentNoSuchService".to_string()]),
+        "{error}"
+    );
+    assert_eq!(error.rows[0].note, None, "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("nothing provides yoagentNoSuchService"),
+        "{error}"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
+/// `rows::wait_running` ends at once on a row that never runs — no such
+/// row, a module that does not resolve — and waits for one still loading.
+#[cfg(feature = "loader")]
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_running_ends_at_once_or_waits_by_state() {
+    use yoagent_rutis::rows::{wait_running, RowState};
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let rows = vec![
+        ts_row("slow", &fixtures.slow, json!({})),
+        ts_row(
+            "broken",
+            &fixtures.slow.with_file_name("no-such-module.mjs"),
+            json!({}),
+        ),
+    ];
+    let patches: Vec<Patch> = serde_json::from_value(json!([{ "insert": rows }])).unwrap();
+    let layers = vec![Layer::new("rows", patches)];
+    let _ = host.loader.reconcile(layers.clone(), None).await.unwrap();
+
+    // Still loading: waited for, not a failure.
+    wait_running(
+        &host.loader,
+        &host.root,
+        &layers,
+        &["slow"],
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("the slow row runs once its apply ends");
+
+    // Never runs: the wait ends at once, every row not running listed.
+    let started = std::time::Instant::now();
+    let ids = vec!["broken".to_string(), "no-such-row".to_string()];
+    let error = wait_running(
+        &host.loader,
+        &host.root,
+        &layers,
+        &ids,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect_err("rows that never run");
+    assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+    let state = |id: &str| {
+        error
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.state.clone())
+    };
+    assert_eq!(state("broken"), Some(RowState::Unresolved), "{error}");
+    assert_eq!(state("no-such-row"), Some(RowState::NoSuchRow), "{error}");
+    assert!(
+        error
+            .rows
+            .iter()
+            .any(|r| r.id == "broken" && r.error.is_some()),
+        "{error}"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_runtime_withdraws_its_handlers() {
     let Some(python) = python() else {
@@ -1062,6 +1355,15 @@ async fn a_crashed_runtime_withdraws_its_handlers() {
     let host = host(None, Some((&fx.py, &python))).await;
     host.load(vec![py_row("py", "py_hooks", json!({}))]).await;
     host.until_handlers(&["py-hooks"]).await;
+    // A Python row's handler belongs to its row too (rutis 0.12's caller row).
+    let owner = host
+        .bridge
+        .registry()
+        .handlers()
+        .into_iter()
+        .find(|h| h.name() == "py-hooks")
+        .map(|h| h.owner().to_string());
+    assert_eq!(owner.as_deref(), Some("py"));
 
     let denied = Reply::new("py_denied", "ran");
     let denied_runs = denied.runs();
@@ -1530,7 +1832,7 @@ export default definePlugin({
 })
 "#;
 
-/// rutis 0.9 closes a local channel on a message over 16 MiB, ending the
+/// rutis (since 0.9) closes a local channel on a message over 16 MiB, ending the
 /// runtime. A conversation holding more than that in images still reaches a
 /// handler that reads it — the images as text — and the runtime lives on.
 #[tokio::test(flavor = "multi_thread")]

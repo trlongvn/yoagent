@@ -79,7 +79,7 @@ async function top(keyword) {
 let probe
 if (!opts.fromJson) {
 log('building the probe…')
-const build = run('cargo', ['build', '--quiet', '--manifest-path', join(rutis, 'Cargo.toml'), '--features', 'node', '--example', 'ecosystem_probe', '--message-format=json'], { timeout: 1_800_000 })
+const build = run('cargo', ['build', '--quiet', '--manifest-path', join(rutis, 'Cargo.toml'), '--features', 'probe', '--example', 'ecosystem_probe', '--message-format=json'], { timeout: 1_800_000 })
 if (!build.ok) throw new Error(`cargo build failed:\n${tail(build.stderr, 4000)}`)
 probe = build.stdout.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return {} } })
   .find((m) => m.reason === 'compiler-artifact' && m.target?.name === 'ecosystem_probe')?.executable
@@ -154,6 +154,8 @@ function classifyPi(r) {
   const error = r.error ?? 'unknown'
   // Its skills do not go through the adapter: yoagent's own loader takes them.
   const usable = skills.length > 0 ? ` Its ${plural(skills.length, 'skill')} still load with yoagent's skills loader.` : ''
+  // Refused after load (the probe reports the stop a run would meet).
+  if (/adapter stopped/.test(error)) return { result: 'refused', detail: error.replace(/^.*?adapter stopped: /s, '') + usable }
   if (/never fires/.test(error)) return { result: 'refused', detail: error.replace(/^.*?Error: /s, '') + usable }
   // A throwing session_start refuses the load too (fail closed), typically
   // reaching for pi app internals the adapter's context does not have.
@@ -313,7 +315,8 @@ async function runDsh(packages) {
       if (!info) {
         r = { inspectError: `could not read the package: ${tail(ins.stderr, 300)}` }
       } else {
-        const inject = (info.inject ?? []).filter((n) => !n.endsWith('?'))
+        // Every key is required in Cordis, `required: false` included.
+        const inject = info.inject ?? []
         r = { ...probeJson(['dsh', '--base', dir, '--rows', JSON.stringify(info.rows), ...inject.flatMap((n) => ['--inject', n])]), client: info.client, peers: info.peers, inject: info.inject, importErrors: info.importErrors }
       }
       if (notes.length > 0) r.installNote = notes.join('; ')

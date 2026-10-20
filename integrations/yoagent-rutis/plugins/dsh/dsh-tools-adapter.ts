@@ -42,10 +42,17 @@
 //
 // dsh's dialogs (an approval its policy asks for, `ask_user_question`) are
 // `host-dialogs.ts`'s, loaded when the host provides a `ui` service.
+//
+// With `dsh-host.ts` loaded (the rows in `dsh-host.json`), each call carries
+// its stand-in DSH agent (`agent` in `tools.execute`): the run's DSH turn
+// opens at its first call and ends at its `finish`. Without it, calls stay
+// agentless. A host that loaded it but refuses a stand-in (no workspace, a
+// failed host service) fails the call with the reason.
 
 import { definePlugin } from '@arcships/rutis'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
-import type { Cancellable, ContentBlock, ToolCall, ToolResult, ToolSpec, Yoagent } from '../yoagent.d.ts'
+import type { Cancellable, ContentBlock, Outcome, RunInfo, ToolCall, ToolResult, ToolSpec, Turn, Yoagent } from '../yoagent.d.ts'
+import type { DshHost } from './dsh-host.ts'
 
 /** The slice of `@deepseek-ai/dsh-attachment`'s `AttachmentStore` this adapter uses. */
 interface DshAttachments {
@@ -86,6 +93,7 @@ interface DshTools {
     name: string
     arguments: unknown
     signal: AbortSignal
+    agent?: unknown
   }): Promise<{
     isError: boolean
     content?: DshBlock[]
@@ -177,6 +185,22 @@ export default definePlugin<Config>({
         return undefined
       }
     }
+    /** The DSH host (`dsh-host.ts`), when the host loaded it: looked up per call, like `attachments`. */
+    const dshHost = (): DshHost | undefined => {
+      try {
+        return ctx.use<DshHost>('yoagent-dsh-host')
+      } catch {
+        return undefined
+      }
+    }
+    /** Tell the DSH host who delegated this run, so its DSH turn is its top-level run's. */
+    const noteRun = (run: RunInfo) => {
+      try {
+        dshHost()?.noteRun(run.run_id, run.parent_run_id)
+      } catch (error) {
+        say('warn', `[dsh] the DSH host could not note run ${run.run_id}: ${error}`)
+      }
+    }
     const maxNote = config?.maxNoteChars ?? 2000
     const say = (level: 'warn' | 'debug', message: string) => {
       // On a host without `log`, rutis's stand-in throws: fall back either way.
@@ -261,7 +285,8 @@ export default definePlugin<Config>({
 
     ctx.effect(
       yoagent.register(config?.name ?? 'dsh-tools', {
-        async tools(): Promise<ToolSpec[]> {
+        async tools(run: RunInfo): Promise<ToolSpec[]> {
+          noteRun(run)
           return dsh
             .schemas()
             .filter((schema) => !only || only.has(schema.name))
@@ -273,11 +298,23 @@ export default definePlugin<Config>({
         },
 
         async call_tool(call: ToolCall & Cancellable): Promise<ToolResult> {
+          const host = dshHost()
+          let agent: unknown
+          if (host) {
+            try {
+              agent = await host.agentFor(call.run_id, call.parent_run_id, call.signal)
+            } catch (error) {
+              const why = error instanceof Error ? error.message : String(error)
+              if (!call.signal.aborted) say('warn', `[dsh] the DSH host has no agent for ${call.tool}: ${why}`)
+              return { text: `the DSH host has no agent for this call: ${why}`, is_error: true }
+            }
+          }
           const out = await dsh.execute({
             callId: `yoagent:${call.call_id}`,
             name: call.tool,
             arguments: call.args,
             signal: call.signal,
+            ...(agent === undefined ? {} : { agent }),
           })
           if (out.isError) {
             const text = (out.content ?? [])
@@ -308,7 +345,26 @@ export default definePlugin<Config>({
           return { content, ...(shown ? { details: { view: shown } } : {}) }
         },
 
-        async before_model(turn: Cancellable) {
+        // The run's DSH turn, if a stand-in opened one, ends with it.
+        async finish(outcome: Outcome & Cancellable) {
+          try {
+            // A failed run says why in `error` (and which extension failed it); a stopped one in `reason`.
+            const why =
+              outcome.end === 'failed'
+                ? [outcome.error || 'the yoagent run failed', outcome.extension ? `(extension ${outcome.extension})` : undefined]
+                    .filter(Boolean)
+                    .join(' ')
+                : outcome.reason
+            await dshHost()?.endRun(outcome.run_id, outcome.end, why)
+          } catch (error) {
+            say('warn', `[dsh] ending the run's DSH turn failed: ${error}`)
+          }
+        },
+
+        async before_model(turn: Turn & Cancellable) {
+          // Also here: a run that has this bridge only as a parent's tree extension never calls
+          // `tools`, but reaches `before_model` (before any of its tool calls).
+          noteRun(turn)
           if (maxNote === 0) return
           const assembly = await prompt.assemble({ signal: turn.signal })
           const parts: string[] = []

@@ -7,7 +7,8 @@
 
 //! **agent** — the agent runtime for Rust.
 //!
-//! A simple, effective agent loop with tool execution and event streaming:
+//! Stream from any of 7 LLM protocols, run tools, loop until done, natively
+//! or on wasm32 (Cloudflare Workers):
 //! `Prompt → LLM stream → tool execution → loop`. The loop is the product;
 //! everything else is optional layers on top of it.
 //!

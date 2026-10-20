@@ -1,5 +1,5 @@
 //! Plugins in other languages — TypeScript / JavaScript on Node or Bun,
-//! Python and Go — through [rutis-bridge](https://docs.rs/rutis-bridge) 0.9
+//! Python and Go — through [rutis-bridge](https://docs.rs/rutis-bridge) 0.12
 //! (the `node`, `bun`, `python`, `go` and `websocket` features).
 //!
 //! With one of those features, [`RutisBridge::install`](crate::RutisBridge::install)
@@ -26,8 +26,11 @@
 //!
 //! `register(name, handler, options?)` returns a function that unregisters
 //! the handler: pass it to `ctx.effect`, so the handler goes when the plugin
-//! unloads. When the plugin's runtime process exits or crashes, its session
-//! closes and every handler it registered is removed too. A handler whose
+//! unloads. A plugin loaded as a row (with `yoagent` in its `inject`) is tied
+//! to that row by the host as well (rutis 0.12's caller row): its handlers go
+//! when the row unloads or restarts, and their owner is the row's loader id.
+//! When the plugin's runtime process exits or crashes, its session closes
+//! and every handler it registered is removed too. A handler whose
 //! runtime is gone while a run still holds it is unavailable, like a Rust
 //! plugin's after an unload: its tool calls fail, its `before_tool` denies,
 //! its `on_input` rejects, its `after_tool` withholds.
@@ -52,9 +55,9 @@
 //! opt-in the same way (`options.messages: true`): `messages` on the
 //! arguments of `before_model`, `before_tool` and `on_stop`.
 //!
-//! The host must share the name with the loader's catalog
-//! (`ServiceCatalog::register_shared("yoagent")`, or `share_by_name()`), so
-//! language rows can inject it.
+//! The loader's catalog must share the name so language rows can inject it:
+//! rutis 0.12's `ServiceCatalog::new()` shares every name by name; one set
+//! to `share_registered_only()` needs `register_shared("yoagent")`.
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -63,7 +66,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
-use rutis::Ctx;
+use rutis::{Ctx, Effect};
 use rutis_bridge::session::{self, host_key, Error, HostDispatch, Reference, Reply, Value};
 use serde_json::{json, Value as Json};
 use tokio_util::sync::CancellationToken;
@@ -74,7 +77,7 @@ use yoagent::{AgentEvent, AgentTool, Content, ToolContext, ToolDecision, ToolErr
 
 use std::time::Duration;
 
-use crate::handler::{EventSink, HandlerImpl, Hooks, Input, RunInfo, Stop, ToolCall, Turn};
+use crate::handler::{EventSink, HandlerImpl, Hooks, Input, Offer, RunInfo, Stop, ToolCall, Turn};
 use crate::registry::Registry;
 
 /// How many events may wait for one handler's `on_event` before it counts
@@ -172,11 +175,16 @@ const MAX_LOG_CHARS: usize = 8 * 1024;
 /// **Never fails.** A plugin calls it fire-and-forget, and a rejected call
 /// it does not catch would end its runtime process. So any value is taken:
 /// a non-string message is written as JSON, other context fields (a whole
-/// hook argument, say) are ignored, a missing argument is empty.
+/// hook argument, say) are ignored, a missing argument is empty, and one with
+/// no JSON form (a `Date`, a `Map`) is empty too, keeping the others in place.
 fn log(args: Value) -> Reply {
     let args: Vec<Json> = args
         .list()
-        .map(|list| list.into_iter().filter_map(|v| v.json().ok()).collect())
+        .map(|list| {
+            list.into_iter()
+                .map(|v| v.json().unwrap_or(Json::Null))
+                .collect()
+        })
         .unwrap_or_default();
     let text = |value: Option<&Json>| match value {
         Some(Json::String(text)) => text.clone(),
@@ -265,21 +273,85 @@ impl Service {
             }
         }
         let caller = session::caller();
-        let owner = match &caller {
-            Some(connection) => format!("language plugin (session {})", connection.tag()),
-            None => "language plugin".to_string(),
+        // The row making the call (rutis 0.12), when it comes from one: its
+        // loader id is the owner, attested by the host rather than said by
+        // the plugin, and the registration lives no longer than the row.
+        let row = session::caller_row();
+        let owner = match (&row, &caller) {
+            (Some(row), _) => row.id().to_string(),
+            (None, Some(connection)) => {
+                format!("language plugin (session {})", connection.tag())
+            }
+            (None, None) => "language plugin".to_string(),
         };
+        if row.is_none() && caller.is_some() {
+            // A plugin that found `yoagent` without declaring it in `inject`,
+            // or a runtime without per-row scopes: a policy keyed on row ids
+            // does not see this handler as any row's.
+            tracing::info!(
+                handler = %name,
+                owner = %owner,
+                "registered by no row (`yoagent` not in its `inject`, or a runtime without row scopes): \
+                 owned by its session, removed when the session closes or by its disposer"
+            );
+        }
         let handler = Arc::new(RemoteHandler {
             name: name.clone(),
             target: Arc::new(target),
             hooks,
             events: Arc::new(options.events),
         });
-        let lifetime = CancellationToken::new();
+        // Unavailable as soon as the row starts unloading (its generation's
+        // token, as for a Rust plugin), or when the disposer runs.
+        let lifetime = match &row {
+            Some(row) => row.ctx().cancellation_token().child_token(),
+            None => CancellationToken::new(),
+        };
         let (seq, _gate) = self
             .registry
             .insert(name.clone(), owner, handler, lifetime.clone())
             .map_err(session::native_error)?;
+        // Removed when the row unloads or restarts, while its runtime runs
+        // on, whether or not the plugin hands the disposer to `ctx.effect`:
+        // the session watch below removes it as the row's token is cancelled
+        // (a spawned task), and this effect removes it synchronously in the
+        // row's cleanup, so it is gone before a restarted row registers the
+        // name again.
+        let mut row_effect = None;
+        if let Some(row) = &row {
+            let registry = Arc::downgrade(&self.registry);
+            let ended = lifetime.clone();
+            let tied = row
+                .ctx()
+                .effect_named(format!("yoagent handler: {name}"), move || {
+                    Effect::Disposer(Box::new(move || {
+                        ended.cancel();
+                        if let Some(registry) = registry.upgrade() {
+                            registry.remove(seq);
+                        }
+                        Ok(())
+                    }))
+                });
+            match tied {
+                Ok(disposer) => row_effect = Some(disposer),
+                Err(error) => {
+                    // The row is no longer loading or active: nothing would
+                    // remove the entry.
+                    lifetime.cancel();
+                    self.registry.remove(seq);
+                    tracing::info!(
+                        handler = %name,
+                        row = %row.id(),
+                        %error,
+                        "registration refused: its row is no longer loading or active"
+                    );
+                    return Err(session::native_error(format!(
+                        "register `{name}`: row `{}` is no longer loading or active ({error})",
+                        row.id()
+                    )));
+                }
+            }
+        }
         // The runtime crashed or exited: its session closed, and the handler
         // goes with it.
         match caller {
@@ -305,11 +377,21 @@ impl Service {
             ),
         }
         let registry = Arc::downgrade(&self.registry);
+        let runtime = self.runtime.clone();
+        // An explicit unregister also drops the row's effect record, so a
+        // plugin re-registering on every config change does not pile them up.
+        let row_effect = std::sync::Mutex::new(row_effect);
         let _entered = self.runtime.enter();
         Ok(Value::callback(move |_| {
             lifetime.cancel();
             if let Some(registry) = registry.upgrade() {
                 registry.remove(seq);
+            }
+            let effect = row_effect.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(effect) = effect {
+                runtime.spawn(async move {
+                    let _ = effect.dispose().await;
+                });
             }
             Ok(Value::Undefined)
         }))
@@ -631,19 +713,20 @@ impl HandlerImpl for RemoteHandler {
         Vec::new()
     }
 
-    async fn tools(&self, run: RunInfo) -> Result<Vec<Arc<dyn AgentTool>>, ExtensionError> {
+    async fn tools(&self, run: RunInfo) -> Result<Vec<Offer>, ExtensionError> {
         let specs = self.target.call("tools", vec![to_json(&run)]).await?;
         let specs: Vec<ToolSpec> = serde_json::from_value(specs)
             .map_err(|e| ExtensionError::new(format!("`tools` returned invalid tools: {e}")))?;
         Ok(specs
             .into_iter()
-            .map(|spec| {
-                Arc::new(RemoteTool {
+            .map(|spec| Offer {
+                source: spec.source.clone(),
+                tool: Arc::new(RemoteTool {
                     label: spec.label.clone().unwrap_or_else(|| spec.name.clone()),
                     spec,
                     target: self.target.clone(),
                     run: run.clone(),
-                }) as Arc<dyn AgentTool>
+                }),
             })
             .collect())
     }
@@ -969,13 +1052,13 @@ impl RemoteEvents {
 }
 
 impl EventSink for RemoteEvents {
-    fn send(&self, event: &AgentEvent) {
+    fn send(&self, event: &AgentEvent) -> bool {
         if self.failure().is_some() {
-            return;
+            return false;
         }
         let kind = event_type(event);
         if !self.filter.contains(&kind) {
-            return;
+            return false;
         }
         let mut json = to_json(event);
         if let (Some(fields), Json::Object(run)) = (json.as_object_mut(), to_json(&self.run)) {
@@ -983,15 +1066,21 @@ impl EventSink for RemoteEvents {
         }
         use tokio::sync::mpsc::error::TrySendError;
         match self.tx.try_send(Delivery::Event(json)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => record_failure(
-                &self.failed,
-                format!(
-                    "plugin handler `{}` fell {EVENT_QUEUE} events behind in `on_event` (not called again this run)",
-                    self.name
-                ),
-            ),
-            Err(TrySendError::Closed(_)) => self.ended(),
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                record_failure(
+                    &self.failed,
+                    format!(
+                        "plugin handler `{}` fell {EVENT_QUEUE} events behind in `on_event` (not called again this run)",
+                        self.name
+                    ),
+                );
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.ended();
+                false
+            }
         }
     }
 
@@ -1032,6 +1121,9 @@ struct ToolSpec {
     description: String,
     #[serde(default = "empty_schema", deserialize_with = "null_as_empty_schema")]
     parameters: Json,
+    /// Where the plugin says the tool came from ([`ToolOwner::source`](crate::ToolOwner::source)).
+    #[serde(default)]
+    source: Option<String>,
 }
 
 fn empty_schema() -> Json {
@@ -1396,7 +1488,7 @@ mod tests {
         fn static_tools(&self) -> Vec<Arc<dyn AgentTool>> {
             Vec::new()
         }
-        async fn tools(&self, _: RunInfo) -> Result<Vec<Arc<dyn AgentTool>>, ExtensionError> {
+        async fn tools(&self, _: RunInfo) -> Result<Vec<crate::handler::Offer>, ExtensionError> {
             Ok(Vec::new())
         }
         async fn before_tool(&self, _: ToolCall) -> Result<ToolDecision, ExtensionError> {
@@ -1565,7 +1657,10 @@ mod tests {
                 }
             }),
         );
-        sink.send(&tool_end());
+        // Taken: an event it subscribed to. Not taken: one it did not, which
+        // the timings then do not count.
+        assert!(sink.send(&tool_end()));
+        assert!(!sink.send(&AgentEvent::AgentStart));
         sink.flush().await;
         assert_eq!(delivered.lock().unwrap().len(), 1);
         assert_eq!(sink.failure(), None);
@@ -1582,5 +1677,11 @@ mod tests {
         assert_eq!(fields.len(), 3);
         // Anything else is passed as it is.
         assert!(matches!(with_signal(json!("text")), Value::Data(t) if t == "text"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sink_whose_delivery_ended_takes_nothing() {
+        let sink = sink(Breaks::TaskDies, &RunInfo::new("run-1"));
+        assert!(!sink.send(&tool_end()));
     }
 }

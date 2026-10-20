@@ -14,13 +14,15 @@ use agent::provider::{ContextTier, CostConfig, ModelConfig};
 
 fn pinned() -> Vec<(&'static str, ModelConfig, CostConfig)> {
     let flat = |i, o, r, w| CostConfig::new(i, o).with_cache_read(r).with_cache_write(w);
-    let tiered = |base: CostConfig, i, o, r, w| {
+    let tiered_at = |above, base: CostConfig, i, o, r, w| {
         base.with_context_tier(
-            ContextTier::new(272_000, i, o)
+            ContextTier::new(above, i, o)
                 .with_cache_read(r)
                 .with_cache_write(w),
         )
     };
+    let tiered = |base: CostConfig, i, o, r, w| tiered_at(272_000, base, i, o, r, w);
+    let read_only = |i, o, r| CostConfig::new(i, o).with_cache_read(r);
     vec![
         (
             "claude_fable_5",
@@ -87,6 +89,58 @@ fn pinned() -> Vec<(&'static str, ModelConfig, CostConfig)> {
             ModelConfig::meta("muse-spark-1.2", "Muse Spark 1.2"),
             flat(1.25, 4.25, 0.15, 1.25),
         ),
+        (
+            "claude_sonnet_5_5",
+            ModelConfig::claude_sonnet_5_5(),
+            flat(2.0, 10.0, 0.1, 2.5),
+        ),
+        (
+            "claude_haiku_5_5",
+            ModelConfig::claude_haiku_5_5(),
+            tiered_at(100_000, flat(0.1, 0.5, 0.01, 0.125), 0.5, 2.5, 0.05, 0.625),
+        ),
+        (
+            "gpt_6_1_sol",
+            ModelConfig::gpt_6_1_sol(),
+            tiered(flat(2.0, 10.0, 0.1, 2.5), 4.0, 15.0, 0.2, 5.0),
+        ),
+        (
+            "gemini_4_argon",
+            ModelConfig::gemini_4_argon(),
+            read_only(4.0, 20.0, 0.2),
+        ),
+        (
+            "gemini_3_8_flash",
+            ModelConfig::gemini_3_8_flash(),
+            read_only(1.5, 7.5, 0.15),
+        ),
+        (
+            "grok_4_7",
+            ModelConfig::grok_4_7(),
+            read_only(2.0, 6.0, 0.5)
+                .with_context_tier(ContextTier::new(200_000, 4.0, 12.0).with_cache_read(1.0)),
+        ),
+        (
+            "mistral_large_4",
+            ModelConfig::mistral_large_4(),
+            read_only(1.36, 4.18, 0.14),
+        ),
+        ("glm_5_3", ModelConfig::glm_5_3(), read_only(1.4, 4.4, 0.26)),
+        (
+            "glm_5_3_flash",
+            ModelConfig::glm_5_3_flash(),
+            read_only(0.15, 0.5, 0.03),
+        ),
+        (
+            "qwen_3_8_max",
+            ModelConfig::qwen_3_8_max(),
+            flat(2.0, 6.0, 0.25, 2.5),
+        ),
+        (
+            "qwen_3_8_flash",
+            ModelConfig::qwen_3_8_flash(),
+            flat(0.15, 0.47, 0.016, 0.2),
+        ),
     ]
 }
 
@@ -111,7 +165,59 @@ fn expected_max_tokens(name: &str) -> u32 {
         | "gpt_6_luna" => 64_000,
         "claude_haiku_4_5" => 32_000,
         "meta(muse-spark-1.1)" | "meta(muse-spark-1.2)" => 131_072,
+        "claude_sonnet_5_5" | "claude_haiku_5_5" | "gpt_6_1_sol" | "grok_4_7" => 64_000,
+        "gemini_4_argon" | "gemini_3_8_flash" => 65_536,
+        "mistral_large_4" => 32_768,
+        "glm_5_3" | "glm_5_3_flash" => 128_000,
+        "qwen_3_8_max" | "qwen_3_8_flash" => 131_072,
         _ => panic!("unrecognized pinned preset: {name}"),
+    }
+}
+
+/// The context window sets the compaction budget: a wrong one means overflow
+/// errors (too large) or needless compaction (too small).
+fn expected_context_window(name: &str) -> u32 {
+    match name {
+        "claude_haiku_4_5" => 200_000,
+        "gpt_5_5" => 1_000_000,
+        "gpt_6_astra" | "gpt_6_sol" | "gpt_6_1_sol" | "gpt_6_luna" => 1_050_000,
+        "gemini_4_argon" | "gemini_3_8_flash" | "meta(muse-spark-1.1)" | "meta(muse-spark-1.2)" => {
+            1_048_576
+        }
+        "grok_4_7" => 500_000,
+        "claude_fable_5" | "claude_fable_5_1" | "claude_opus_5_5" | "claude_opus_5"
+        | "claude_opus_4_8" | "claude_sonnet_5" | "claude_sonnet_5_5" | "claude_haiku_5_5"
+        | "mistral_large_4" | "glm_5_3" | "glm_5_3_flash" | "qwen_3_8_max" | "qwen_3_8_flash" => {
+            1_000_000
+        }
+        _ => panic!("unrecognized pinned preset: {name}"),
+    }
+}
+
+#[test]
+fn every_preset_context_window_is_pinned() {
+    for (name, config, _) in pinned() {
+        assert_eq!(
+            config.context_window,
+            expected_context_window(name),
+            "{name}: the resolved context_window changed"
+        );
+    }
+}
+
+/// Models that always think are marked reasoning-capable, so a `ThinkingLevel`
+/// reaches them without the "not marked reasoning-capable" warning.
+#[test]
+fn always_thinking_presets_are_marked_reasoning() {
+    for config in [
+        ModelConfig::gemini_4_argon(),
+        ModelConfig::gemini_3_8_flash(),
+        ModelConfig::grok_4_7(),
+        ModelConfig::glm_5_3(),
+        ModelConfig::glm_5_3_flash(),
+        ModelConfig::gpt_6_1_sol(),
+    ] {
+        assert!(config.reasoning, "{}", config.id);
     }
 }
 
@@ -138,4 +244,21 @@ fn the_pin_detects_a_one_ulp_change() {
     let mut detiered = pinned().remove(7).1.cost.unwrap();
     detiered.context_tiers[0].cache_read_per_million = 0.5;
     assert_ne!(Some(detiered), pinned().remove(7).1.cost);
+}
+
+/// `ModelConfig::presets()` lists exactly the presets pinned here (by
+/// provider and id), so a preset added to one and not the other fails.
+#[test]
+fn presets_lists_every_pinned_preset() {
+    let mut pinned: Vec<(String, String)> = pinned()
+        .into_iter()
+        .filter(|(name, _, _)| !name.starts_with("meta("))
+        .map(|(_, config, _)| (config.provider, config.id))
+        .collect();
+    let mut listed: Vec<(String, String)> = ModelConfig::presets()
+        .map(|config| (config.provider, config.id))
+        .collect();
+    pinned.sort();
+    listed.sort();
+    assert_eq!(listed, pinned);
 }

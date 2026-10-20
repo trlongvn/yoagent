@@ -11,8 +11,10 @@ use tokio::sync::Mutex;
 pub struct McpToolAdapter {
     client: Arc<Mutex<McpClient>>,
     tool: McpToolInfo,
-    /// Prefix to avoid name collisions (e.g., "server_name__tool_name").
-    prefix: Option<String>,
+    /// The name the agent and the model see: the server's tool name, or
+    /// `<prefix>__<tool>` with [`with_prefix`](Self::with_prefix). Calls to
+    /// the server always use the server's own name.
+    name: String,
     call_timeout: Option<Duration>,
 }
 
@@ -28,8 +30,8 @@ impl McpToolAdapter {
     pub fn new(client: Arc<Mutex<McpClient>>, tool: McpToolInfo) -> Self {
         Self {
             client,
+            name: tool.name.clone(),
             tool,
-            prefix: None,
             call_timeout: None,
         }
     }
@@ -42,9 +44,16 @@ impl McpToolAdapter {
         self
     }
 
-    /// Create with a name prefix for disambiguation.
+    /// Name the tool `<prefix>__<tool>` for the agent and the model (as
+    /// `OpenApiConfig::with_name_prefix` does for OpenAPI tools), so two
+    /// servers offering a tool of the same name, or a server tool named like
+    /// a built-in, do not collide. The server is still called with its own
+    /// tool name. A second call replaces the prefix. Provider limits on tool
+    /// names apply to the result: keep the prefix to letters, digits, `_` and
+    /// `-`, and short (several providers cap names at 64 characters); neither
+    /// the prefix nor the server's name is checked here.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = Some(prefix.into());
+        self.name = format!("{}__{}", prefix.into(), self.tool.name);
         self
     }
 
@@ -63,7 +72,8 @@ impl McpToolAdapter {
             .collect())
     }
 
-    /// Create adapters with a name prefix for all tools from an MCP client.
+    /// Create adapters for all tools from an MCP client, each named
+    /// `<prefix>__<tool>` ([`with_prefix`](Self::with_prefix)).
     pub async fn from_client_with_prefix(
         client: Arc<Mutex<McpClient>>,
         prefix: impl Into<String>,
@@ -88,13 +98,13 @@ impl McpToolAdapter {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl AgentTool for McpToolAdapter {
     fn name(&self) -> &str {
-        // Return the tool name; prefix is applied in label for display.
-        // We use the raw name so MCP server recognizes it in call_tool.
-        &self.tool.name
+        // Prefixed when a prefix was given; `execute` calls the server with
+        // the server's own name (`self.tool.name`).
+        &self.name
     }
 
     fn label(&self) -> &str {
-        &self.tool.name
+        &self.name
     }
 
     fn description(&self) -> &str {
@@ -335,5 +345,100 @@ mod tests {
         assert_eq!(adapters.len(), 2);
         assert_eq!(adapters[0].name(), "tool_a");
         assert_eq!(adapters[1].name(), "tool_b");
+    }
+
+    /// Records each request and answers from a queue.
+    struct RecordingTransport {
+        sent: Arc<std::sync::Mutex<Vec<JsonRpcRequest>>>,
+        responses: std::sync::Mutex<Vec<JsonRpcResponse>>,
+    }
+
+    #[async_trait]
+    impl McpTransport for RecordingTransport {
+        async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+            self.sent.lock().unwrap().push(request);
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                Err(McpError::ConnectionClosed)
+            } else {
+                Ok(responses.remove(0))
+            }
+        }
+
+        async fn close(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefix_names_the_tool_and_the_server_still_gets_its_own_name() {
+        // Two servers offering a tool of the same name.
+        let mut adapters = Vec::new();
+        let mut sent = Vec::new();
+        for server in ["docs", "web"] {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transport = RecordingTransport {
+                sent: log.clone(),
+                responses: std::sync::Mutex::new(vec![
+                    ok_response(
+                        1,
+                        serde_json::json!({ "tools": [{ "name": "search", "inputSchema": {"type": "object"} }] }),
+                    ),
+                    ok_response(
+                        2,
+                        serde_json::json!({ "content": [{"type": "text", "text": server}], "isError": false }),
+                    ),
+                ]),
+            };
+            let client = McpClient::from_transport(Box::new(transport))
+                .with_call_timeout(Some(Duration::from_secs(7)));
+            adapters.extend(
+                McpToolAdapter::from_client_with_prefix(Arc::new(Mutex::new(client)), server)
+                    .await
+                    .unwrap(),
+            );
+            sent.push(log);
+        }
+        let names: Vec<&str> = adapters.iter().map(|a| a.name()).collect();
+        assert_eq!(names, ["docs__search", "web__search"]);
+        // The client's call timeout is carried over, prefix or not.
+        assert!(adapters
+            .iter()
+            .all(|a| a.call_timeout == Some(Duration::from_secs(7))));
+        assert_eq!(adapters[1].label(), "web__search");
+
+        let ctx = ToolContext::new("tc-1", "web__search");
+        let result = adapters[1]
+            .execute(serde_json::json!({"q": "x"}), ctx)
+            .await
+            .unwrap();
+        assert!(matches!(&result.content[0], Content::Text { text } if text == "web"));
+        // The server was called with its own tool name, not the prefixed one.
+        let calls = sent[1].lock().unwrap();
+        let call = calls
+            .iter()
+            .find(|r| r.method == "tools/call")
+            .expect("a tools/call");
+        assert_eq!(call.params.as_ref().unwrap()["name"], "search");
+        // ...and only the server it belongs to.
+        assert!(!sent[0]
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "tools/call"));
+
+        // Without a prefix, the server's name.
+        let tool = McpToolInfo {
+            name: "search".into(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        };
+        let client = Arc::new(Mutex::new(McpClient::from_transport(Box::new(
+            MockTransport::new(vec![]),
+        ))));
+        let plain = McpToolAdapter::new(client, tool);
+        assert_eq!(plain.name(), "search");
+        // A second prefix replaces the first; prefixes never stack.
+        assert_eq!(plain.with_prefix("a").with_prefix("b").name(), "b__search");
     }
 }

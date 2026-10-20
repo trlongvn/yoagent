@@ -328,7 +328,13 @@ pub(crate) async fn parse_stream(
                                     .prompt_token_count
                                     .unwrap_or(0)
                                     .saturating_sub(u.cached_content_token_count.unwrap_or(0));
-                                usage.output = u.candidates_token_count.unwrap_or(0);
+                                // Thinking tokens bill as output ("Output price
+                                // (including thinking tokens)") but are counted
+                                // apart, in `thoughtsTokenCount`.
+                                usage.output = u
+                                    .candidates_token_count
+                                    .unwrap_or(0)
+                                    .saturating_add(u.thoughts_token_count.unwrap_or(0));
                                 usage.total_tokens = u.total_token_count.unwrap_or(0);
                                 usage.cache_read = u.cached_content_token_count.unwrap_or(0);
                             }
@@ -610,13 +616,7 @@ fn build_request_body(config: &StreamConfig) -> serde_json::Value {
                 content,
                 ..
             } => {
-                let text = content
-                    .iter()
-                    .find_map(|c| match c {
-                        Content::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+                let text = super::tool_result_text(content);
 
                 let mut fr = serde_json::json!({
                     "name": tool_name,
@@ -797,6 +797,8 @@ struct GoogleUsageMetadata {
     total_token_count: Option<u64>,
     #[serde(default, rename = "cachedContentTokenCount")]
     cached_content_token_count: Option<u64>,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1314,6 +1316,8 @@ mod tests {
             "gemini-3-pro-preview",
             "gemini-pro-latest",
             "gemini-flash-latest", // hot-swapped alias: MINIMAL not assumed
+            "gemini-3.8-flash",    // rejects MINIMAL (thinking guide)
+            "gemini-4-argon",      // rejects MINIMAL; thinking cannot be off
         ] {
             assert_eq!(
                 thinking_config(model, ThinkingLevel::Minimal)["thinkingLevel"],
@@ -1534,5 +1538,77 @@ mod tests {
         mc.google = Some(GoogleCompat::force_thinking_level());
         let back: ModelConfig = serde_json::from_value(serde_json::to_value(&mc).unwrap()).unwrap();
         assert_eq!(back.google, Some(GoogleCompat::force_thinking_level()));
+    }
+
+    #[test]
+    fn tool_result_sends_every_text_block() {
+        // An MCP server may answer in several text blocks (ESLint's: an intro,
+        // the findings, a closing note); the model must see all of them.
+        let config = StreamConfig {
+            model: "gemini-2.5-flash".into(),
+            system_prompt: "".into(),
+            messages: vec![Message::ToolResult {
+                tool_call_id: "call-1".into(),
+                tool_name: "lint".into(),
+                content: vec![
+                    Content::Text {
+                        text: "Here are the results:".into(),
+                    },
+                    Content::Text {
+                        text: "[{\"line\":3}]".into(),
+                    },
+                ],
+                is_error: false,
+                timestamp: 0,
+            }],
+            tools: vec![],
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            model_config: None,
+            cache_config: CacheConfig::default(),
+            output_schema: None,
+        };
+        let body = build_request_body(&config);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["functionResponse"]["response"]["result"],
+            "Here are the results:\n[{\"line\":3}]"
+        );
+    }
+
+    #[test]
+    fn tool_result_with_an_image_sends_every_text_block_and_the_image() {
+        let config = StreamConfig {
+            model: "gemini-2.5-flash".into(),
+            system_prompt: "".into(),
+            messages: vec![Message::ToolResult {
+                tool_call_id: "call-1".into(),
+                tool_name: "screenshot".into(),
+                content: vec![
+                    Content::Text { text: "a".into() },
+                    Content::Image {
+                        data: "AAAA".into(),
+                        mime_type: "image/png".into(),
+                    },
+                    Content::Text { text: "b".into() },
+                ],
+                is_error: false,
+                timestamp: 0,
+            }],
+            tools: vec![],
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            model_config: None,
+            cache_config: CacheConfig::default(),
+            output_schema: None,
+        };
+        let body = build_request_body(&config);
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["functionResponse"]["response"]["result"], "a\nb");
+        assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
+        assert_eq!(parts.as_array().unwrap().len(), 2);
     }
 }

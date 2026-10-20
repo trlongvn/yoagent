@@ -162,6 +162,8 @@ let tools: Vec<Box<dyn AgentTool>> = vec![
 
 Enforcement is against the **resolved** path, not the string, so neither `..` nor a symlink pointing outside can escape. That includes a dangling symlink, which a write would follow to create its target; a symlink loop is refused. A file that does not exist yet still resolves through its real parent, so writes are checked too, and the tool then does its I/O on the path it checked. Before 0.24.2, a `..` after a not-yet-existing directory, or a dangling symlink, could get past the check. Something changing the tree between the check and the I/O, such as a parallel `bash` call, is not covered. The rejection message deliberately does not echo the allowed roots, since tool results reach the model's transcript.
 
+With or without an allowlist, `read_file`, `write_file` and `edit_file` work on regular files only: a FIFO, a device, a socket or a directory (after following symlinks) is refused with an error naming what it is. Before 0.25.8 a FIFO or `/dev/zero` could hang the call.
+
 ## `BashTool` is not a sandbox
 
 `BashTool` runs whatever the model asks through `bash -c`, with the agent process's own environment and filesystem access.
@@ -196,7 +198,7 @@ async fn execute(&self, params: serde_json::Value, _ctx: ToolContext) -> Result<
 }
 ```
 
-**Exception: BashTool.** The built-in `BashTool` returns `Ok` even on non-zero exit codes, with both stdout and stderr in the result. This is intentional — the LLM needs to see the actual error output (compilation errors, test failures, etc.) to diagnose and fix issues. Only failures outside the command return `Err`: a matched deny pattern, a refused confirmation, a timeout (its message carries the output printed so far), cancellation, or `bash` failing to start. A command that does not exist is an ordinary non-zero exit (127). On Unix, a timeout, a cancel or dropping the call kills the command's whole process group — pipeline stages, commands in a `&&` list and background jobs included; only a process that starts its own session (`setsid`) escapes. A command that finishes on its own leaves a background job alone if the job's output is redirected away from the tool (`npm run dev >dev.log 2>&1 &`); a job still writing to the tool's output keeps the call open until the timeout, which kills it. Because the command runs in its own process group, the terminal's Ctrl+C no longer reaches it: a host should cancel or drop the call on Ctrl+C (the CLI example aborts the run), and a command that prompts on `/dev/tty` (`sudo`, an SSH passphrase) stops until the timeout. On Windows only the `bash` process is killed.
+**Exception: BashTool.** The built-in `BashTool` returns `Ok` even on non-zero exit codes, with both stdout and stderr in the result. This is intentional — the LLM needs to see the actual error output (compilation errors, test failures, etc.) to diagnose and fix issues. Only failures outside the command return `Err`: a matched deny pattern, a refused confirmation, a timeout (its message carries the output printed so far), cancellation, or `bash` failing to start. A command that does not exist is an ordinary non-zero exit (127). On Unix, a timeout, a cancel or dropping the call kills the command's whole process group — pipeline stages, commands in a `&&` list and background jobs included; only a process that starts its own session (`setsid`) escapes. A command that finishes on its own leaves its background jobs running. The call ends when `bash` exits: the output is read for one more second, then a job still holding the tool's output is left running, what it prints from then on is discarded, and the result says so (a `NOTE:` line, `details.output_still_open`). To keep a job's output, redirect it (`npm run dev >dev.log 2>&1 &`). Before 0.25.8 such a job held the call until the timeout, which killed it. Because the command runs in its own process group, the terminal's Ctrl+C no longer reaches it: a host should cancel or drop the call on Ctrl+C (the CLI example aborts the run), and a command that prompts on `/dev/tty` (`sudo`, an SSH passphrase) stops until the timeout. On Windows only the `bash` process is killed.
 
 **A panicking tool** is contained by the loop, the same as a panicking middleware. The call ends as an error result (`tool '<name>' panicked: …`) that the model sees, and the run continues.
 
@@ -514,7 +516,10 @@ The contract:
   one survives: the agent's own tools (including the injected `shared_state`
   tool) win, then earlier sources in installation order, then the earlier
   tool within one source. Each dropped duplicate is logged with
-  `tracing::warn!`; the run is never refused.
+  `tracing::warn!`; the run is never refused. (The agent's own tools —
+  `with_tools`, MCP adapters included — are not de-duplicated: give clashing
+  MCP or OpenAPI tools a prefix with `McpToolAdapter::with_prefix` or
+  `OpenApiConfig::with_name_prefix`.)
 - **Failures.** A source that panics — while building its future or while it
   runs — is contained, logged with the panic message, and contributes no
   tools to that run.

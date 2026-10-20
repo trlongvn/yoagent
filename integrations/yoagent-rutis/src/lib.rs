@@ -30,9 +30,10 @@
 //! can return images in tool results and write logs into the host's
 //! `tracing` output (target `yoagent_rutis::plugin`). Plugins from other
 //! agent ecosystems — DSH tool plugins, pi extensions — plug in through
-//! adapters shipped in the repository's `plugins/` directory;
-//! see the [README](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis)
-//! and its adapter contract.
+//! adapters shipped in the crate's `plugins/` directory ([`adapters`] says
+//! where); see the [README](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis)
+//! and its adapter contract. With the `probe` feature, `probe` loads such a
+//! package through its adapter and reports what an agent gets from it.
 //!
 //! # Host
 //!
@@ -87,7 +88,7 @@
 //!
 //! # Plugins in other languages
 //!
-//! With the `node`, `bun`, `python`, `go` or `websocket` feature (rutis-bridge 0.9),
+//! With the `node`, `bun`, `python`, `go` or `websocket` feature (rutis-bridge 0.12),
 //! [`RutisBridge::install`] also provides the registry to plugins in other
 //! languages, as the host service `yoagent`. Such a plugin registers an
 //! object (a Python dict, a Go map of functions) of async functions, with the same hooks and the
@@ -142,6 +143,7 @@
 //! - **Route rutis's `ErrorSink`** (default: stderr) into your logging with
 //!   `Ctx::root_with_sink`.
 
+pub mod adapters;
 pub mod bridge;
 pub mod events;
 pub mod extension;
@@ -166,7 +168,13 @@ mod host;
 )]
 pub mod languages;
 pub mod plugin;
+#[cfg(feature = "probe")]
+#[cfg_attr(docsrs, doc(cfg(feature = "probe")))]
+pub mod probe;
 pub mod registry;
+#[cfg(feature = "loader")]
+#[cfg_attr(docsrs, doc(cfg(feature = "loader")))]
+pub mod rows;
 
 pub use bridge::RutisBridge;
 pub use events::AgentEventEmitted;
@@ -175,7 +183,7 @@ pub use extension::{
 };
 pub use handler::{Handler, Input, RunInfo, Stop, ToolCall, Turn};
 pub use plugin::{AgentPlugin, PluginCtxExt};
-pub use registry::{HandlerInfo, Registry};
+pub use registry::{HandlerInfo, HookTiming, Registry, ToolOwner};
 
 /// The rutis this bridge is built against (`0.8`, the release train shared
 /// with `rutis-bridge` and `rutis-loader`). Its types are part of this crate's

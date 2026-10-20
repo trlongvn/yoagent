@@ -134,13 +134,10 @@ fn models_dev_fixture_maps_into_our_schema() {
     assert_eq!(gpt.cache_write_per_million, 0.0);
     let gemini = t.cost("google", "gemini-2.5-pro").unwrap();
     assert_eq!(gemini.context_tiers[0].above_prompt_tokens, 200_000);
-    // reasoning == output is expressible.
-    assert_eq!(
-        t.cost("deepseek", "deepseek-v4-pro")
-            .unwrap()
-            .output_per_million,
-        0.87
-    );
+    // DeepSeek bills by time of day: never taken from models.dev (it lists
+    // the off-peak rate), so the snapshot's peak rate stands.
+    assert!(t.cost("deepseek", "deepseek-v4-pro").is_none());
+    assert!(t.cost("deepseek", "deepseek-flash").is_none());
     // alibaba is our qwen.
     assert!(t.cost("qwen", "qwen-flash").is_some());
     assert!(t.cost("alibaba", "qwen-flash").is_none());
@@ -149,12 +146,23 @@ fn models_dev_fixture_maps_into_our_schema() {
         .cost("openrouter", "perplexity/sonar-deep-research")
         .is_none());
     assert!(t.cost("poe", "cerebras/qwen3-32b-cs").is_none());
-    assert_eq!(t.len(), 11);
+    assert_eq!(t.len(), 10);
 
     // Against the built-in data: every overlapping model agrees as billed
     // (gpt-5.5's implicit cache_write equals its explicit input-rate one), so
     // only new models are reported.
     let changes = t.changes_from(&PriceTable::builtin());
+    // Except a model on a vendor promotion: the snapshot carries the regular
+    // rate, models.dev the promotional half (what a live fetch installs).
+    let promo = |c: &yoagent::provider::prices::PriceChange| {
+        c.provider == "mistral" && c.model == "mistral-large-4"
+    };
+    let mistral = changes.iter().find(|c| promo(c)).expect("the promotion");
+    assert_eq!(
+        mistral.after.as_ref().map(|a| a.input_per_million),
+        Some(0.68)
+    );
+    let changes: Vec<_> = changes.into_iter().filter(|c| !promo(c)).collect();
     assert!(
         changes.iter().all(|c| c.before.is_none()),
         "{:?}",
@@ -164,9 +172,10 @@ fn models_dev_fixture_maps_into_our_schema() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     );
+    // A model the snapshot lacks is reported as new.
     assert!(changes
         .iter()
-        .any(|c| c.provider == "deepseek" && c.model == "deepseek-flash"));
+        .any(|c| c.provider == "google" && c.model == "gemini-2.5-pro"));
 }
 
 #[test]
@@ -186,7 +195,7 @@ fn a_changed_models_dev_envelope_is_an_error_not_an_empty_table() {
 fn the_models_dev_report_says_what_was_skipped_and_why() {
     let _g = exclusive();
     let report = PriceTable::from_models_dev_json_report(MODELS_DEV).unwrap();
-    assert_eq!(report.table.len(), 11);
+    assert_eq!(report.table.len(), 10);
     let reason = |p: &str, m: &str| {
         report
             .skipped
@@ -197,7 +206,10 @@ fn the_models_dev_report_says_what_was_skipped_and_why() {
     };
     assert!(reason("openrouter", "perplexity/sonar-deep-research").contains("reasoning"));
     assert!(reason("poe", "cerebras/qwen3-32b-cs").contains("no cost"));
-    assert_eq!(report.skipped.len(), 2);
+    for m in ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"] {
+        assert!(reason("deepseek", m).contains("time of day"));
+    }
+    assert_eq!(report.skipped.len(), 5);
     assert!(report.ignored_fields.is_empty());
 }
 
@@ -279,7 +291,7 @@ async fn fetches_models_dev_format_from_a_url() {
         }
         expected
     });
-    assert_eq!(report.skipped.len(), 2);
+    assert_eq!(report.skipped.len(), 5);
 }
 
 /// Item 2: a `Url` source is usually hand-maintained, so it is strict.
@@ -416,9 +428,9 @@ async fn an_expired_cache_is_refetched_and_rewritten() {
         "{:?}",
         got.origin
     );
-    assert_eq!(got.table.len(), 11);
+    assert_eq!(got.table.len(), 10);
     // The models.dev skip list reaches the caller.
-    assert_eq!(got.skipped.len(), 2);
+    assert_eq!(got.skipped.len(), 5);
     // The cache now holds the mapped table and serves it, fresh.
     let again = PriceTable::fetch_cached(&source, &cache, opts(DAY, DAY)).await;
     assert!(matches!(again.origin, PriceOrigin::Cache { .. }));
@@ -720,4 +732,45 @@ async fn an_unreadable_cache_is_reported() {
     let (problem, logged) = run(dir.path().join("missing.json")).await;
     assert!(problem.is_none());
     assert_eq!(logged, 0);
+}
+
+/// A models.dev cache written before DeepSeek was priced by time of day
+/// holds its off-peak rates: they must not come back through the cache,
+/// fresh or stale, any more than through a fetch.
+#[tokio::test]
+async fn a_cached_models_dev_table_never_brings_back_off_peak_deepseek() {
+    let _g = serial().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("prices.json");
+    let down = serve("/api.json", ResponseTemplate::new(500)).await;
+    let source = PriceSource::ModelsDevAt(format!("{}/api.json", down.uri()));
+    let old = r#"{"schema": 1, "providers": {
+        "anthropic": {"claude-sonnet-5": {"input": 1.5, "output": 7.5}},
+        "deepseek": {"deepseek-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.003}}}}"#;
+    write_cache(&cache, &source, old);
+
+    // Fresh: used without a request, DeepSeek dropped.
+    let got = PriceTable::fetch_cached(&source, &cache, opts(DAY, DAY)).await;
+    assert!(
+        matches!(got.origin, PriceOrigin::Cache { .. }),
+        "{:?}",
+        got.origin
+    );
+    assert!(got.table.cost("deepseek", "deepseek-flash").is_none());
+    assert!(got.table.cost("anthropic", "claude-sonnet-5").is_some());
+
+    // Stale, the fetch failing: the same.
+    let got = PriceTable::fetch_cached(&source, &cache, opts(Duration::ZERO, Duration::MAX)).await;
+    assert!(
+        matches!(got.origin, PriceOrigin::StaleCache { .. }),
+        "{:?}",
+        got.origin
+    );
+    assert!(got.table.cost("deepseek", "deepseek-flash").is_none());
+
+    // A source that is not models.dev keeps whatever it lists.
+    let mine = url_source(&down);
+    write_cache(&cache, &mine, old);
+    let got = PriceTable::fetch_cached(&mine, &cache, opts(DAY, DAY)).await;
+    assert!(got.table.cost("deepseek", "deepseek-flash").is_some());
 }

@@ -385,14 +385,8 @@ fn build_request_body(
                     // Images present: use array format for multimodal tool results
                     content_to_openai(content)
                 } else {
-                    // Text-only: use plain string for maximum compat
-                    let text = content
-                        .iter()
-                        .find_map(|c| match c {
-                            Content::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
+                    // Text-only: every text block in one plain string, for maximum compat
+                    let text = super::tool_result_text(content);
                     serde_json::json!(text)
                 };
 
@@ -675,6 +669,8 @@ struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
     #[serde(default)]
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+    #[serde(default)]
     prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
@@ -691,6 +687,12 @@ struct OpenAiPromptTokensDetails {
     cache_write_tokens: u64,
 }
 
+#[derive(Deserialize)]
+struct OpenAiCompletionTokensDetails {
+    #[serde(default, deserialize_with = "null_as_zero")]
+    reasoning_tokens: u64,
+}
+
 /// Maps a streamed usage chunk onto [`Usage`].
 ///
 /// `prompt_tokens` includes both cached and cache-written tokens — OpenAI's
@@ -700,6 +702,13 @@ struct OpenAiPromptTokensDetails {
 /// excludes both, matching how the other providers split `Usage`. DeepSeek
 /// reports the split directly as `prompt_cache_hit_tokens` /
 /// `prompt_cache_miss_tokens`, which take precedence.
+///
+/// Reasoning tokens bill as output. OpenAI counts them inside
+/// `completion_tokens` (`completion_tokens_details.reasoning_tokens` is a
+/// breakdown); a provider may instead report them beside it, so that
+/// `total_tokens = prompt_tokens + completion_tokens + reasoning_tokens`. They
+/// are added to `output` only when `total_tokens` shows exactly that, so a
+/// provider that includes them is never double-counted.
 fn usage_from_openai(u: &OpenAiUsage) -> Usage {
     let details = u.prompt_tokens_details.as_ref();
     let cache_read = u
@@ -713,10 +722,24 @@ fn usage_from_openai(u: &OpenAiUsage) -> Usage {
                 .saturating_sub(cache_read)
                 .saturating_sub(cache_write)
         }),
-        output: u.completion_tokens,
+        output: u.completion_tokens + reasoning_outside_completion(u),
         cache_read,
         cache_write,
         total_tokens: u.total_tokens,
+    }
+}
+
+/// Reasoning tokens reported beside `completion_tokens` rather than inside it
+/// (see [`usage_from_openai`]); 0 when they are inside, or not reported.
+fn reasoning_outside_completion(u: &OpenAiUsage) -> u64 {
+    let reasoning = u
+        .completion_tokens_details
+        .as_ref()
+        .map_or(0, |d| d.reasoning_tokens);
+    if reasoning > 0 && u.total_tokens == u.prompt_tokens + u.completion_tokens + reasoning {
+        reasoning
+    } else {
+        0
     }
 }
 
@@ -1386,6 +1409,33 @@ mod tests {
         assert_eq!(usage.total_tokens, 110);
     }
 
+    /// Reasoning tokens reported beside `completion_tokens` (total =
+    /// prompt + completion + reasoning) are output; reported inside it (total =
+    /// prompt + completion, OpenAI's convention) they are not added again.
+    #[test]
+    fn test_reasoning_tokens_count_once() {
+        let usage = |json: serde_json::Value| {
+            let chunk: OpenAiChunk =
+                serde_json::from_value(serde_json::json!({ "choices": [], "usage": json }))
+                    .unwrap();
+            usage_from_openai(&chunk.usage.unwrap())
+        };
+        let beside = usage(serde_json::json!({
+            "prompt_tokens": 32,
+            "completion_tokens": 9,
+            "completion_tokens_details": { "reasoning_tokens": 94 },
+            "total_tokens": 135
+        }));
+        assert_eq!(beside.output, 103, "visible + reasoning");
+        let inside = usage(serde_json::json!({
+            "prompt_tokens": 32,
+            "completion_tokens": 103,
+            "completion_tokens_details": { "reasoning_tokens": 94 },
+            "total_tokens": 135
+        }));
+        assert_eq!(inside.output, 103, "already counted");
+    }
+
     #[test]
     fn test_usage_tolerates_explicit_nulls() {
         // One `null` count used to fail the whole chunk, dropping the usage
@@ -1601,6 +1651,43 @@ mod tests {
         assert_eq!(tool_msg["content"], "hello");
     }
 
+    #[test]
+    fn test_tool_result_sends_every_text_block() {
+        // An MCP server may answer in several text blocks (ESLint's: an intro,
+        // the findings, a closing note); the model must see all of them.
+        let model_config = ModelConfig::openai("gpt-4o", "GPT-4o");
+        let compat = OpenAiCompat::openai();
+        let config = StreamConfig {
+            model: "gpt-4o".into(),
+            system_prompt: String::new(),
+            messages: vec![Message::ToolResult {
+                tool_call_id: "call-1".into(),
+                tool_name: "lint".into(),
+                content: vec![
+                    Content::Text {
+                        text: "Here are the results:".into(),
+                    },
+                    Content::Text {
+                        text: "[{\"line\":3}]".into(),
+                    },
+                ],
+                is_error: false,
+                timestamp: 0,
+            }],
+            tools: vec![],
+            thinking_level: ThinkingLevel::Off,
+            api_key: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            model_config: Some(model_config.clone()),
+            cache_config: CacheConfig::default(),
+            output_schema: None,
+        };
+
+        let body = build_request_body(&config, &model_config, &compat);
+        let tool_msg = body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(tool_msg["content"], "Here are the results:\n[{\"line\":3}]");
+    }
     #[test]
     fn test_ollama_inserts_assistant_after_tool_result_run() {
         let model_config = ModelConfig::ollama("http://localhost:11434/v1", "llama3.1:8b");

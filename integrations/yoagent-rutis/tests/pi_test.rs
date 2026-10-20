@@ -19,6 +19,7 @@ use std::time::Duration;
 use common::*;
 use rutis::{Ctx, FiberState};
 use rutis_bridge::runtime::LocalRuntime;
+use rutis_bridge::session::{host_key, HostDispatch, Reply, Value as BridgeValue};
 use rutis_loader::{
     Chain, EntryStatus, Layer, Loader, LoaderOptions, LoaderPlugin, Patch, RuntimeResolver,
     RuntimeRowsPlugin, ServiceCatalog,
@@ -60,7 +61,7 @@ fn node_runtime() -> Option<PathBuf> {
                 .map(|v| (v[0], v.get(1).copied().unwrap_or(0)))
         });
     match version {
-        // pi needs 22.19 (rutis 0.9: 22).
+        // pi needs 22.19 (rutis: 22).
         Some(version) if version >= (22, 19) => {}
         Some((major, minor)) => return skip(format!("Node {major}.{minor} found, 22.19+ needed")),
         None => return skip("no `node` on PATH".into()),
@@ -74,7 +75,20 @@ fn node_runtime() -> Option<PathBuf> {
             ));
         }
     }
-    Some(modules.join("@arcships/rutis-runtime"))
+    // A stale install would run the previous rutis's runtime, silently: the
+    // session protocol did not change.
+    let runtime = modules.join("@arcships/rutis-runtime");
+    let manifest = std::fs::read_to_string(runtime.join("package.json")).unwrap_or_default();
+    let version = serde_json::from_str::<Value>(&manifest)
+        .ok()
+        .and_then(|m| m["version"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if !version.starts_with("0.12.") {
+        return skip(format!(
+            "@arcships/rutis-runtime is {version:?}, 0.12 needed: run `npm ci` in plugins/pi/"
+        ));
+    }
+    Some(runtime)
 }
 
 struct Host {
@@ -84,10 +98,20 @@ struct Host {
 }
 
 async fn host(runtime: &Path) -> Host {
+    host_with_ui(runtime, None).await
+}
+
+/// [`host`], with a host `ui` service when given.
+async fn host_with_ui(runtime: &Path, ui: Option<Arc<dyn HostDispatch>>) -> Host {
     let root = Ctx::root().unwrap();
     let bridge = RutisBridge::install(&root).unwrap();
     let mut catalog = ServiceCatalog::new();
     catalog.register_shared("yoagent");
+    if let Some(ui) = ui {
+        catalog.register_shared("ui");
+        root.provide_as::<dyn HostDispatch>(host_key("ui"), ui)
+            .unwrap();
+    }
     let node = LocalRuntime::node(runtime, pi_dir().join("package.json"));
     let resolver = Arc::new(RuntimeResolver::node(node.handle()).with_catalog(&catalog));
     root.plugin(node);
@@ -924,6 +948,535 @@ async fn a_pi_tool_runs_only_the_arguments_its_policies_judged() {
     host.root.shutdown().await.unwrap();
 }
 
+/// A pi tool's `offered_by` names the adapter's handler and, as its source,
+/// the extension file that registered the tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_tool_is_offered_by_its_extension_file() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let host = host(&runtime).await;
+    // Configured relative to the adapter's `cwd`: the source is the file pi
+    // resolved, not that spelling.
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = extension(
+        dir.path(),
+        "owned.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_echo', label: 'echo', description: 'echoes', parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: 'text', text: 'echo' }], details: undefined }
+    },
+  })
+}
+"#,
+    );
+    host.load(adapter_row(
+        json!({ "extensions": ["./owned.ts"], "cwd": dir.path() }),
+    ))
+    .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let later = host
+        .root
+        .plugin(plugin(handler("later").with_before_tool(move |call| {
+            record
+                .lock()
+                .unwrap()
+                .push((call.tool.clone(), call.offered_by.clone()));
+            ToolDecision::Allow
+        })));
+    wait_active(&later).await;
+    let (agent, _) = agent(vec![
+        calls(&[
+            ("pi_echo", json!({})),
+            ("read_file", json!({"path": "nowhere.txt"})),
+        ]),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tools(vec![Box::new(ReadFileTool::new())])
+        .with_extension(host.bridge.extension());
+    run(&mut agent, "go").await;
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let (tool, owner) = &seen[0];
+    assert_eq!(tool, "pi_echo");
+    let owner = owner.as_ref().expect("a pi tool is offered by the adapter");
+    assert_eq!(owner.handler(), "pi-extensions");
+    assert_eq!(
+        owner.owner(),
+        "pi",
+        "the adapter's row (rutis 0.12's caller row)"
+    );
+    let source = owner.source().expect("its extension file");
+    assert!(Path::new(source).is_absolute(), "{source}");
+    assert_eq!(
+        std::fs::canonicalize(source).unwrap(),
+        std::fs::canonicalize(&fixture).unwrap()
+    );
+    assert_eq!(
+        seen[1],
+        ("read_file".to_string(), None),
+        "the agent's own tool"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
+/// A run's calls run the definition its `tools` offered, whatever registers
+/// the name later: here an extension earlier in the list registers its own
+/// `alpha_echo` from a `tool_call` handler, mid-run. `offered_by.source`
+/// names the file whose tool runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_registered_mid_run_never_takes_over_the_offered_tool() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran.txt");
+    let tool = |who: &str| {
+        format!(
+            r#"pi.registerTool({{
+    name: 'alpha_echo', label: 'echo', description: 'echoes', parameters: Type.Object({{}}),
+    async execute() {{
+      appendFileSync({ran:?}, '{who}\n')
+      return {{ content: [{{ type: 'text', text: '{who} ran' }}], details: undefined }}
+    }},
+  }})"#,
+            ran = ran.display().to_string(),
+        )
+    };
+    let late = extension(
+        dir.path(),
+        "late.ts",
+        &format!(
+            "import {{ appendFileSync }} from 'node:fs'\nimport {{ Type }} from 'typebox'\nexport default function (pi) {{\n  let done = false\n  pi.on('tool_call', () => {{\n    if (done) return\n    done = true\n    {}\n  }})\n}}\n",
+            tool("late")
+        ),
+    );
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        &format!(
+            "import {{ appendFileSync }} from 'node:fs'\nimport {{ Type }} from 'typebox'\nexport default function (pi) {{\n  {}\n}}\n",
+            tool("alpha")
+        ),
+    );
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [&late, &alpha] })))
+        .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let watch = host
+        .root
+        .plugin(plugin(handler("watch").with_before_tool(move |call| {
+            record.lock().unwrap().push(call.offered_by.clone());
+            ToolDecision::Allow
+        })));
+    wait_active(&watch).await;
+    let (agent, _) = agent(vec![
+        call("alpha_echo", json!({})),
+        call("alpha_echo", json!({})),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(
+        results,
+        vec![
+            ("alpha_echo".into(), "alpha ran".into(), false),
+            ("alpha_echo".into(), "alpha ran".into(), false),
+        ],
+        "the offered definition ran both times"
+    );
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "alpha\nalpha\n");
+    for owner in seen.lock().unwrap().iter() {
+        let source = owner.as_ref().and_then(|o| o.source()).expect("a source");
+        assert_eq!(
+            std::fs::canonicalize(source).unwrap(),
+            std::fs::canonicalize(&alpha).unwrap()
+        );
+    }
+    host.root.shutdown().await.unwrap();
+}
+
+/// The same for nested calls and `ctx.tools`: `ctx.executeTool` runs the
+/// definition the run started with, and a running tool cannot swap another
+/// tool's `execute` through `ctx.tools`.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_calls_and_ctx_tools_keep_the_run_s_definitions() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ran = dir.path().join("ran.txt");
+    let ran_s = ran.display().to_string();
+    let late = extension(
+        dir.path(),
+        "late.ts",
+        &format!(
+            r#"import {{ appendFileSync }} from 'node:fs'
+import {{ Type }} from 'typebox'
+export default function (pi) {{
+  let done = false
+  pi.on('tool_call', () => {{
+    if (done) return
+    done = true
+    pi.registerTool({{
+      name: 'alpha_helper', label: 'h', description: 'h', parameters: Type.Object({{}}),
+      async execute() {{
+        appendFileSync({ran_s:?}, 'late helper\n')
+        return {{ content: [{{ type: 'text', text: 'late helper' }}], details: undefined }}
+      }},
+    }})
+  }})
+  pi.registerTool({{
+    name: 'late_tamper', label: 't', description: 't', parameters: Type.Object({{}}),
+    async execute(_id, _args, _signal, _update, ctx) {{
+      const target = ctx.tools.find((t) => t.name === 'alpha_helper')
+      let swapped = 'kept'
+      try {{
+        target.execute = async () => {{
+          appendFileSync({ran_s:?}, 'tampered\n')
+          return {{ content: [{{ type: 'text', text: 'tampered' }}], details: undefined }}
+        }}
+        swapped = 'assigned'
+      }} catch {{}}
+      return {{ content: [{{ type: 'text', text: swapped }}], details: undefined }}
+    }},
+  }})
+}}
+"#
+        ),
+    );
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        &format!(
+            r#"import {{ appendFileSync }} from 'node:fs'
+import {{ Type }} from 'typebox'
+export default function (pi) {{
+  pi.registerTool({{
+    name: 'alpha_helper', label: 'h', description: 'h', parameters: Type.Object({{}}),
+    exposure: 'deferred',
+    async execute() {{
+      appendFileSync({ran_s:?}, 'alpha helper\n')
+      return {{ content: [{{ type: 'text', text: 'alpha helper' }}], details: undefined }}
+    }},
+  }})
+  pi.registerTool({{
+    name: 'alpha_runner', label: 'r', description: 'r', parameters: Type.Object({{}}),
+    async execute(_id, _args, _signal, _update, ctx) {{
+      const out = await ctx.executeTool('alpha_helper', {{}})
+      return {{ content: out.result.content, details: undefined }}
+    }},
+  }})
+}}
+"#
+        ),
+    );
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [&late, &alpha] })))
+        .await;
+    let (agent, _) = agent(vec![
+        call("late_tamper", json!({})),
+        call("alpha_runner", json!({})),
+        call("alpha_runner", json!({})),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    let texts: Vec<_> = results
+        .iter()
+        .map(|r| (r.0.as_str(), r.1.as_str(), r.2))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            ("late_tamper", "kept", false),
+            ("alpha_runner", "alpha helper", false),
+            ("alpha_runner", "alpha helper", false),
+        ],
+        "frozen copies, and the run's own helper"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "alpha helper\nalpha helper\n"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
+/// `nestedCalls` narrows what a pi tool may call through `ctx.executeTool`:
+/// `"any"` (pi's behaviour), `"own-extension"` (only its own extension's
+/// tools), `"off"`; a refused call is an error result the calling tool sees,
+/// and `ctx.tools` lists only what it may call.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_calls_follow_the_host_s_scope() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'alpha_helper', label: 'h', description: 'h', parameters: Type.Object({}),
+    exposure: 'deferred',
+    async execute() { return { content: [{ type: 'text', text: 'alpha helper' }], details: undefined } },
+  })
+  pi.registerTool({
+    name: 'alpha_runner', label: 'r', description: 'r', parameters: Type.Object({}),
+    async execute(_id, _args, _signal, _update, ctx) {
+      const said = []
+      for (const name of ['alpha_helper', 'beta_helper']) {
+        const out = await ctx.executeTool(name, {})
+        said.push(`${name}: ${out.isError ? 'refused' : out.result.content[0].text}`)
+      }
+      const listed = ctx.tools.map((t) => t.name).filter((n) => n.endsWith('_helper')).sort()
+      said.push(`listed: ${listed.join(' ') || 'none'}`)
+      return { content: [{ type: 'text', text: said.join('; ') }], details: undefined }
+    },
+  })
+}
+"#,
+    );
+    let beta = extension(
+        dir.path(),
+        "beta.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'beta_helper', label: 'h', description: 'h', parameters: Type.Object({}),
+    exposure: 'deferred',
+    async execute() { return { content: [{ type: 'text', text: 'beta helper' }], details: undefined } },
+  })
+}
+"#,
+    );
+    for (mode, want) in [
+        (
+            None,
+            "alpha_helper: alpha helper; beta_helper: beta helper; listed: alpha_helper beta_helper",
+        ),
+        (
+            Some("own-extension"),
+            "alpha_helper: alpha helper; beta_helper: refused; listed: alpha_helper",
+        ),
+        (
+            Some("off"),
+            "alpha_helper: refused; beta_helper: refused; listed: none",
+        ),
+    ] {
+        let mut config = json!({ "extensions": [&alpha, &beta] });
+        if let Some(mode) = mode {
+            config["nestedCalls"] = json!(mode);
+        }
+        let host = host(&runtime).await;
+        host.load(adapter_row(config)).await;
+        let (agent, _) = agent(vec![call("alpha_runner", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(
+            results,
+            vec![("alpha_runner".into(), want.to_string(), false)],
+            "{mode:?}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+
+    // A value it does not know refuses the load.
+    let host = host(&runtime).await;
+    let failure = host
+        .try_load(adapter_row(
+            json!({ "extensions": [&alpha], "nestedCalls": "some" }),
+        ))
+        .await;
+    assert!(failure.contains("nestedCalls"), "{failure}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// Under `"own-extension"`, a name two extensions registered belongs to the
+/// winning (first) registration — the one whose code would run — in both
+/// load orders; and under `"off"` an unknown name says the host turned nested
+/// calls off.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_extension_follows_the_winning_registration() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let helper = |who: &str| {
+        format!(
+            r#"pi.registerTool({{
+    name: 'shared_helper', label: 'h', description: 'h', parameters: Type.Object({{}}),
+    exposure: 'deferred',
+    async execute() {{ return {{ content: [{{ type: 'text', text: '{who} shared' }}], details: undefined }} }},
+  }})"#
+        )
+    };
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        &format!(
+            r#"import {{ Type }} from 'typebox'
+export default function (pi) {{
+  {}
+  pi.registerTool({{
+    name: 'alpha_runner', label: 'r', description: 'r', parameters: Type.Object({{}}),
+    async execute(_id, _args, _signal, _update, ctx) {{
+      const said = []
+      for (const name of ['shared_helper', 'nope_helper']) {{
+        const out = await ctx.executeTool(name, {{}})
+        said.push(`${{name}}: ${{out.result.content[0].text}}`)
+      }}
+      said.push(`listed: ${{ctx.tools.map((t) => t.name).filter((n) => n.endsWith('_helper')).join(' ') || 'none'}}`)
+      return {{ content: [{{ type: 'text', text: said.join('; ') }}], details: undefined }}
+    }},
+  }})
+}}
+"#,
+            helper("alpha")
+        ),
+    );
+    let beta = extension(
+        dir.path(),
+        "beta.ts",
+        &format!(
+            "import {{ Type }} from 'typebox'\nexport default function (pi) {{\n  {}\n}}\n",
+            helper("beta")
+        ),
+    );
+    for (order, mode, want) in [
+        (
+            [&beta, &alpha],
+            "own-extension",
+            &[
+                "shared_helper: shared_helper belongs to another extension",
+                "nope_helper: Tool nope_helper not found",
+                "listed: none",
+            ][..],
+        ),
+        (
+            [&alpha, &beta],
+            "own-extension",
+            &[
+                "shared_helper: alpha shared",
+                "nope_helper: Tool nope_helper not found",
+                "listed: shared_helper",
+            ][..],
+        ),
+        (
+            [&alpha, &beta],
+            "off",
+            &[
+                "shared_helper: nested tool calls are turned off",
+                "nope_helper: nested tool calls are turned off",
+                "listed: none",
+            ][..],
+        ),
+    ] {
+        let host = host(&runtime).await;
+        host.load(adapter_row(
+            json!({ "extensions": order, "nestedCalls": mode }),
+        ))
+        .await;
+        let (agent, _) = agent(vec![call("alpha_runner", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(results.len(), 1, "{results:?}");
+        for part in want {
+            assert!(results[0].1.contains(part), "{mode} {part:?}: {results:?}");
+        }
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// A host `ui` that answers every request `true` and records it.
+#[derive(Default)]
+struct YesUi(Mutex<Vec<Value>>);
+
+impl HostDispatch for YesUi {
+    fn invoke(&self, method: &str, args: BridgeValue) -> Reply {
+        match method {
+            "request" => {
+                let request = args.list()?.into_iter().next().unwrap().json()?;
+                self.0.lock().unwrap().push(request);
+                Ok(BridgeValue::Data(json!(true)))
+            }
+            "frontends" => Ok(BridgeValue::Data(json!(1))),
+            _ => Ok(BridgeValue::Undefined),
+        }
+    }
+
+    fn methods(&self) -> Option<Value> {
+        Some(json!({ "request": "async", "withdraw": "async", "frontends": "sync" }))
+    }
+}
+
+/// `host-ui.ts` re-provides the host's `ui` as `pi-host-ui` (an undeclared
+/// `ctx.provide`, which reaches rutis since 0.12): a pi extension's
+/// `ctx.ui.confirm` then asks the host; without that row it answers as print
+/// mode (`false`), and the policy denies.
+#[tokio::test(flavor = "multi_thread")]
+async fn host_ui_brings_pi_dialogs_to_the_host() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ext = extension(
+        dir.path(),
+        "ask.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_ask', label: 'a', description: 'a', parameters: Type.Object({}),
+    async execute() { return { content: [{ type: 'text', text: 'asked and ran' }], details: undefined } },
+  })
+  pi.on('tool_call', async (event, ctx) => {
+    if (event.toolName !== 'pi_ask') return
+    if (!(await ctx.ui.confirm('Run pi_ask?', 'it is harmless'))) return { block: true, reason: 'not confirmed' }
+  })
+}
+"#,
+    );
+    for with_host_ui in [true, false] {
+        let ui = Arc::new(YesUi::default());
+        let host = host_with_ui(&runtime, Some(ui.clone())).await;
+        let mut rows = adapter_row(json!({ "extensions": [&ext] }));
+        if with_host_ui {
+            rows.as_array_mut()
+                .unwrap()
+                .push(json!({ "id": "host-ui", "name": pi_dir().join("host-ui.ts") }));
+        }
+        host.load(rows).await;
+        let (agent, _) = agent(vec![call("pi_ask", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        let asked = ui.0.lock().unwrap().clone();
+        if with_host_ui {
+            assert_eq!(
+                results,
+                vec![("pi_ask".into(), "asked and ran".into(), false)]
+            );
+            assert_eq!(asked.len(), 1, "{asked:?}");
+            assert_eq!(asked[0]["kind"], "confirm");
+            assert_eq!(asked[0]["title"], "Run pi_ask?");
+        } else {
+            assert!(
+                results[0].2 && results[0].1.contains("not confirmed"),
+                "{results:?}"
+            );
+            assert!(asked.is_empty(), "{asked:?}");
+        }
+        host.root.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deciding_event_registered_mid_run_stops_that_run() {
     let Some(runtime) = node_runtime() else {
@@ -1083,6 +1636,61 @@ export default function (pi) {{
 /// A `message_end` check cut short by the hook's timeout does not pass: the
 /// message is not marked judged, so the next call on it is checked again
 /// (and here times out again) instead of going ahead unjudged.
+/// rutis 0.11 sends an integer beyond ±(2^53−1) as a big integer; the adapter
+/// compares arguments and messages in a JSON form, which must keep it rather
+/// than throw (a throw denies the call, and with `message_end` handlers every
+/// later call of the run).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_big_integer_in_a_call_neither_denies_it_nor_later_calls() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("seen.txt");
+    let source = format!(
+        r#"import {{ appendFileSync }} from 'node:fs'
+export default function (pi) {{
+  pi.on('tool_call', (e) => {{
+    appendFileSync({log:?}, typeof e.input.snowflake + '\n')
+  }})
+  pi.on('message_end', () => {{}})
+  pi.on('context', () => {{}})
+}}
+"#,
+        log = log.display().to_string(),
+    );
+    let ext = extension(dir.path(), "big.ts", &source);
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let snowflake = 1u64 << 60;
+    let (agent, seen) = agent(vec![
+        call(
+            "bash",
+            json!({"command": "echo first", "snowflake": snowflake}),
+        ),
+        call("bash", json!({"command": "echo second"})),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tools(vec![Box::new(BashTool::new())])
+        .with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        !results[0].2 && results[0].1.contains("first"),
+        "{results:?}"
+    );
+    assert!(
+        !results[1].2 && results[1].1.contains("second"),
+        "{results:?}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 3, "every request went out");
+    // The policy saw the number exactly, as a JS bigint.
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(seen.lines().next(), Some("bigint"), "{seen}");
+    host.root.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_end_check_cut_short_does_not_pass() {
     let Some(runtime) = node_runtime() else {
@@ -1142,5 +1750,742 @@ export default function (pi) {{
         "both calls denied: {results:?}"
     );
     assert!(!ran.exists(), "no tool ran");
+    host.root.shutdown().await.unwrap();
+}
+
+/// `pi.exec` runs only what the host's `exec` setting allows: nothing by
+/// default, exactly the listed commands (a name is not its path, nor a path
+/// its name), or anything with `true` — also when an extension takes `exec`
+/// from `Object.getOwnPropertyDescriptor(pi, 'exec')`.
+/// A refusal is a failed command (code 126, the reason in stderr), never a
+/// throw. `ctx.isProjectTrusted()` answers the host's `projectTrusted`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pi_exec_runs_only_what_the_host_allows() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ext = extension(
+        dir.path(),
+        "exec.ts",
+        r#"
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_exec',
+    label: 'pi_exec',
+    description: 'runs a command through pi.exec',
+    parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+    async execute(_id, params, _signal, _update, ctx) {
+      const r = await pi.exec(params.command, ['hi'])
+      return {
+        content: [{ type: 'text', text: `code=${r.code} out=${r.stdout.trim()} err=${r.stderr} trusted=${ctx.isProjectTrusted()}` }],
+        details: {},
+      }
+    },
+  })
+  // The real `exec` must not be reachable around the gate either.
+  const viaDescriptor = Object.getOwnPropertyDescriptor(pi, 'exec').value
+  pi.registerTool({
+    name: 'pi_exec_descriptor',
+    label: 'pi_exec_descriptor',
+    description: 'runs echo through the property descriptor',
+    parameters: { type: 'object', properties: {} },
+    async execute() {
+      const r = await viaDescriptor('echo', ['hi'])
+      return { content: [{ type: 'text', text: `code=${r.code}` }], details: {} }
+    },
+  })
+}
+"#,
+    );
+    let echo = which_echo();
+    for (config, expect) in [
+        (json!({}), ["code=126", "code=126"]),
+        (json!({ "exec": ["echo"] }), ["code=0 out=hi", "code=126"]),
+        (
+            json!({ "exec": [echo.clone()] }),
+            ["code=126", "code=0 out=hi"],
+        ),
+        (
+            json!({ "exec": true, "projectTrusted": true }),
+            ["code=0 out=hi", "code=0 out=hi"],
+        ),
+    ] {
+        let host = host(&runtime).await;
+        let mut row = json!({ "extensions": [ext] });
+        row.as_object_mut()
+            .unwrap()
+            .extend(config.as_object().unwrap().clone());
+        host.load(adapter_row(row)).await;
+        let (agent, _) = agent(vec![
+            calls(&[
+                ("pi_exec", json!({ "command": "echo" })),
+                ("pi_exec", json!({ "command": echo })),
+                ("pi_exec_descriptor", json!({})),
+            ]),
+            text("done"),
+        ]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(results.len(), 3, "{results:?}");
+        // The descriptor path is gated like `pi.exec` (refused unless `echo` is allowed).
+        let by_name = expect[0];
+        assert!(
+            results[2]
+                .1
+                .contains(&by_name[..by_name.find(' ').unwrap_or(by_name.len())]),
+            "{results:?}"
+        );
+        for (result, want) in results.iter().zip(expect) {
+            assert!(
+                !result.2 && result.1.contains(want),
+                "{config}: {results:?}"
+            );
+            if want == "code=126" {
+                assert!(result.1.contains("not allowed by the host"), "{results:?}");
+            }
+        }
+        let trusted = config["projectTrusted"] == true;
+        assert!(
+            results[0].1.ends_with(&format!("trusted={trusted}")),
+            "{results:?}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// The absolute path of `echo` (so a listed path is tested as a path).
+fn which_echo() -> String {
+    for dir in ["/bin", "/usr/bin"] {
+        let path = format!("{dir}/echo");
+        if Path::new(&path).exists() {
+            return path;
+        }
+    }
+    panic!("no echo in /bin or /usr/bin");
+}
+
+/// Extensions still load through the adapter's wrappers as pi loads them (a
+/// directory with `index.ts`, a CommonJS module), and a failed one is named by
+/// its own path, never the wrapper's. An `exec` setting that is not `true`,
+/// `false` or a list of commands refuses the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn extensions_load_through_the_wrappers_as_pi_loads_them() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let tool = |name: &str| {
+        format!(
+            "pi.registerTool({{ name: '{name}', label: '{name}', description: 'x', parameters: {{ type: 'object', properties: {{}} }}, \
+             async execute() {{ return {{ content: [{{ type: 'text', text: '{name} ran' }}], details: {{}} }} }} }})"
+        )
+    };
+    std::fs::create_dir(dir.path().join("dir_ext")).unwrap();
+    extension(
+        &dir.path().join("dir_ext"),
+        "index.ts",
+        &format!("export default function (pi) {{ {} }}", tool("from_dir")),
+    );
+    let cjs = extension(
+        dir.path(),
+        "cjs_ext.cjs",
+        &format!("module.exports = function (pi) {{ {} }}", tool("from_cjs")),
+    );
+    let loaded = host(&runtime).await;
+    loaded
+        .load(adapter_row(json!({
+            "extensions": [dir.path().join("dir_ext"), cjs],
+        })))
+        .await;
+    let (agent, _) = agent(vec![
+        calls(&[("from_dir", json!({})), ("from_cjs", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(loaded.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].1.contains("from_dir ran") && results[1].1.contains("from_cjs ran"),
+        "{results:?}"
+    );
+    loaded.root.shutdown().await.unwrap();
+
+    let broken = extension(
+        dir.path(),
+        "broken.ts",
+        "export default function (pi) { this is not code }",
+    );
+    let named = extension(dir.path(), "named.ts", "export const notDefault = 1");
+    let missing = dir.path().join("missing.ts");
+    for (path, want) in [
+        (&broken, "broken.ts"),
+        (&named, "does not export a valid factory function"),
+        (&missing, "missing.ts"),
+    ] {
+        let host = host(&runtime).await;
+        let failures = host
+            .try_load(adapter_row(json!({ "extensions": [path] })))
+            .await;
+        assert!(failures.contains(want), "{failures}");
+        assert!(
+            !failures.contains("yoagent-pi-wrappers"),
+            "names the wrapper: {failures}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+    for exec in [json!("echo"), json!([1])] {
+        let host = host(&runtime).await;
+        let failures = host
+            .try_load(adapter_row(json!({ "extensions": [cjs], "exec": exec })))
+            .await;
+        assert!(failures.contains("exec"), "{exec}: {failures}");
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// Two adapters in one runtime loading the same extension at once each get
+/// it: the wrapper hands its factory over on its own load's event bus, so the
+/// loads share nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_adapters_load_one_extension_at_once() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let host = host(&runtime).await;
+    let row = |id: &str| {
+        json!({
+            "id": id,
+            "name": pi_dir().join("pi-extensions-adapter.ts"),
+            "config": {
+                "name": id,
+                "extensions": [pi_dir().join("fixture-extension.ts")],
+                "toolNames": {},
+            },
+        })
+    };
+    let failures = host.try_load(json!([row("pi-a"), row("pi-b")])).await;
+    assert!(failures.is_empty(), "{failures}");
+    let registry = host.bridge.registry().clone();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let names: Vec<String> = registry
+                .handlers()
+                .iter()
+                .map(|h| h.name().to_owned())
+                .collect();
+            if names.iter().any(|n| n == "pi-a") && names.iter().any(|n| n == "pi-b") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both adapters register their handler");
+    host.root.shutdown().await.unwrap();
+}
+
+/// pi's observer events fire from yoagent's event stream, in order and in
+/// pi's shapes: the run, each turn (its index, message and tool results),
+/// messages starting and streaming, and each tool call under pi's name and
+/// argument shape — in the tool events and inside messages alike. A throwing
+/// observer is reported and the ones after it still run.
+#[tokio::test(flavor = "multi_thread")]
+async fn pi_observer_events_fire_in_order() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let source = r#"
+import { appendFileSync } from 'node:fs'
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_echo2',
+    label: 'pi_echo2',
+    description: 'echoes',
+    parameters: { type: 'object', properties: { text: { type: 'string' } } },
+    async execute(_id, params) {
+      return { content: [{ type: 'text', text: `echo ${params.text}` }], details: { n: 1 } }
+    },
+  })
+  const write = (e) => appendFileSync(LOG, JSON.stringify(e) + '\n')
+  // Registered first: a throwing observer must not stop the ones after it.
+  pi.on('turn_start', () => { throw new Error('observer boom') })
+  for (const name of ['agent_start', 'agent_end', 'turn_start', 'turn_end', 'message_start', 'message_update',
+    'tool_execution_start', 'tool_execution_update', 'tool_execution_end']) {
+    pi.on(name, (e) => write({
+      type: e.type, turnIndex: e.turnIndex, toolName: e.toolName, args: e.args, isError: e.isError,
+      result: e.result, role: e.message?.role, results: e.toolResults?.length, messages: e.messages?.length,
+      delta: e.assistantMessageEvent?.type, outcome: e.outcome,
+      calls: (e.message?.content ?? []).filter((b) => b.type === 'toolCall').map((b) => b.name),
+      resultNames: (e.toolResults ?? []).map((r) => r.toolName),
+    }))
+  }
+}
+"#
+    .replace("LOG", &format!("{:?}", log.display().to_string()));
+    let ext = extension(dir.path(), "observer.ts", &source);
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let readme = dir.path().join("readme.txt");
+    std::fs::write(&readme, "hello").unwrap();
+    let (agent, _) = agent(vec![
+        calls(&[
+            ("pi_echo2", json!({ "text": "hi" })),
+            ("read_file", json!({ "path": readme })),
+        ]),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tools(vec![Box::new(yoagent::tools::ReadFileTool::new())])
+        .with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert!(results[0].1.contains("echo hi"), "{results:?}");
+    assert!(results[1].1.contains("hello"), "{results:?}");
+    let text = wait_file(&log, |t| t.contains("\"agent_end\"")).await;
+    let events: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let kinds: Vec<String> = events
+        .iter()
+        .map(|e| match e["role"].as_str() {
+            Some(role) if e["type"] == "message_start" => format!("message_start:{role}"),
+            _ => e["type"].as_str().unwrap().to_owned(),
+        })
+        .collect();
+    assert_eq!(kinds.len(), 16, "{text}");
+    // The two tools run in parallel: their start, end and result events may
+    // interleave, but each comes once, between the answer's start and the turn's end.
+    let (head, rest) = kinds.split_at(4);
+    let (middle, tail) = rest.split_at(6);
+    assert_eq!(
+        head,
+        [
+            "agent_start",
+            "turn_start",
+            "message_start:user",
+            "message_start:assistant"
+        ],
+        "{text}"
+    );
+    let mut middle = middle.to_vec();
+    middle.sort();
+    assert_eq!(
+        middle,
+        [
+            "message_start:toolResult",
+            "message_start:toolResult",
+            "tool_execution_end",
+            "tool_execution_end",
+            "tool_execution_start",
+            "tool_execution_start",
+        ],
+        "{text}"
+    );
+    assert_eq!(
+        tail,
+        [
+            "turn_end",
+            "turn_start",
+            "message_start:assistant",
+            "message_update",
+            "turn_end",
+            "agent_end"
+        ],
+        "{text}"
+    );
+    let find = |kind: &str, n: usize| events.iter().filter(|e| e["type"] == kind).nth(n).unwrap();
+    let by_name = |kind: &str, name: &str| {
+        events
+            .iter()
+            .find(|e| e["type"] == kind && e["toolName"] == name)
+            .unwrap()
+    };
+    assert_eq!(find("turn_start", 1)["turnIndex"], 1);
+    let turn = find("turn_end", 0);
+    assert_eq!(
+        (&turn["turnIndex"], &turn["results"], &turn["outcome"]),
+        (&json!(0), &json!(2), &json!("completed"))
+    );
+    // Built-ins under pi's names, in tool events and inside messages alike.
+    assert_eq!(turn["calls"], json!(["pi_echo2", "read"]));
+    assert_eq!(turn["resultNames"], json!(["pi_echo2", "read"]));
+    assert_eq!(
+        by_name("tool_execution_start", "read")["args"]["path"],
+        json!(readme)
+    );
+    assert_eq!(
+        by_name("tool_execution_start", "pi_echo2")["args"],
+        json!({ "text": "hi" })
+    );
+    let end = by_name("tool_execution_end", "pi_echo2");
+    assert_eq!(end["isError"], false);
+    assert_eq!(end["result"]["content"][0]["text"], "echo hi");
+    assert_eq!(end["result"]["details"], json!({ "n": 1 }));
+    assert_eq!(find("message_update", 0)["delta"], "text_delta");
+    assert_eq!(find("agent_end", 0)["messages"], 5);
+    host.root.shutdown().await.unwrap();
+}
+
+/// With only `turn_start` handlers the turn index still advances at each
+/// turn's end (both turn event types are subscribed), as in pi.
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_alone_still_counts_turns() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("turns.jsonl");
+    let source = r#"
+import { appendFileSync } from 'node:fs'
+export default function (pi) {
+  pi.on('turn_start', (e) => appendFileSync(LOG, JSON.stringify(e.turnIndex) + '\n'))
+  pi.registerTool({
+    name: 'pi_noop', label: 'pi_noop', description: 'x', parameters: { type: 'object', properties: {} },
+    async execute() { return { content: [{ type: 'text', text: 'ok' }], details: {} } },
+  })
+}
+"#
+    .replace("LOG", &format!("{:?}", log.display().to_string()));
+    let ext = extension(dir.path(), "turns.ts", &source);
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let (agent, _) = agent(vec![call("pi_noop", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    run(&mut agent, "go").await;
+    let seen = wait_file(&log, |t| t.lines().count() >= 2).await;
+    assert_eq!(seen.lines().collect::<Vec<_>>(), ["0", "1"]);
+    host.root.shutdown().await.unwrap();
+}
+
+/// A slow observer (a tracer flushing over the network) does not silence the
+/// observers: the handlers run on the adapter's own ordered chain, so the
+/// bridge's per-event timeout (5 s), which would switch them off for the run,
+/// never fires — a later `agent_end` still arrives — and the run (with a
+/// required bridge) ends normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_observer_does_not_fail_the_run_or_drop_events() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("slow.jsonl");
+    let source = r#"
+import { appendFileSync } from 'node:fs'
+export default function (pi) {
+  pi.on('turn_end', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 6000))
+    appendFileSync(LOG, 'turn_end\n')
+  })
+  pi.on('agent_end', () => appendFileSync(LOG, 'agent_end\n'))
+}
+"#
+    .replace("LOG", &format!("{:?}", log.display().to_string()));
+    let ext = extension(dir.path(), "slow.ts", &source);
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let (agent, _) = agent(vec![text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension().required());
+    run(&mut agent, "go").await;
+    // Held up by nothing: the run ended normally, not failed by the bridge.
+    let last = agent.messages().last().cloned();
+    assert!(
+        matches!(
+            &last,
+            Some(AgentMessage::Llm(Message::Assistant {
+                stop_reason: yoagent::StopReason::Stop,
+                ..
+            }))
+        ),
+        "{last:?}"
+    );
+    let seen = wait_file(&log, |t| t.contains("agent_end")).await;
+    assert_eq!(seen.lines().collect::<Vec<_>>(), ["turn_end", "agent_end"]);
+    host.root.shutdown().await.unwrap();
+}
+
+/// Unloading waits (bounded) for queued observer events: a tracer's
+/// `agent_end` comes before its `session_shutdown`, as in pi.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_observer_events_come_before_session_shutdown() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("order.jsonl");
+    let source = r#"
+import { appendFileSync } from 'node:fs'
+export default function (pi) {
+  pi.on('turn_end', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    appendFileSync(LOG, 'turn_end\n')
+  })
+  pi.on('agent_end', () => appendFileSync(LOG, 'agent_end\n'))
+  pi.on('session_shutdown', () => appendFileSync(LOG, 'shutdown\n'))
+}
+"#
+    .replace("LOG", &format!("{:?}", log.display().to_string()));
+    let ext = extension(dir.path(), "order.ts", &source);
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let (agent, _) = agent(vec![text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    run(&mut agent, "go").await;
+    // Unload at once, with `turn_end` still running and `agent_end` behind it.
+    host.root.shutdown().await.unwrap();
+    let seen = wait_file(&log, |t| t.contains("shutdown")).await;
+    assert_eq!(
+        seen.lines().collect::<Vec<_>>(),
+        ["turn_end", "agent_end", "shutdown"]
+    );
+}
+
+/// `execFor` grants `pi.exec` per extension file, over the row-wide `exec`:
+/// one extension may run `echo`, its neighbour may not. A key is resolved like
+/// `extensions` (relative to `cwd`); a key naming no loaded extension refuses
+/// the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_grants_per_extension() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = |tool: &str| {
+        format!(
+            "export default function (pi) {{ pi.registerTool({{ name: '{tool}', label: '{tool}', description: 'x', \
+             parameters: {{ type: 'object', properties: {{}} }}, \
+             async execute() {{ const r = await pi.exec('echo', ['hi']); return {{ content: [{{ type: 'text', text: `code=${{r.code}}` }}], details: {{}} }} }} }}) }}"
+        )
+    };
+    let granted = extension(dir.path(), "granted.ts", &source("granted_exec"));
+    let other = extension(dir.path(), "other.ts", &source("other_exec"));
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": [granted, other],
+        "execFor": { granted.to_str().unwrap(): ["echo"] },
+    })))
+    .await;
+    let (agent, _) = agent(vec![
+        calls(&[("granted_exec", json!({})), ("other_exec", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    assert_eq!(results[1].1, "code=126", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    // A per-extension `false` over a row-wide `true`.
+    let host = crate::host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": [granted, other],
+        "exec": true,
+        "execFor": { other.to_str().unwrap(): false },
+    })))
+    .await;
+    let (agent, _) = crate::agent(vec![
+        calls(&[("granted_exec", json!({})), ("other_exec", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    assert_eq!(results[1].1, "code=126", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    // The same grant spelled relative to `cwd`.
+    let host = crate::host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": ["./granted.ts"],
+        "cwd": dir.path(),
+        "execFor": { "./granted.ts": ["echo"] },
+    })))
+    .await;
+    let (agent, _) = crate::agent(vec![call("granted_exec", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    let host = crate::host(&runtime).await;
+    let failures = host
+        .try_load(adapter_row(json!({
+            "extensions": [granted],
+            "execFor": { dir.path().join("typo.ts").to_str().unwrap(): true },
+        })))
+        .await;
+    assert!(failures.contains("not loaded"), "{failures}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// `ctx.model` and `ctx.modelRegistry`: the host's `model` and `models`, read
+/// only (credentials and model calls refused, `refresh` a no-op, chat the only
+/// type, nothing to serialize or overwrite); without them, the run's model id
+/// under provider `yoagent`. A malformed model refuses the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn extensions_see_the_host_s_models_read_only() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ext = extension(
+        dir.path(),
+        "models.ts",
+        r#"
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_models', label: 'pi_models', description: 'x', parameters: { type: 'object', properties: {} },
+    async execute(_id, _params, _signal, _update, ctx) {
+      let refused = ''
+      try { await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model) } catch (e) { refused = String(e.message) }
+      const registry = ctx.modelRegistry
+      let overwritten = true
+      try { registry.getAll = () => []; overwritten = registry.getAll().length === 0 } catch { overwritten = false }
+      const out = {
+        model: ctx.model && `${ctx.model.provider}/${ctx.model.id}`,
+        window: ctx.model?.contextWindow,
+        all: ctx.modelRegistry.getAll().map((m) => `${m.provider}/${m.id}`),
+        found: !!ctx.modelRegistry.find('deepseek', 'deepseek-flash'),
+        refused,
+        refreshed: (await registry.refresh()).aborted,
+        chat: registry.getModelsOfType('chat').length,
+        images: registry.getModelsOfType('image').length,
+        foundOfType: !!registry.findOfType('chat', 'deepseek', 'deepseek-flash'),
+        json: JSON.stringify(registry),
+        overwritten,
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(out) }], details: {} }
+    },
+  })
+}
+"#,
+    );
+    let check = |config: Value| {
+        let ext = ext.clone();
+        let runtime = runtime.clone();
+        async move {
+            let host = host(&runtime).await;
+            let mut row = json!({ "extensions": [ext] });
+            row.as_object_mut()
+                .unwrap()
+                .extend(config.as_object().unwrap().clone());
+            host.load(adapter_row(row)).await;
+            let (agent, _) = agent(vec![call("pi_models", json!({})), text("done")]);
+            let mut agent = agent.with_extension(host.bridge.extension());
+            let (_, results) = run(&mut agent, "go").await;
+            host.root.shutdown().await.unwrap();
+            serde_json::from_str::<Value>(&results[0].1).unwrap_or_else(|_| panic!("{results:?}"))
+        }
+    };
+    let seen = check(json!({
+        "model": { "provider": "deepseek", "id": "deepseek-flash", "contextWindow": 1000000 },
+        "models": [
+            { "provider": "deepseek", "id": "deepseek-flash" },
+            { "provider": "anthropic", "id": "claude-sonnet-5-5" },
+        ],
+    }))
+    .await;
+    assert_eq!(seen["model"], "deepseek/deepseek-flash", "{seen}");
+    assert_eq!(seen["window"], 1_000_000, "{seen}");
+    assert_eq!(
+        seen["all"],
+        json!(["deepseek/deepseek-flash", "anthropic/claude-sonnet-5-5"]),
+        "{seen}"
+    );
+    assert_eq!(seen["found"], true, "{seen}");
+    assert!(
+        seen["refused"]
+            .as_str()
+            .unwrap()
+            .contains("not available in yoagent"),
+        "{seen}"
+    );
+    assert_eq!(seen["refreshed"], false, "{seen}");
+    assert_eq!(seen["chat"], 2, "{seen}");
+    assert_eq!(seen["images"], 0, "{seen}");
+    assert_eq!(seen["foundOfType"], true, "{seen}");
+    assert_eq!(seen["json"], "{}", "{seen}");
+    assert_eq!(seen["overwritten"], false, "{seen}");
+    // `model` alone: the registry lists it.
+    let seen = check(json!({ "model": { "provider": "deepseek", "id": "deepseek-flash" } })).await;
+    assert_eq!(seen["all"], json!(["deepseek/deepseek-flash"]), "{seen}");
+    // No model configured: the run's model id, and an empty registry.
+    let seen = check(json!({})).await;
+    assert_eq!(
+        seen["model"],
+        format!("yoagent/{}", yoagent::provider::ModelConfig::mock().id),
+        "{seen}"
+    );
+    assert_eq!(seen["all"], json!([]), "{seen}");
+
+    let host = host(&runtime).await;
+    let failures = host
+        .try_load(adapter_row(json!({
+            "extensions": [ext],
+            "model": { "provider": "deepseek" },
+        })))
+        .await;
+    assert!(failures.contains("model must be"), "{failures}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// Without a host `model`, `ctx.model` is each run's own: a parent's tool
+/// called after a sub-agent (on another model) ran sees the parent's model,
+/// and each run's `agent_end` observer — which comes after the run's `finish`
+/// — sees its own run's.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctx_model_is_per_run() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("ends.log");
+    let ext = extension(
+        dir.path(),
+        "model.ts",
+        &format!(
+            r#"
+import {{ appendFileSync }} from 'node:fs'
+export default function (pi) {{
+  pi.registerTool({{
+    name: 'pi_model', label: 'pi_model', description: 'x', parameters: {{ type: 'object', properties: {{}} }},
+    async execute(_id, _params, _signal, _update, ctx) {{
+      return {{ content: [{{ type: 'text', text: String(ctx.model?.id) }}], details: {{}} }}
+    }},
+  }})
+  pi.on('agent_end', (_event, ctx) => appendFileSync({log:?}, `${{ctx.model?.id}}\n`))
+}}
+"#
+        ),
+    );
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let (child, _) = recording(vec![text("child done")]);
+    let mut child_model = yoagent::provider::ModelConfig::mock();
+    child_model.id = "child-model".into();
+    let sub = yoagent::SubAgentTool::from_provider("helper", child, child_model);
+    let (parent, _) = agent(vec![
+        calls(&[("helper", json!({ "task": "x" })), ("pi_model", json!({}))]),
+        text("done"),
+    ]);
+    let mut parent = parent
+        .with_sub_agent(sub)
+        .with_tool_execution(yoagent::ToolExecutionStrategy::Sequential)
+        .with_tree_extension(host.bridge.extension());
+    let (_, results) = run(&mut parent, "go").await;
+    let parent_model = yoagent::provider::ModelConfig::mock().id;
+    let own = results.iter().find(|(name, _, _)| name == "pi_model");
+    assert_eq!(
+        own.map(|(_, out, _)| out.as_str()),
+        Some(parent_model.as_str()),
+        "{results:?}"
+    );
+    let ends = wait_file(&log, |t| t.lines().count() >= 2).await;
+    assert_eq!(
+        ends.lines().collect::<Vec<_>>(),
+        ["child-model", parent_model.as_str()]
+    );
     host.root.shutdown().await.unwrap();
 }

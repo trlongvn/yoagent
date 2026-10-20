@@ -1257,3 +1257,240 @@ async fn a_finished_command_leaves_its_detached_background_job_alone() {
         .status()
         .unwrap();
 }
+
+/// #342: a background job that keeps the output pipes open must not hold
+/// the call until the timeout: once `bash` exits, the output is read for a
+/// short grace, the job is left running and the result says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_job_holding_the_pipes_does_not_hold_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let started = std::time::Instant::now();
+    let result = BashTool::new()
+        .with_timeout(std::time::Duration::from_secs(20))
+        .execute(
+            serde_json::json!({
+                "command": format!("sleep 30 & echo $! > {}; echo hi; echo oops >&2", pid_file.display())
+            }),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the call waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(result.details["exit_code"], 0);
+    let text = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(text.contains("hi") && text.contains("oops"), "{text}");
+    assert!(text.contains("still holds the command's output"), "{text}");
+    assert_eq!(result.details["output_still_open"], true);
+    let pid = background_pid(&pid_file).await;
+    assert!(alive(&pid), "the job is left running");
+    std::process::Command::new("kill")
+        .arg(&pid)
+        .status()
+        .unwrap();
+}
+
+/// #342: what a job prints after `bash` exits but within the grace is
+/// captured, and a job that closes the pipes in time gets no note.
+#[cfg(unix)]
+#[tokio::test]
+async fn output_printed_within_the_read_grace_is_captured() {
+    let result = BashTool::new()
+        .with_timeout(std::time::Duration::from_secs(20))
+        .execute(
+            serde_json::json!({ "command": "(sleep 0.3; echo late) & echo early" }),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    let text = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(text.contains("early") && text.contains("late"), "{text}");
+    assert!(!text.contains("NOTE:"), "{text}");
+    assert_eq!(result.details["output_still_open"], false);
+}
+
+/// #342: a job left running keeps working when it prints after the call:
+/// the pipes are drained, never closed under it (that would SIGPIPE it).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_job_that_keeps_printing_survives_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    // Written after the job has put more than a pipe buffer (64 KiB) on each
+    // stream: only a pipe that is read lets it get there.
+    let done = dir.path().join("done");
+    BashTool::new()
+        .with_timeout(std::time::Duration::from_secs(20))
+        .execute(
+            serde_json::json!({
+                "command": format!(
+                    "(sleep 1.5; head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; touch {}; \
+                     while :; do echo tick; sleep 0.05; done) & echo $! > {}; echo hi",
+                    done.display(),
+                    pid_file.display()
+                )
+            }),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    let pid = background_pid(&pid_file).await;
+    let mut waited = 0;
+    while !done.exists() {
+        assert!(waited < 200, "the job never got its output out");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    // Still printing, past the grace.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(alive(&pid), "the job died after the call returned");
+    std::process::Command::new("kill")
+        .arg(&pid)
+        .status()
+        .unwrap();
+}
+
+/// #342: a timeout that fires during that grace does not turn a finished
+/// command into a timed-out one, nor kill the job it left running.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_timeout_during_the_read_grace_keeps_a_finished_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let result = BashTool::new()
+        // Inside the 1 s grace, with room for `bash` to start on a busy runner.
+        .with_timeout(std::time::Duration::from_millis(900))
+        .execute(
+            serde_json::json!({
+                "command": format!("sleep 30 & echo $! > {}; echo hi", pid_file.display())
+            }),
+            ctx("bash"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.details["exit_code"], 0);
+    assert_eq!(result.details["output_still_open"], true);
+    let text = match &result.content[0] {
+        Content::Text { text } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(text.contains("hi") && text.contains("NOTE:"), "{text}");
+    let pid = background_pid(&pid_file).await;
+    assert!(alive(&pid), "the job is left running");
+    std::process::Command::new("kill")
+        .arg(&pid)
+        .status()
+        .unwrap();
+}
+
+/// #341: a FIFO, a device or a directory is refused before any read, write
+/// or edit — a FIFO reports a length of 0, so the size check passed and the
+/// read blocked for ever; `/dev/zero` read without end. The bounds report a
+/// regression, but cannot end it: the blocked `tokio::fs` thread keeps the
+/// runtime from shutting down, so a regression still hangs this test.
+#[cfg(unix)]
+#[tokio::test]
+async fn file_tools_refuse_what_is_not_a_regular_file() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe.txt");
+    let fifo_png = dir.path().join("pipe.png");
+    for path in [&fifo, &fifo_png] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo");
+    }
+    let bounded = |fut| tokio::time::timeout(Duration::from_secs(5), fut);
+    let refused = |result: Result<ToolResult, ToolError>, kind: &str| match result {
+        Err(ToolError::Failed(message)) => assert!(message.contains(kind), "{message}"),
+        other => panic!("expected a refusal naming {kind}, got {other:?}"),
+    };
+
+    let read = ReadFileTool::new();
+    for (path, kind) in [
+        (fifo.to_str().unwrap(), "FIFO"),
+        (fifo_png.to_str().unwrap(), "FIFO"),
+        ("/dev/zero", "character device"),
+        (dir.path().to_str().unwrap(), "directory"),
+    ] {
+        let result = bounded(read.execute(serde_json::json!({ "path": path }), ctx("read_file")))
+            .await
+            .unwrap_or_else(|_| panic!("read_file on {path} hung"));
+        refused(result, kind);
+    }
+
+    let edit = EditFileTool::new();
+    let result = bounded(edit.execute(
+        serde_json::json!({ "path": fifo, "old_text": "a", "new_text": "b" }),
+        ctx("edit_file"),
+    ))
+    .await
+    .expect("edit_file on a FIFO hung");
+    refused(result, "FIFO");
+
+    let write = WriteFileTool::new();
+    let result = bounded(write.execute(
+        serde_json::json!({ "path": fifo, "content": "x" }),
+        ctx("write_file"),
+    ))
+    .await
+    .expect("write_file on a FIFO hung");
+    refused(result, "FIFO");
+
+    for path in [dir.path().to_str().unwrap(), "/dev/null"] {
+        let kind = if path == "/dev/null" {
+            "character device"
+        } else {
+            "directory"
+        };
+        let result = bounded(write.execute(
+            serde_json::json!({ "path": path, "content": "x" }),
+            ctx("write_file"),
+        ))
+        .await
+        .expect("write_file hung");
+        refused(result, kind);
+        let result = bounded(edit.execute(
+            serde_json::json!({ "path": path, "old_text": "a", "new_text": "b" }),
+            ctx("edit_file"),
+        ))
+        .await
+        .expect("edit_file hung");
+        refused(result, kind);
+    }
+
+    // A symlink to a regular file still reads and writes.
+    let real = dir.path().join("real.txt");
+    std::fs::write(&real, "hello\n").unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let result = read
+        .execute(serde_json::json!({ "path": link }), ctx("read_file"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&result.content[0], Content::Text { text } if text.contains("hello")),
+        "{result:?}"
+    );
+    write
+        .execute(
+            serde_json::json!({ "path": link, "content": "bye\n" }),
+            ctx("write_file"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "bye\n");
+}

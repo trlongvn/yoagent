@@ -30,7 +30,8 @@
 //                           with `parentToolCallId`, results through
 //                           `tool_result`; never rejects); yoagent's own tools
 //                           are not reachable from it. `ctx.tools` lists the
-//                           callable ones.
+//                           callable ones. Config `nestedCalls` narrows both
+//                           (`own-extension`, `off`).
 //                           A tool that overrides one of pi's built-ins
 //                           (`read`, `edit`, ...) makes the adapter deny
 //                           yoagent's counterpart (`read_file`, ...), so the
@@ -109,12 +110,28 @@
 //                           rewrite fails the run only for a required bridge,
 //                           and refuses every later run.
 //
+// Observers (OBSERVED_EVENTS: `agent_start` / `agent_end`, `turn_start` /
+// `turn_end`, `message_start` / `message_update`, `tool_execution_*`) fire
+// from yoagent's event stream when a handler for them exists at load (the
+// bridge's `on_event`, subscribed to the yoagent types they need): after the
+// fact and in order, on copies, on the adapter's own chain (`on_event` returns
+// at once, so a slow observer never meets the bridge's per-event timeout; a
+// handler gets OBSERVER_HANDLER_BUDGET_MS before the chain moves on; past
+// MAX_OBSERVER_BACKLOG waiting, streaming events are dropped, lifecycle ones
+// past twice that, counted and reported per burst; unloading waits up to
+// OBSERVER_DRAIN_MS for the queue before `session_shutdown`), a result ignored
+// (`turn_end`'s `continue` / `entries` reported once), a throw reported once per run; tool calls under pi's names and argument shapes, in the tool
+// events and inside messages; `turn_end` only for a turn that ended with an
+// assistant message (the index advances at every turn's end), with generated
+// entry ids and an empty context preview. `message_end` (the checked path) is
+// not ordered with these. One registered later fires if its types are subscribed.
+//
 // What does not map: no other event is ever fired. Events that would decide
 // or rewrite something yoagent does (DECIDING_EVENTS: `context_with_system`,
 // `before_provider_request`, ...; `context` and `message_end` too when
-// registered after load) refuse the load unless listed in `allowUnmapped`; the rest (observers such as `agent_end` or
-// `tool_execution_*`, pi's session events, the boundary events `turn_end` /
-// `agent_before_settle`), commands, shortcuts, flags, renderers, model
+// registered after load) refuse the load unless listed in `allowUnmapped`; the rest (an
+// observer registered after load whose types are not subscribed, pi's session
+// events, `agent_before_settle`, `agent_settled`), commands, shortcuts, flags, renderers, model
 // providers, virtual models and MCP servers are reported (at info: expected,
 // not a fault; a load failure with `strict`). One registered after load (in a handler or a
 // tool) is reported at the next model request or tool call, and a deciding
@@ -123,7 +140,15 @@
 // `pi.sendMessage` are recorded in the adapter's in-memory session (readable
 // through `ctx.sessionManager`; a displayed message is also logged; a message
 // never starts a turn); other runtime actions (`pi.sendUserMessage`,
-// `pi.setModel`, ...) throw "not available in yoagent". `ctx.hasUI` is false and `ctx.ui` behaves as in
+// `pi.setModel`, ...) throw "not available in yoagent". `pi.exec` runs only
+// what the host's `exec` setting allows (default nothing; a refusal is a
+// failed command, code 126, empty stdout): each factory gets a `pi` whose
+// `exec` is gated, so extensions are imported through pi's loader by a
+// generated wrapper and run with its `loadExtensionFromFactory` (`loadGated`;
+// every load, whatever `exec` is). Fixed answers — `ctx.isProjectTrusted()`
+// (the host's `projectTrusted`, default false), `ctx.model`,
+// `ctx.modelRegistry`, `ctx.getContextUsage()`, print-mode dialogs — are
+// logged once per question and answer as `[pi] fixed answer: …`. `ctx.hasUI` is false and `ctx.ui` behaves as in
 // pi's print mode: `confirm` answers false, `select` and `input` nothing, so
 // a policy that would ask the user denies instead. When the host provides a
 // `ui` service (yoagent-frontend, experimental) and loads `host-ui.ts` next
@@ -134,7 +159,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import { definePlugin } from '@arcships/rutis'
-import type { Cancellable, ContentBlock, Message, Stop, ToolCall, ToolOutput, ToolResult, ToolSpec, Yoagent } from '../yoagent.d.ts'
+import type { Cancellable, ContentBlock, Message, RunInfo, Stop, ToolCall, ToolOutput, ToolResult, ToolSpec, Yoagent } from '../yoagent.d.ts'
 
 export interface Config {
   /** The handler's name in the bridge (unique across the host's plugins). */
@@ -151,6 +176,134 @@ export interface Config {
   allowUnmapped?: string[]
   /** Fail loading when an extension registers anything else that does not map. */
   strict?: boolean
+  /**
+   * Which tools a pi tool may call through `ctx.executeTool`. Nested calls are judged by pi's
+   * `tool_call` handlers only, never by the host's per-call policies, so a host that trusts tools
+   * per extension narrows them: `"any"` (default, as pi), `"own-extension"` (only tools whose winning
+   * registration is the calling tool's own extension's), `"off"`. A refused call is an error result to the caller.
+   */
+  nestedCalls?: 'any' | 'own-extension' | 'off'
+  /**
+   * What `pi.exec(command, args)` may run: `false` or `[]` (default: nothing), `true` (anything,
+   * as pi), or the commands allowed, each matched against `command` exactly: `"git"` allows `git`
+   * (found on `PATH`), not `/usr/bin/git` or `./git`. Only the command is checked; its arguments
+   * and `options.cwd` are the extension's, so allowing a command that can run others (`git`, `sh`,
+   * `node`, `npx`) allows those too. A refused call resolves as a failed command (code 126, empty
+   * `stdout`, the reason in `stderr`) and is reported at warn, once per extension and command.
+   * This gates pi's API only: an extension is code the host runs and may start processes itself.
+   */
+  exec?: boolean | string[]
+  /**
+   * Grants for single extensions, over `exec`: an extension file (as in `extensions`, resolved
+   * against `cwd`) → its own `true` / `false` / command list. A key naming no loaded extension
+   * refuses the load (a typo would otherwise grant nothing, silently).
+   */
+  execFor?: Record<string, boolean | string[]>
+  /** What `ctx.isProjectTrusted()` answers (default `false`; pi's own default is `true`). */
+  projectTrusted?: boolean
+  /**
+   * What `ctx.model` is: the model the agent runs. Default: the run's model id (from yoagent's
+   * request), under provider `yoagent`; before the first request, `undefined`.
+   */
+  model?: ModelSpec
+  /**
+   * What `ctx.modelRegistry` lists (`getAll`, `getAvailable`, `find`; default: `model`, if
+   * set). Read-only: its other methods — credentials, model calls, provider registration —
+   * throw "not available in yoagent".
+   */
+  models?: ModelSpec[]
+}
+
+/** A model as the host describes it to pi extensions. */
+export interface ModelSpec {
+  provider: string
+  id: string
+  name?: string
+  contextWindow?: number
+  maxTokens?: number
+  reasoning?: boolean
+  /** Input kinds (default `["text"]`). */
+  input?: ('text' | 'image')[]
+}
+
+/** A host's model in pi's `Model` shape (frozen; `api` is `yoagent`, no costs or credentials). */
+function piModel(spec: ModelSpec) {
+  return Object.freeze({
+    id: spec.id,
+    name: spec.name ?? spec.id,
+    api: 'yoagent',
+    provider: spec.provider,
+    baseUrl: '',
+    input: Object.freeze([...(spec.input ?? ['text'])]),
+    cost: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+    reasoning: spec.reasoning ?? false,
+    contextWindow: spec.contextWindow ?? 128_000,
+    maxTokens: spec.maxTokens ?? 4_096,
+  })
+}
+
+/** Whether `value` is a usable `ModelSpec`. */
+const isModelSpec = (value: unknown): value is ModelSpec => {
+  const m = value as ModelSpec
+  return (
+    !!m &&
+    typeof m === 'object' &&
+    typeof m.provider === 'string' &&
+    !!m.provider &&
+    typeof m.id === 'string' &&
+    !!m.id &&
+    (m.name === undefined || typeof m.name === 'string') &&
+    (m.contextWindow === undefined || (Number.isInteger(m.contextWindow) && m.contextWindow > 0)) &&
+    (m.maxTokens === undefined || (Number.isInteger(m.maxTokens) && m.maxTokens > 0)) &&
+    (m.reasoning === undefined || typeof m.reasoning === 'boolean') &&
+    (m.input === undefined || (Array.isArray(m.input) && m.input.every((i) => i === 'text' || i === 'image')))
+  )
+}
+
+/**
+ * A read-only `ModelRegistry` over the host's models: the lookups pi extensions use to see
+ * models (all of them chat models; `refresh` does nothing); everything else (credentials, model
+ * calls, registering providers) throws, reported once. It cannot be written to.
+ */
+function readOnlyRegistry(models: ReturnType<typeof piModel>[]) {
+  const find = (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id)
+  const ofType = (type: string, provider?: string) =>
+    type === 'chat' ? models.filter((m) => provider === undefined || m.provider === provider) : []
+  const reads: Record<string, (...args: never[]) => unknown> = {
+    getAll: () => [...models],
+    getAvailable: () => [...models],
+    find,
+    findOfType: (type: string, provider: string, id: string) => (type === 'chat' ? find(provider, id) : undefined),
+    getModelOfType: (type: string, provider: string, id: string) => (type === 'chat' ? find(provider, id) : undefined),
+    getModelsOfType: ofType,
+    getAvailableOfType: async (type: string, provider?: string) => ofType(type, provider),
+    refresh: async () => ({ aborted: false, errors: new Map() }),
+    getError: () => undefined,
+    getProviderDisplayName: (provider: string) => provider,
+    hasConfiguredAuth: () => false,
+    isUsingOAuth: () => false,
+    getRegisteredProviderIds: () => [...new Set(models.map((m) => m.provider))],
+  }
+  const refused = new Set<string>()
+  return new Proxy(reads, {
+    set: () => false,
+    defineProperty: () => false,
+    setPrototypeOf: () => false,
+    deleteProperty: () => false,
+    get: (target, key) => {
+      // Not a promise, and `JSON.stringify` sees an object with no own data.
+      if (typeof key !== 'string' || key === 'then' || key === 'toJSON') return undefined
+      if (key in target) return target[key]
+      return () => {
+        const why = `ctx.modelRegistry.${key}() is not available in yoagent (no credentials, model calls or providers are handed to extensions)`
+        if (!refused.has(key)) {
+          refused.add(key)
+          report('info', `[pi] ${why}`)
+        }
+        throw new Error(why)
+      }
+    },
+  })
 }
 
 /**
@@ -240,6 +393,47 @@ const DECIDING_EVENTS = new Set([
 /** Events whose handlers run on copies, stopping the adapter if one would change what it got. */
 const CHECKED_EVENTS = new Set(['context', 'message_end'])
 
+/**
+ * pi's observer events, fired from yoagent's event stream (`on_event`):
+ * after the fact, so a handler's result changes nothing. Each needs the
+ * yoagent event types listed. `message_end` is not here: its handlers run
+ * on the checked path (CHECKED_EVENTS), once per message.
+ */
+const OBSERVED_EVENTS = new Map<string, string[]>([
+  ['agent_start', ['agentStart']],
+  ['agent_end', ['agentEnd']],
+  // Both need both: the turn index advances at every turn's end, as in pi.
+  ['turn_start', ['turnStart', 'turnEnd']],
+  ['turn_end', ['turnStart', 'turnEnd']],
+  ['message_start', ['messageStart']],
+  ['message_update', ['messageUpdate']],
+  ['tool_execution_start', ['toolExecutionStart']],
+  ['tool_execution_update', ['toolExecutionStart', 'toolExecutionUpdate']],
+  ['tool_execution_end', ['toolExecutionEnd']],
+])
+
+/**
+ * Most observer events waiting for slow handlers: past it, streaming events
+ * (`message_update`, `tool_execution_update`) are dropped; lifecycle events
+ * (starts and ends) only past twice as many, so a tracer's spans close.
+ */
+const MAX_OBSERVER_BACKLOG = 1000
+
+/** Events whose loss leaves only a gap in a stream, not an open span. */
+const STREAMING_EVENTS = new Set(['message_update', 'tool_execution_update'])
+
+/**
+ * How long one observer handler may take before the queue moves on without
+ * it (it is reported once per run; the handler itself is not stopped).
+ */
+const OBSERVER_HANDLER_BUDGET_MS = 30_000
+
+/** How long unloading waits for queued observer events before `session_shutdown`. */
+const OBSERVER_DRAIN_MS = 5_000
+
+/** pi's names for yoagent's stream deltas (`message_update`'s `assistantMessageEvent.type`). */
+const DELTA_TYPES: Record<string, string> = { text: 'text_delta', thinking: 'thinking_delta', toolCallDelta: 'toolcall_delta' }
+
 /** pi's message shape from yoagent's (they match; pi's assistant messages also name their API). */
 const piMessage = (message: Message) =>
   structuredClone(message.role === 'assistant' && message.api === undefined ? { ...message, api: 'yoagent' } : message)
@@ -267,14 +461,30 @@ let report = (level: 'error' | 'warn' | 'info' | 'debug', message: string) => {
   console.warn(message)
 }
 
+/**
+ * A question pi's API asks that this adapter answers with a fixed value: said
+ * once per question and answer (per runtime, shared by every adapter in it), at info, under one tag hosts can search for, so a plugin
+ * that does nothing can be traced to the answer it got.
+ */
+const answered = new Set<string>()
+function fixedAnswer<T>(question: string, answer: T, shown: string = JSON.stringify(answer) ?? 'undefined'): T {
+  // Keyed by the answer too: two adapters in one runtime may answer differently.
+  const key = `${question}\0${shown}`
+  if (!answered.has(key)) {
+    answered.add(key)
+    report('info', `[pi] fixed answer: ${question} → ${shown}`)
+  }
+  return answer
+}
+
 /** pi's print-mode UI (its `noOpUIContext`): nothing to show, no one to ask. */
 const NO_UI = new Proxy(
   {
-    select: async () => undefined,
-    confirm: async () => false,
-    input: async () => undefined,
-    editor: async () => undefined,
-    custom: async () => undefined,
+    select: async () => fixedAnswer('ctx.ui.select() (no user to ask)', undefined),
+    confirm: async () => fixedAnswer('ctx.ui.confirm() (no user to ask)', false),
+    input: async () => fixedAnswer('ctx.ui.input() (no user to ask)', undefined),
+    editor: async () => fixedAnswer('ctx.ui.editor() (no user to ask)', undefined),
+    custom: async () => fixedAnswer('ctx.ui.custom() (no user to ask)', undefined),
     notify: (message: string, level?: string) =>
       report(level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'info', `[pi ${level ?? 'info'}] ${message}`),
     onTerminalInput: () => () => {},
@@ -399,20 +609,183 @@ interface PiRuntime {
   [action: string]: unknown
 }
 
+interface PiApi {
+  exec(command: string, args: string[], options?: unknown): Promise<ExecResult>
+  [member: string]: unknown
+}
+type ExecResult = { stdout: string; stderr: string; code: number; killed: boolean }
+type Factory = (pi: PiApi) => unknown
+type Loaded = {
+  extensions: PiExtension[]
+  errors: { path: string; error: string }[]
+  warnings?: { path: string; warning: string }[]
+  runtime: PiRuntime
+}
+
 /**
  * pi's loader, by file: the package exports only `discoverAndLoadExtensions`,
  * which also loads `<cwd>/.pi/extensions` and `~/.pi/agent/extensions`.
  */
-async function piLoader(): Promise<{
-  loadExtensions(paths: string[], cwd: string): Promise<{
-    extensions: PiExtension[]
-    errors: { path: string; error: string }[]
-    warnings?: { path: string; warning: string }[]
-    runtime: PiRuntime
-  }>
-}> {
+async function piModule<T>(path: string): Promise<T> {
   const index = import.meta.resolve('@earendil-works/pi-coding-agent')
-  return import(new URL('./core/extensions/loader.js', index).href)
+  return import(new URL(path, index).href)
+}
+
+/** The event a wrapper below hands its extension's factory over on (the load's own pi event bus). */
+const FACTORY_EVENT = 'yoagent-rutis.pi.factory'
+
+/**
+ * Load extensions as pi's `loadExtensions` does, except that each factory is
+ * given `gate(pi)` instead of pi's API object: `pi.exec` lives on that object,
+ * created inside pi's loader with no hook, so gating it means calling the
+ * factory ourselves. pi's loader still imports every module (its resolution
+ * and aliases): it loads one generated wrapper per extension, which only hands
+ * the extension's factory over; pi's exported `loadExtensionFromFactory` then
+ * runs it, under the extension's own resolved path.
+ */
+async function loadGated(paths: string[], cwd: string, gate: (pi: PiApi, path: string) => PiApi): Promise<Loaded> {
+  const loader = await piModule<{
+    loadExtensions(paths: string[], cwd: string, eventBus: unknown, runtime: unknown): Promise<Loaded>
+    loadExtensionFromFactory(factory: Factory, cwd: string, eventBus: unknown, runtime: unknown, path: string): Promise<PiExtension>
+    createExtensionRuntime(): PiRuntime
+  }>('./core/extensions/loader.js')
+  const { createEventBus } = await piModule<{
+    createEventBus(): { on(channel: string, handler: (data: unknown) => void): () => void }
+  }>('./core/event-bus.js')
+  const { resolvePath } = await piModule<{ resolvePath(input: string, base: string, options?: unknown): string }>(
+    './utils/paths.js',
+  )
+  const eventBus = createEventBus()
+  const runtime = loader.createExtensionRuntime()
+  const extensions: PiExtension[] = []
+  const errors: { path: string; error: string }[] = []
+  // First every module, through pi's loader (file I/O); then every factory,
+  // back to back, as pi runs them: nothing but the factories happens between
+  // the last of them and the adapter's load-time checks.
+  const imported: { path: string; resolved: string; factory: Factory }[] = []
+  const dir = await wrapperDir()
+  const wrappers: { wrapper: string; path: string; resolved: string }[] = []
+  for (const path of paths) {
+    const resolved = resolvePath(path, cwd, { normalizeUnicodeSpaces: true })
+    wrappers.push({ wrapper: await writeWrapper(dir, resolved), path, resolved })
+  }
+  // Each wrapper hands its factory over on this load's own event bus, which
+  // calls the handler synchronously: no state shared with other loads, so two
+  // adapters loading one file at once each get their own module's factory.
+  // pi's loader runs the wrappers in order, one each (a file listed twice runs
+  // twice, as in pi).
+  const handed: { path: string; factory: unknown }[] = []
+  const unsubscribe = eventBus.on(FACTORY_EVENT, (data) => {
+    handed.push(data as { path: string; factory: unknown })
+  })
+  let first: Loaded
+  try {
+    first = await loader.loadExtensions(
+      wrappers.map((w) => w.wrapper),
+      cwd,
+      eventBus,
+      runtime,
+    )
+  } finally {
+    unsubscribe()
+  }
+  // pi reports failures in the order of the paths it was given.
+  const failures = [...first.errors]
+  for (const { wrapper, path, resolved } of wrappers) {
+    if (failures[0]?.path === wrapper) {
+      errors.push({ path, error: failures.shift()!.error.replaceAll(wrapper, resolved) })
+      continue
+    }
+    const next = handed.findIndex((h) => h.path === resolved)
+    const factory = next === -1 ? undefined : handed.splice(next, 1)[0].factory
+    if (typeof factory !== 'function') {
+      errors.push({ path, error: `Extension does not export a valid factory function: ${path}` })
+    } else imported.push({ path, resolved, factory: factory as Factory })
+  }
+  for (const { path, resolved, factory } of imported) {
+    try {
+      extensions.push(
+        await loader.loadExtensionFromFactory((pi) => factory(gate(pi, resolved)), cwd, eventBus, runtime, resolved),
+      )
+    } catch (error) {
+      errors.push({ path, error: `Failed to load extension: ${message(error)}` })
+    }
+  }
+  const warnings = (first.warnings ?? []).map((w) => {
+    const at = wrappers.find((x) => x.wrapper === w.path)
+    return at ? { path: at.path, warning: w.warning.replaceAll(at.wrapper, at.resolved) } : w
+  })
+  return { extensions, errors, warnings, runtime }
+}
+
+/**
+ * The directory the wrappers live in: one per user under the temp directory,
+ * kept, so each extension's wrapper has a stable name and content and pi's
+ * jiti reuses its transpile cache (a fresh name per load would leave a cache
+ * file behind every time). Refused unless it is a real directory of this
+ * user's that nobody else can write: a wrapper is code this runtime runs.
+ */
+async function wrapperDir(): Promise<string> {
+  const { mkdir, lstat } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const uid = process.getuid?.()
+  const dir = join(tmpdir(), `yoagent-pi-wrappers-${uid ?? 'user'}`)
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    const info = await lstat(dir)
+    // Windows reports no POSIX owner or mode bits (a writable directory reads 0o777), and its
+    // temp directory is per-user already: there, only that it is a real directory is checked.
+    const posix = process.platform !== 'win32'
+    if (!info.isDirectory() || (posix && ((uid !== undefined && info.uid !== uid) || (info.mode & 0o022) !== 0))) {
+      throw new Error('it is not a directory of this user\'s that only this user can write')
+    }
+  } catch (error) {
+    throw new Error(`pi adapter: cannot use ${dir} for the extension wrappers (every extension is loaded through one there): ${message(error)}`)
+  }
+  return dir
+}
+
+/** Writes (atomically) and returns the wrapper that hands `resolved`'s factory over. */
+async function writeWrapper(dir: string, resolved: string): Promise<string> {
+  const { writeFile, rename } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { createHash } = await import('node:crypto')
+  const wrapper = join(dir, `${createHash('sha256').update(resolved).digest('hex').slice(0, 32)}.ts`)
+  const source =
+    `import factory from ${JSON.stringify(resolved)}\n` +
+    `export default (pi) => { pi.events.emit(${JSON.stringify(FACTORY_EVENT)}, { path: ${JSON.stringify(resolved)}, factory }) }\n`
+  const temporary = `${wrapper}.${randomUUID()}`
+  await writeFile(temporary, source, { mode: 0o600 })
+  await rename(temporary, wrapper)
+  return wrapper
+}
+
+/**
+ * `pi.exec` as the host's grant for the extension at `path` allows it (`grantFor`: its own in
+ * `execFor`, else the row-wide `exec`); everything else on pi's API as it is.
+ */
+function gateExec(grantFor: (path: string) => boolean | string[]) {
+  const refusedOnce = new Set<string>()
+  return (pi: PiApi, path: string): PiApi => {
+    const exec = grantFor(path)
+    if (exec === true) return pi
+    const allowed = (command: string) => Array.isArray(exec) && exec.includes(command)
+    const gated = (command: string, args: string[], options?: unknown): Promise<ExecResult> => {
+      if (allowed(command)) return pi.exec(command, args, options)
+      const why = `pi.exec("${command}") is not allowed by the host (the adapter's \`exec\` / \`execFor\` setting)`
+      const key = `${path}\0${command}`
+      if (!refusedOnce.has(key)) {
+        refusedOnce.add(key)
+        report('warn', `[pi] ${path}: refused ${why}`)
+      }
+      return Promise.resolve({ stdout: '', stderr: why, code: 126, killed: false })
+    }
+    // A copy, not a Proxy: a Proxy's target still hands the real `exec` out
+    // through `Object.getOwnPropertyDescriptor`. pi's API methods are
+    // closures that never use `this`, and `events` is shared by reference.
+    return { ...pi, exec: gated }
+  }
 }
 
 const short = (path: string) => path.split('/').pop() ?? path
@@ -469,10 +842,13 @@ function seenAs(value: unknown): unknown {
 /**
  * JSON with object keys sorted and non-integers at 15 significant digits:
  * arguments cross serde_json, which may reorder keys and parse a float's
- * shortest form one unit off.
+ * shortest form one unit off. A big integer (rutis 0.11 sends one beyond
+ * ±(2^53−1) as a `bigint`, which `JSON.stringify` refuses) is written as its
+ * digits plus `n`, so it never equals a string or a number.
  */
 function canon(value: unknown): string {
   return JSON.stringify(value, (_key, v) => {
+    if (typeof v === 'bigint') return `${v}n`
     if (typeof v === 'number' && !Number.isInteger(v)) return Number(v.toPrecision(15))
     return v && typeof v === 'object' && !Array.isArray(v)
       ? Object.fromEntries(Object.entries(v as Args).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
@@ -480,7 +856,14 @@ function canon(value: unknown): string {
   })
 }
 
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
+const message = (error: unknown) => {
+  try {
+    return error instanceof Error ? error.message : String(error)
+  } catch {
+    // An error whose own `toString` throws (or that has none).
+    return Object.prototype.toString.call(error)
+  }
+}
 
 export default definePlugin<Config>({
   inject: ['yoagent'],
@@ -495,6 +878,15 @@ export default definePlugin<Config>({
       withoutBuiltins: { type: 'array', items: { type: 'string' } },
       allowUnmapped: { type: 'array', items: { type: 'string' } },
       strict: { type: 'boolean' },
+      nestedCalls: { type: 'string', enum: ['any', 'own-extension', 'off'] },
+      exec: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+      execFor: {
+        type: 'object',
+        additionalProperties: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+      },
+      projectTrusted: { type: 'boolean' },
+      model: { type: 'object' },
+      models: { type: 'array', items: { type: 'object' } },
     },
   },
   async apply(ctx, config) {
@@ -512,10 +904,50 @@ export default definePlugin<Config>({
     const names = new Map(Object.entries({ ...TOOL_NAMES, ...config.toolNames }))
     const withoutBuiltins = new Set(config.withoutBuiltins ?? [])
     const allowUnmapped = new Set(config.allowUnmapped ?? [])
+    const nestedCalls = config.nestedCalls ?? 'any'
+    if (!['any', 'own-extension', 'off'].includes(nestedCalls)) {
+      throw new Error(`nestedCalls must be "any", "own-extension" or "off", not ${JSON.stringify(nestedCalls)}`)
+    }
 
     const { SessionManager } = await import('@earendil-works/pi-coding-agent')
     const { validateToolArguments } = await import('@earendil-works/pi-ai')
-    const loaded = await (await piLoader()).loadExtensions(config.extensions, cwd)
+    const isGrant = (g: unknown): g is boolean | string[] =>
+      typeof g === 'boolean' || (Array.isArray(g) && g.every((c) => typeof c === 'string'))
+    const exec = config.exec ?? false
+    if (!isGrant(exec)) throw new Error(`exec must be true, false or a list of commands, not ${JSON.stringify(exec)}`)
+    const shown = (g: boolean | string[]) => (g === true ? 'anything' : g === false || g.length === 0 ? 'nothing' : g.join(', '))
+    report('debug', `[pi] pi.exec allowed: ${shown(exec)}`)
+    // Per-extension grants, keyed by the resolved file as `loadGated` resolves `extensions`.
+    const { resolvePath } = await piModule<{ resolvePath(input: string, base: string, options?: unknown): string }>(
+      './utils/paths.js',
+    )
+    const resolveExt = (path: string) => resolvePath(path, cwd, { normalizeUnicodeSpaces: true })
+    const execFor = new Map<string, boolean | string[]>()
+    for (const [path, grant] of Object.entries(config.execFor ?? {})) {
+      if (!isGrant(grant)) {
+        throw new Error(`execFor["${path}"] must be true, false or a list of commands, not ${JSON.stringify(grant)}`)
+      }
+      execFor.set(resolveExt(path), grant)
+      report('debug', `[pi] pi.exec allowed for ${path}: ${shown(grant)}`)
+    }
+    const listed = new Set(config.extensions.map(resolveExt))
+    const unknown = [...execFor.keys()].filter((path) => !listed.has(path))
+    if (unknown.length > 0) {
+      throw new Error(`execFor names extensions that are not loaded: ${unknown.join(', ')}`)
+    }
+    // Models extensions see (`ctx.model`, `ctx.modelRegistry`).
+    for (const [what, spec] of [['model', config.model] as const, ...(config.models ?? []).map((m, i) => [`models[${i}]`, m] as const)]) {
+      if (spec !== undefined && !isModelSpec(spec)) {
+        throw new Error(`${what} must be {provider, id, name?, contextWindow?, maxTokens?, reasoning?, input?}, not ${JSON.stringify(spec)}`)
+      }
+    }
+    const hostModel = config.model ? piModel(config.model) : undefined
+    const registry = readOnlyRegistry(config.models ? config.models.map(piModel) : hostModel ? [hostModel] : [])
+    /** Per run, the id of the model its latest request used (when the host names no `model`). */
+    const runModels = new Map<string, string>()
+    /** The latest request's model of any run: for contexts outside a run (`session_start`, ...). */
+    let latestModel: string | undefined
+    const loaded = await loadGated(config.extensions, cwd, gateExec((path) => execFor.get(path) ?? exec))
     if (loaded.errors.length > 0) {
       throw new Error(`pi extensions failed to load: ${loaded.errors.map((e) => `${e.path}: ${e.error}`).join('; ')}`)
     }
@@ -553,7 +985,9 @@ export default definePlugin<Config>({
         return undefined
       }
     }
-    const context = (signal?: AbortSignal, systemPrompt = '') => {
+    /** The model id `ctx.model` names for a run: its latest request's, else any run's latest. */
+    const modelOf = (runId?: string) => (runId !== undefined ? runModels.get(runId) : undefined) ?? latestModel
+    const context = (signal?: AbortSignal, runId?: string, systemPrompt = '', modelId = modelOf(runId)) => {
       const hostUiService = lookupUi()
       return {
       ui: hostUiService ? hostUi(hostUiService, signal) : NO_UI,
@@ -561,15 +995,21 @@ export default definePlugin<Config>({
       hasUI: hostUiService !== undefined,
       cwd,
       sessionManager,
-      modelRegistry: undefined,
-      model: undefined,
+      get modelRegistry() {
+        return fixedAnswer('ctx.modelRegistry', registry, `a read-only list of ${registry.getAll().length} model(s)`)
+      },
+      get model() {
+        const model = hostModel ?? (modelId ? piModel({ provider: 'yoagent', id: modelId }) : undefined)
+        return fixedAnswer('ctx.model', model, model ? `${model.provider}/${model.id}` : 'undefined')
+      },
       scopedModels: [],
       signal,
       isIdle: () => signal === undefined,
-      // pi's own default is true; this adapter loads only the files it is given, never a project's `.pi`.
-      isProjectTrusted: () => false,
+      // pi's own default is true; this adapter loads only the files it is given, never a project's
+      // `.pi`, and a host opts in (`projectTrusted`) to what extensions do in a trusted project.
+      isProjectTrusted: () => fixedAnswer('ctx.isProjectTrusted()', config.projectTrusted ?? false),
       hasPendingMessages: () => false,
-      getContextUsage: () => undefined,
+      getContextUsage: () => fixedAnswer('ctx.getContextUsage()', undefined),
       getSystemPrompt: () => systemPrompt,
       abort: () => {
         throw new Error('ctx.abort() is not available in yoagent')
@@ -618,6 +1058,7 @@ export default definePlugin<Config>({
       args: unknown,
       signal: AbortSignal,
       depth: number,
+      caller: string | undefined,
     ): Promise<Outcome> => {
       const failed = (text: string, input: unknown = args): Outcome => ({
         toolCall: { id, name, arguments: input },
@@ -628,7 +1069,18 @@ export default definePlugin<Config>({
       checkShadowing(false)
       if (refusal) return failed(refusal)
       if (depth >= 8) return failed('nested tool calls are limited to 8 levels')
-      const tool = callable().get(name)
+      // A tool still running after its run ended (a timer, a detached promise).
+      if (!snapshots.has(runId)) return failed(`run ${runId} has ended; nested tool calls are no longer possible`)
+      // Refused before any lookup or foreign code: the host's scope, reported to the host, since
+      // nested calls never reach its per-call policies.
+      const refused =
+        nestedCalls === 'off' || callableIn(runId).has(name) ? nestedRefusal(runId, caller, name) : undefined
+      if (refused) {
+        report('info', `[pi] nested call ${parentId} -> ${name} refused: ${refused}`)
+        return failed(refused)
+      }
+      // From the run's snapshot, like a top-level call: a name registered since never takes over.
+      const tool = callableIn(runId).get(name)
       if (!tool) return failed(`Tool ${name} not found (yoagent's own tools cannot be called from a pi tool)`)
       let input: Args
       try {
@@ -643,7 +1095,7 @@ export default definePlugin<Config>({
         const event = { type: 'tool_call', toolCallId: id, parentToolCallId: parentId, toolName: name, input }
         let result: { block?: boolean; reason?: string; terminate?: boolean } | undefined
         try {
-          result = (await fn(event, context(signal))) as typeof result
+          result = (await fn(event, context(signal, runId))) as typeof result
         } catch (error) {
           return failed(`pi extension ${short(ext.path)} failed: ${message(error)}`, input)
         }
@@ -656,7 +1108,7 @@ export default definePlugin<Config>({
       const started = performance.now()
       let out: { content?: Block[]; details?: unknown; isError?: boolean }
       try {
-        out = await tool.execute(id, input, signal, undefined, toolContext(signal, runId, id, depth + 1))
+        out = await tool.execute(id, input, signal, undefined, toolContext(signal, runId, id, depth + 1, sourceIn(runId, name)))
       } catch (error) {
         // As pi: a throw is an error result, and it still goes through the tool_result handlers.
         out = { content: [{ type: 'text', text: message(error) }], details: {}, isError: true }
@@ -674,7 +1126,7 @@ export default definePlugin<Config>({
       }
       for (const { ext, fn } of handlers('tool_result')) {
         try {
-          const edit = (await fn(event, context(signal))) as { content?: Block[]; details?: unknown; isError?: boolean } | undefined
+          const edit = (await fn(event, context(signal, runId))) as { content?: Block[]; details?: unknown; isError?: boolean } | undefined
           if (edit?.content !== undefined) event.content = edit.content
           if (edit?.details !== undefined) event.details = edit.details
           if (edit?.isError !== undefined) event.isError = edit.isError
@@ -692,16 +1144,19 @@ export default definePlugin<Config>({
     }
 
     /** A tool's `ctx`: the extension context, plus `tools` and `executeTool` for nested calls. */
-    const toolContext = (signal: AbortSignal, runId: string, callId: string, depth = 0) => {
+    const toolContext = (signal: AbortSignal, runId: string, callId: string, depth: number, caller: string | undefined) => {
       let nested = 0
-      return {
-        ...context(signal),
+      // Added onto the context, not spread: a spread reads every getter, which would log
+      // fixed answers (`ctx.model`, ...) no extension asked for.
+      return Object.defineProperties(context(signal, runId), Object.getOwnPropertyDescriptors({
         get tools() {
-          return [...callable().values()]
+          // The run's frozen copies (a tool cannot swap another's `execute` through them), only
+          // those `nestedCalls` lets this tool call.
+          return [...callableIn(runId)].filter(([name]) => !nestedRefusal(runId, caller, name)).map(([, tool]) => tool)
         },
         executeTool: (name: string, args: unknown, options?: { signal?: AbortSignal }) =>
-          executeNested(runId, callId, `${callId}/${++nested}`, name, args, options?.signal ?? signal, depth),
-      }
+          executeNested(runId, callId, `${callId}/${++nested}`, name, args, options?.signal ?? signal, depth, caller),
+      }))
     }
 
     /** Every handler of `event`, in extension load and registration order. */
@@ -717,6 +1172,19 @@ export default definePlugin<Config>({
         }
       }
       return byName
+    }
+    /**
+     * The extension file that registered each tool `registered()` keeps (first wins, the same
+     * rule): pi's resolved path, not the configured spelling (`./x.ts`, `~/x.ts`).
+     */
+    const registeredBy = () => {
+      const paths = new Map<string, string>()
+      for (const ext of extensions) {
+        for (const { definition } of ext.tools.values()) {
+          if (!paths.has(definition.name)) paths.set(definition.name, ext.resolvedPath ?? ext.path)
+        }
+      }
+      return paths
     }
 
     // pi.setActiveTools: an allowlist over the tools pi knows — yoagent's built-ins under pi's
@@ -825,6 +1293,7 @@ export default definePlugin<Config>({
         for (const event of ext.handlers.keys()) {
           if (MAPPED_EVENTS.has(event)) continue
           if (watching && CHECKED_EVENTS.has(event)) continue
+          if (observed(event)) continue
           if (DECIDING_EVENTS.has(event) && !allowUnmapped.has(event)) deciding.push(own(`event "${event}"`))
           else ignored.push(own(`event "${event}"`))
         }
@@ -919,7 +1388,7 @@ export default definePlugin<Config>({
             const before = canon(copy)
             let result: { message?: unknown } | undefined
             try {
-              result = (await fn({ type: 'message_end', message: copy }, context(signal))) as typeof result
+              result = (await fn({ type: 'message_end', message: copy }, context(signal, runId))) as typeof result
             } catch (error) {
               // Cut short: not judged, so not seen; the next check runs it again.
               if (signal?.aborted) return unfinished('message_end')
@@ -936,7 +1405,7 @@ export default definePlugin<Config>({
         }
       })
     /** `context` on the messages a request sends; the refusal if a handler would change them. */
-    const checkContext = async (messages: Message[] | undefined, signal?: AbortSignal) => {
+    const checkContext = async (runId: string, messages: Message[] | undefined, signal?: AbortSignal) => {
       const listeners = handlers('context')
       if (!messages || listeners.length === 0) return
       for (const { ext, fn } of listeners) {
@@ -944,7 +1413,7 @@ export default definePlugin<Config>({
         const before = canon(copy)
         let result: { messages?: unknown } | undefined
         try {
-          result = (await fn({ type: 'context', messages: copy }, context(signal))) as typeof result
+          result = (await fn({ type: 'context', messages: copy }, context(signal, runId))) as typeof result
         } catch (error) {
           if (signal?.aborted) return unfinished('context')
           report('warn', `[pi] ${short(ext.path)} context: ${message(error)}`)
@@ -964,9 +1433,33 @@ export default definePlugin<Config>({
     const terminated = new Map<string, string>()
     // The arguments the policies approved, per run and call: `call_tool` runs only these.
     const judged = new Map<string, string>()
+    // Per run, as its `tools` saw them: the pi tools it was offered, the ones its pi tools may
+    // call through `ctx.executeTool`, and the extension file that registered each (what
+    // `nestedCalls` compares). Its calls, top-level and nested, are judged and run against
+    // these only, so a name registered again later (an extension earlier in the list, from an
+    // event handler or a timer) never takes over a call, and `source` names what runs. Frozen
+    // shallow copies: `ctx.tools` hands them to running tools, which must not swap an `execute`.
+    const snapshots = new Map<
+      string,
+      { offered: Map<string, PiTool>; callable: Map<string, PiTool>; sources: Map<string, string> }
+    >()
+    const frozen = (tools: Map<string, PiTool>) =>
+      new Map([...tools].map(([name, tool]) => [name, Object.freeze({ ...tool }) as PiTool]))
+    const offeredIn = (runId: string) => snapshots.get(runId)?.offered ?? new Map<string, PiTool>()
+    const callableIn = (runId: string) => snapshots.get(runId)?.callable ?? new Map<string, PiTool>()
+    /** The extension file that registered `name`, as the run's `tools` saw it. */
+    const sourceIn = (runId: string, name: string) => snapshots.get(runId)?.sources.get(name)
+    /** Why `nestedCalls` refuses a call from a tool of `caller` to `name`, if it does. */
+    const nestedRefusal = (runId: string, caller: string | undefined, name: string) => {
+      if (nestedCalls === 'off') return `nested tool calls are turned off by the host (nestedCalls: "off")`
+      if (nestedCalls === 'own-extension' && (caller === undefined || sourceIn(runId, name) !== caller)) {
+        return `${name} belongs to another extension; the host allows nested calls only within the calling tool's own extension (nestedCalls: "own-extension")`
+      }
+      return undefined
+    }
     const callKey = (call: ToolCall) => `${call.run_id}/${call.call_id}`
 
-    const startNote = async (prompt: string, signal: AbortSignal) => {
+    const startNote = async (prompt: string, signal: AbortSignal, runId: string) => {
       let systemPrompt = PROMPT_MARK
       for (const { ext, fn } of handlers('before_agent_start')) {
         const options = new Proxy({} as Record<string, unknown>, {
@@ -977,7 +1470,7 @@ export default definePlugin<Config>({
         })
         const event = { type: 'before_agent_start', prompt, systemPrompt, systemPromptOptions: options }
         try {
-          const result = (await fn(event, context(signal, systemPrompt))) as
+          const result = (await fn(event, context(signal, runId, systemPrompt))) as
             | { systemPrompt?: unknown; message?: unknown }
             | undefined
           if (result?.message !== undefined) {
@@ -1007,8 +1500,12 @@ export default definePlugin<Config>({
         started.push(`${short(ext.path)}: ${message(error)}`)
       }
     }
+    // Set once the observers exist: stops them and waits (bounded) for what is queued, so a
+    // tracer's `agent_end` comes before its `session_shutdown`, as in pi.
+    let drainObservers: () => Promise<void> = async () => {}
     // Registered first, so a refusal below still shuts the extensions down.
     ctx.effect(async () => {
+      await drainObservers()
       for (const { ext, fn } of handlers('session_shutdown')) {
         try {
           await fn({ type: 'session_shutdown', reason: 'quit' }, context())
@@ -1022,19 +1519,278 @@ export default definePlugin<Config>({
       throw new Error(`pi extensions failed in session_start: ${started.join('; ')}`)
     }
     // After session_start, so what it registered is checked too.
+    // Observer events: the yoagent event types the handlers present at load need. One registered
+    // later is fired when its types are already subscribed, else reported as not available.
+    // (After session_start, like `watching`: what it registered counts.)
+    const subscribed = new Set<string>()
+    for (const [event, types] of OBSERVED_EVENTS) {
+      if (handlers(event).length > 0) for (const t of types) subscribed.add(t)
+    }
+    const observed = (event: string) =>
+      OBSERVED_EVENTS.has(event) && OBSERVED_EVENTS.get(event)!.every((t) => subscribed.has(t))
     watching = handlers('context').length + handlers('message_end').length > 0
     checkUnmapped(true)
     checkShadowing(true)
 
+    /** Per run: the turn index, and each running tool call's pi name and arguments. */
+    const turns = new Map<string, number>()
+    /** A run's tools kept past `finish` for its `agentEnd` (delivered after it), when subscribed. */
+    const ending = new Map<string, { offered: Map<string, PiTool>; model?: string }>()
+    const running = new Map<string, { toolName: string; args: unknown }>()
+    const observerFailed = new Set<string>()
+    /** A yoagent tool call as pi names it: a pi tool keeps its name, a built-in gets pi's name and argument shape. */
+    const piCall = (runId: string, tool: string, args: unknown) => {
+      const own = (snapshots.get(runId) ?? ending.get(runId))?.offered.has(tool) ?? false
+      const shape = own ? undefined : ARGS.get(tool)
+      let input = args
+      try {
+        input = shape && args && typeof args === 'object' ? shape.toPi(args as Args) : args
+      } catch (error) {
+        // An argument shape that cannot take pi's form: shown in yoagent's.
+        report('debug', `[pi] ${tool}: arguments shown in yoagent's form to observers: ${message(error)}`)
+      }
+      return { toolName: own ? tool : (names.get(tool) ?? tool), args: input }
+    }
+    /** A message as pi's observers see it: its tool calls and results under pi's names and shapes. */
+    const observedMessage = (runId: string, message: Message) => {
+      const out = piMessage(message) as Record<string, unknown> & { role: string; content?: unknown }
+      if (out.role === 'assistant' && Array.isArray(out.content)) {
+        out.content = out.content.map((block: Record<string, unknown>) => {
+          if (block?.type !== 'toolCall' || typeof block.name !== 'string') return block
+          const call = piCall(runId, block.name, block.arguments)
+          return { ...block, name: call.toolName, arguments: call.args }
+        })
+      }
+      if (out.role === 'toolResult' && typeof out.toolName === 'string') {
+        out.toolName = piCall(runId, out.toolName, undefined).toolName
+      }
+      return out
+    }
+    const llm = (runId: string, messages: unknown) =>
+      ((messages as Message[] | undefined) ?? [])
+        .filter((m) => m && m.role !== ('extension' as never))
+        .map((m) => observedMessage(runId, m))
+    /** The pi event for a yoagent one, or nothing (the types a subscribed observer does not use). */
+    const piEvent = (event: Record<string, unknown> & { type: string; run: RunInfo }): Record<string, unknown> | undefined => {
+      const runId = event.run.run_id
+      switch (event.type) {
+        case 'agentStart':
+          turns.set(runId, 0)
+          return { type: 'agent_start' }
+        case 'agentEnd': {
+          turns.delete(runId)
+          for (const key of running.keys()) if (key.startsWith(`${runId}/`)) running.delete(key)
+          const messages = llm(runId, event.messages)
+          ending.delete(runId)
+          return { type: 'agent_end', messages }
+        }
+        case 'turnStart':
+          return { type: 'turn_start', turnIndex: turns.get(runId) ?? 0, timestamp: Date.now() }
+        case 'turnEnd': {
+          const turnIndex = turns.get(runId) ?? 0
+          turns.set(runId, turnIndex + 1)
+          const message = event.message as Message
+          // As pi: only a turn that ended with an assistant message (not a stop or cancel marker).
+          if (message?.role !== 'assistant') return undefined
+          const stop = (message as { stopReason?: string }).stopReason
+          const toolResults = llm(runId, event.toolResults)
+          return {
+            type: 'turn_end',
+            turnIndex,
+            message: observedMessage(runId, message),
+            toolResults,
+            // No session entries in yoagent: ids for this run and turn, and an empty boundary.
+            messageEntryId: `${runId}/turn-${turnIndex}`,
+            toolResultEntryIds: toolResults.map((_, i) => `${runId}/turn-${turnIndex}/result-${i}`),
+            entries: [],
+            continue: false,
+            context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false },
+            outcome: stop === 'aborted' ? 'aborted' : stop === 'error' ? 'error' : 'completed',
+          }
+        }
+        case 'messageStart':
+          return { type: 'message_start', message: observedMessage(runId, event.message as Message) }
+        case 'messageUpdate': {
+          const message = observedMessage(runId, event.message as Message) as { content?: unknown[] }
+          const delta = event.delta as { type: string; delta: string }
+          return {
+            type: 'message_update',
+            message,
+            assistantMessageEvent: {
+              type: DELTA_TYPES[delta.type] ?? `${delta.type}_delta`,
+              contentIndex: Math.max(0, (message.content?.length ?? 1) - 1),
+              delta: delta.delta,
+              partial: message,
+            },
+          }
+        }
+        case 'toolExecutionStart': {
+          const call = piCall(runId, event.toolName as string, event.args)
+          running.set(`${runId}/${event.toolCallId}`, call)
+          return { type: 'tool_execution_start', toolCallId: event.toolCallId, ...call }
+        }
+        case 'toolExecutionUpdate': {
+          const call = running.get(`${runId}/${event.toolCallId}`) ?? piCall(runId, event.toolName as string, undefined)
+          return { type: 'tool_execution_update', toolCallId: event.toolCallId, ...call, partialResult: event.partialResult }
+        }
+        case 'toolExecutionEnd': {
+          const key = `${runId}/${event.toolCallId}`
+          const call = running.get(key) ?? piCall(runId, event.toolName as string, undefined)
+          running.delete(key)
+          return {
+            type: 'tool_execution_end',
+            toolCallId: event.toolCallId,
+            toolName: call.toolName,
+            result: event.result,
+            isError: event.isError,
+          }
+        }
+        default:
+          return undefined
+      }
+    }
+    /**
+     * Fires a yoagent event's pi counterpart at its handlers. The pi event is built now (the
+     * run's tools are still known), the handlers run later on one ordered chain: `on_event`
+     * returns at once, so a slow observer (a tracer flushing over the network) never meets the
+     * bridge's per-event timeout, which would switch every observer off for the run (and fail a
+     * required bridge's run). At most MAX_OBSERVER_BACKLOG events wait; past that, events are
+     * dropped, reported once. Never throws: a throwing handler is reported once (per extension
+     * and event) and the others still run; a result is ignored (a `turn_end` asking to continue
+     * or add entries is reported once).
+     */
+    let chain: Promise<void> = Promise.resolve()
+    let backlog = 0
+    let dropped = 0
+    let closed = false
+    const mappingFailed = new Set<string>()
+    /** Once per run, extension and kind of trouble: a failure in a later run is reported again. */
+    const once = (key: string, level: 'warn' | 'info', text: string) => {
+      if (observerFailed.has(key)) return
+      observerFailed.add(key)
+      report(level, text)
+    }
+    const runHandlers = async (pi: Record<string, unknown>, runId: string, model: string | undefined) => {
+      for (const { ext, fn } of handlers(pi.type as string)) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          const call = Promise.resolve().then(() => fn(structuredClone(pi), context(undefined, runId, '', model)))
+          const budget = new Promise<'late'>((resolve) => {
+            timer = setTimeout(() => resolve('late'), OBSERVER_HANDLER_BUDGET_MS)
+          })
+          const result = (await Promise.race([call, budget])) as
+            | 'late'
+            | { continue?: unknown; entries?: unknown[] }
+            | undefined
+          if (result === 'late') {
+            // Left running; the queue moves on so one stuck handler cannot stall every observer.
+            call.catch(() => {})
+            once(
+              `${runId}\0${ext.path}\0${pi.type}\0late`,
+              'warn',
+              `[pi] ${short(ext.path)}: a ${pi.type} handler did not finish within ${OBSERVER_HANDLER_BUDGET_MS / 1000} s; ` +
+                `the observers went on without it (reported once per run)`,
+            )
+          } else if (pi.type === 'turn_end' && result && (result.continue || (result.entries?.length ?? 0) > 0)) {
+            once(
+              `${ext.path}\0turn_end-result`,
+              'warn',
+              `[pi] ${short(ext.path)}: a turn_end result (continue / entries) is not applied in yoagent; ignored`,
+            )
+          }
+        } catch (error) {
+          once(
+            `${runId}\0${ext.path}\0${pi.type}`,
+            'warn',
+            `[pi] ${short(ext.path)}: a ${pi.type} handler threw (reported once per run): ${message(error)}`,
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      // The run is over for its observers: its once-per-run keys can go.
+      if (pi.type === 'agent_end') {
+        for (const key of observerFailed) if (key.startsWith(`${runId}\0`)) observerFailed.delete(key)
+      }
+    }
+    /**
+     * Fires a yoagent event's pi counterpart at its handlers. The pi event is built now (the
+     * run's tools are still known), the handlers run later on one ordered chain: `on_event`
+     * returns at once, so a slow observer (a tracer flushing over the network) never meets the
+     * bridge's per-event timeout, which would switch every observer off for the run (and fail a
+     * required bridge's run). A handler gets OBSERVER_HANDLER_BUDGET_MS before the queue moves
+     * on. Past MAX_OBSERVER_BACKLOG waiting events streaming events are dropped (lifecycle ones
+     * past twice that), counted and reported when the queue catches up. Never throws: a
+     * throwing handler is reported once per run and the others still run; a result is ignored
+     * (a `turn_end` asking to continue or add entries is reported once).
+     */
+    const observe = async (event: Record<string, unknown> & { type: string; run: RunInfo }) => {
+      if (refusal || closed) {
+        ending.clear()
+        return
+      }
+      // The run's model now, not when the handler runs: by then the run may have ended
+      // (`agentEnd` always comes after `finish`) and another run made the latest request.
+      const model = runModels.get(event.run.run_id) ?? ending.get(event.run.run_id)?.model ?? latestModel
+      let pi: Record<string, unknown> | undefined
+      try {
+        pi = piEvent(event)
+      } catch (error) {
+        if (!mappingFailed.has(event.type)) {
+          mappingFailed.add(event.type)
+          report('warn', `[pi] could not map ${event.type} events for pi observers (reported once): ${message(error)}`)
+        }
+        return
+      }
+      if (!pi) return
+      const limit = STREAMING_EVENTS.has(pi.type as string) ? MAX_OBSERVER_BACKLOG : 2 * MAX_OBSERVER_BACKLOG
+      if (backlog >= limit) {
+        if (dropped++ === 0) {
+          report('warn', `[pi] observers are ${backlog} events behind; dropping events until they catch up`)
+        }
+        return
+      }
+      backlog++
+      const next = pi
+      const runId = event.run.run_id
+      chain = chain
+        .then(() => runHandlers(next, runId, model))
+        .catch((error) => report('warn', `[pi] observer queue: ${message(error)}`))
+        .finally(() => {
+          backlog--
+          if (backlog === 0 && dropped > 0) {
+            report('warn', `[pi] observers caught up; ${dropped} events were dropped`)
+            dropped = 0
+          }
+        })
+    }
+    drainObservers = async () => {
+      closed = true
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const done = await Promise.race([
+        chain.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), OBSERVER_DRAIN_MS)
+        }),
+      ])
+      clearTimeout(timer)
+      if (!done) report('warn', `[pi] unloading with ${backlog} observer events still queued`)
+    }
+
     ctx.effect(
       yoagent.register(config.name ?? 'pi-extensions', {
-        async tools(): Promise<ToolSpec[]> {
+        async tools(run: RunInfo): Promise<ToolSpec[]> {
           // Registrations made since load: reported now (a run cannot refuse the load).
           checkUnmapped(false)
           checkShadowing(false)
           if (refusal) return []
-          return [...available().values()].map((tool) => ({
+          const paths = registeredBy()
+          const tools = frozen(available())
+          snapshots.set(run.run_id, { offered: tools, callable: frozen(callable()), sources: paths })
+          return [...tools.values()].map((tool) => ({
             name: tool.name,
+            // The extension file that registered it: a host's policy may trust a tool by it.
+            source: paths.get(tool.name) ?? null,
             label: tool.label ?? null,
             description: [tool.description ?? '', ...(tool.promptGuidelines ?? []).map((g) => `- ${g}`)]
               .filter(Boolean)
@@ -1044,7 +1800,8 @@ export default definePlugin<Config>({
         },
 
         async call_tool(call: ToolCall & Cancellable): Promise<ToolResult> {
-          const tool = available().get(call.tool)
+          // The definition this run was offered, whatever registered the name since.
+          const tool = offeredIn(call.run_id).get(call.tool)
           if (!tool) return { text: `pi tool ${call.tool} is not available`, is_error: true }
           const approved = judged.get(callKey(call))
           judged.delete(callKey(call))
@@ -1055,7 +1812,7 @@ export default definePlugin<Config>({
             }
           }
           try {
-            const out = await tool.execute(call.call_id, call.args, call.signal, undefined, toolContext(call.signal, call.run_id, call.call_id))
+            const out = await tool.execute(call.call_id, call.args, call.signal, undefined, toolContext(call.signal, call.run_id, call.call_id, 0, sourceIn(call.run_id, call.tool)))
             if (out.isError === true) return { text: text(out.content), details: out.details ?? null, is_error: true }
             return { content: blocks(out.content), details: out.details ?? null }
           } catch (error) {
@@ -1073,7 +1830,7 @@ export default definePlugin<Config>({
             const stopped = await checkEnded(call.run_id, call.messages, call.signal)
             if (stopped) return { deny: stopped }
           }
-          const piTools = available()
+          const piTools = offeredIn(call.run_id)
           const own = piTools.get(call.tool)
           const counterpart = names.get(call.tool)
           // A yoagent built-in whose pi counterpart an extension overrides: the model must use the override.
@@ -1112,7 +1869,7 @@ export default definePlugin<Config>({
             const event = { type: 'tool_call', toolCallId: call.call_id, toolName, input }
             let result: { block?: boolean; reason?: string; terminate?: boolean } | undefined
             try {
-              result = (await fn(event, context(call.signal))) as typeof result
+              result = (await fn(event, context(call.signal, call.run_id))) as typeof result
             } catch (error) {
               // As in pi: a failing tool_call handler blocks the call.
               return { deny: `pi extension ${short(ext.path)} failed: ${message(error)}` }
@@ -1150,7 +1907,7 @@ export default definePlugin<Config>({
           if (refusal) throw new Error(refusal)
           const editors = handlers('tool_result')
           if (editors.length === 0) return
-          const own = available().has(call.tool)
+          const own = offeredIn(call.run_id).has(call.tool)
           const shape = own ? undefined : ARGS.get(call.tool)
           const event = {
             type: 'tool_result',
@@ -1166,7 +1923,7 @@ export default definePlugin<Config>({
           const failed: string[] = []
           for (const { ext, fn } of editors) {
             try {
-              const result = (await fn(event, context(call.signal))) as
+              const result = (await fn(event, context(call.signal, call.run_id))) as
                 | { content?: Block[]; details?: unknown; isError?: boolean }
                 | undefined
               if (result?.content !== undefined) {
@@ -1204,7 +1961,7 @@ export default definePlugin<Config>({
             const event = { type: 'input', text: input.text, source: 'interactive' }
             let result: { action?: string } | undefined
             try {
-              result = (await fn(event, context(input.signal))) as typeof result
+              result = (await fn(event, context(input.signal, input.run_id))) as typeof result
             } catch (error) {
               // Unlike pi (which goes on): an input check that failed rejects.
               return { reject: `pi extension ${short(ext.path)} failed: ${message(error)}` }
@@ -1217,6 +1974,10 @@ export default definePlugin<Config>({
         },
 
         async before_model(turn) {
+          if (typeof turn.model === 'string' && turn.model) {
+            runModels.set(turn.run_id, turn.model)
+            latestModel = turn.model
+          }
           checkUnmapped(false)
           checkShadowing(false)
           if (refusal) return { stop: refusal }
@@ -1225,13 +1986,13 @@ export default definePlugin<Config>({
           if (watching) {
             // Prompts and tool results ended since; then the context this request sends.
             const stopped =
-              (await checkEnded(turn.run_id, turn.messages, turn.signal)) ?? (await checkContext(turn.messages, turn.signal))
+              (await checkEnded(turn.run_id, turn.messages, turn.signal)) ?? (await checkContext(turn.run_id, turn.messages, turn.signal))
             if (stopped) return { stop: stopped }
           }
           if (handlers('before_agent_start').length === 0) return
           let note = notes.get(turn.run_id)
           if (!note) {
-            note = startNote(turn.latest_user_text ?? '', turn.signal)
+            note = startNote(turn.latest_user_text ?? '', turn.signal, turn.run_id)
             notes.set(turn.run_id, note)
           }
           const added = await note
@@ -1256,8 +2017,22 @@ export default definePlugin<Config>({
           ended.delete(outcome.run_id)
           queue.delete(outcome.run_id)
           for (const key of judged.keys()) if (key.startsWith(`${outcome.run_id}/`)) judged.delete(key)
+          // `agentEnd` comes after `finish`: it names tools from what this run offered.
+          const snapshot = snapshots.get(outcome.run_id)
+          if (snapshot && subscribed.has('agentEnd')) ending.set(outcome.run_id, { ...snapshot, model: runModels.get(outcome.run_id) })
+          snapshots.delete(outcome.run_id)
+          runModels.delete(outcome.run_id)
+          // Observer bookkeeping: whatever event types are subscribed (the bridge delivers the
+          // run's events before `finish`; only `agentEnd`, which needs neither, comes after).
+          turns.delete(outcome.run_id)
+          for (const key of running.keys()) if (key.startsWith(`${outcome.run_id}/`)) running.delete(key)
         },
-      }, watching ? { messages: true } : undefined),
+        // Only with observer handlers at load: pi's observer events, from yoagent's.
+        ...(subscribed.size > 0 ? { on_event: observe } : {}),
+      }, {
+        ...(watching ? { messages: true } : {}),
+        ...(subscribed.size > 0 ? { events: [...subscribed] } : {}),
+      }),
     )
   },
 })

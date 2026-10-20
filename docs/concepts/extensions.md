@@ -147,12 +147,27 @@ let budget = Budget::for_model(2.0, &model).expect("a priced model");
 let agent = Agent::from_config(model).with_extension(budget);
 ```
 
-- **What counts:** the run's assistant turns, its own decision evaluations (tool gate, input guard, advisor) and `LlmCompaction` summaries — each at its model's price, or the budget's rate when unpriced — and what a sub-agent reports spending (at its own price, or this one if it has none).
+- **What counts:** the run's assistant turns, its own decision evaluations (tool gate, input guard, advisor), `LlmCompaction` summaries and model calls extensions record (below) — each at its model's price, or the budget's rate when unpriced — and what a sub-agent reports spending (at its own price, or this one if it has none).
 - **Per run** by default, sub-agents included.
 - **`.across_runs()`** makes it one total for every run the extension serves: all of a session's runs, or, with `with_tree_extension`, a whole delegation tree, where each run's own messages are counted once. Read the total with `spent_usd()` through an `Arc<Budget>` you keep.
 - A **per-run budget installed as a tree extension** gives every run of the tree its own limit.
 - Messages are priced at the one rate given (`Budget::usd(max, CostConfig)` to choose it). `Budget::for_model` takes the model's `cost`, which is `None` until the process opts in to prices ([Model Pricing](pricing.md#enabling-pricing)). A negative or NaN limit panics; `with_name` tells several budgets apart.
 - The check is before each request, so the request that crosses the limit still completes. A provider attempt that fails mid-stream reports no usage, so its billed input tokens are not counted.
+
+### Spend an extension makes
+
+An extension that calls a model outside the run's turns — a host service answering a plugin's model call, say — records it with the run's `SpendHandle`, so it counts like the run's own spend:
+
+```rust,ignore
+async fn start_run(&self, run: &RunContext<'_>) -> Result<Box<dyn RunHooks>, ExtensionError> {
+    // Keep it for the run; usable from any task while the run is live.
+    let spend = run.spend_handle();
+    // ... after a model call made for this run:
+    // spend.add(&usage, &model_config);
+}
+```
+
+`add(&usage, &model)` prices the call at the model's `cost` (`add_priced` takes a `CostConfig` instead); never pass dollars. A `Budget` counts it at its next check (before the next request), and the run's `SessionStats` holds it in `extensions`, inside `total_usage()` and `total_cost_usd()` (an unpriced call makes the total `None`, as an unpriced turn does); `Agent::extension_spend()` sums it across runs. Spend recorded after the run ended — after the extensions' `finish` — is not counted, with a warning; spend recorded in a `finish` that runs after a `Budget`'s own is in the run's stats but not in that budget's total. `run.spend_handle()` is `None` outside a loop (a `RunContext::new` in a test).
 
 ## Built on extensions
 
@@ -176,6 +191,23 @@ So is the [`yoagent-rutis`](https://github.com/yologdev/yoagent/tree/main/integr
 What the bridge gives every ecosystem alike: TypeScript and Python handlers next to Rust ones, one registration order, **image** tool results both ways (`content` blocks), **plugin logs** in the host's `tracing` output (`yoagent.log`, with the run they belong to), and failures that deny rather than allow. What stays outside the loop on purpose — commands, dialogs, session history, a UI — belongs to the app that hosts the agent.
 
 **The adapter contract.** An ecosystem rarely maps one-to-one, so an adapter should follow the same rules ([details](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis#writing-an-ecosystem-adapter)): map only what the host can honour; refuse to load when a plugin would decide or rewrite something the host cannot enforce; deny a call when a policy fails; withhold a result when a redaction fails; report — never silently drop — what is ignored.
+
+## Where extensions run
+
+The loop and the `Extension` contract build for every target yoagent supports, so an extension written in Rust runs wherever the agent does. What changes from one place to another is what *else* is there: an operating system to run tools and plugin processes on, or only the host's `fetch`.
+
+| | Local machine or VM | Cloudflare Worker (`wasm32`) |
+|---|---|---|
+| Build | default features (`native`) | `--no-default-features` ([guide](../guides/wasm-workers.md)) |
+| `Extension`s written in Rust: your own, `Budget` | yes | yes (`tests/wasm32.rs` runs an extension that gates and observes a whole run) |
+| Decision models: `ToolGate`, `InputGuard`, the advisor (`decision` feature) | yes | yes, over HTTP or the [`yoagent-workers`](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-workers) binding to Workers AI |
+| Built-in tools: shell, files, search | yes | no: there is no operating system |
+| MCP servers | stdio and HTTP | HTTP only |
+| Plugins through [`yoagent-rutis`](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis): TypeScript (Node or Bun), Python, Go, pi extensions, DSH plugins | yes | no: the crate does not build for `wasm32` (rutis's host needs Tokio's networking), so not even a runtime on another machine over `wss` (its `websocket` feature) can be reached from a Worker |
+
+A VM is a local machine as far as yoagent is concerned: the same build and the same features; only who runs it differs.
+
+So an agent meant to run in a Worker gets its policies, budgets and checks from Rust extensions (and decision models), and its tools from `AgentTool`s you write or HTTP MCP servers. The same extensions work unchanged when that agent runs locally, where the plugin ecosystems are also available.
 
 ## Order with the older hooks
 

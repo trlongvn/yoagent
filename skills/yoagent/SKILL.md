@@ -5,7 +5,7 @@ description: Use when building, extending or upgrading an agent on the yoagent R
 
 # yoagent: which feature for which job
 
-Written for **yoagent 0.25.4** (and yoagent-rutis 0.3.0); the recipes
+Written for **yoagent 0.25.11** (and yoagent-rutis 0.7.1); the recipes
 below are compiled by `tests/skill_test.rs`, line for line. Check what you
 build against: `cargo tree -p yoagent` or `Cargo.lock`. If you are on an
 older version, read [What changed](#what-changed) first.
@@ -143,8 +143,8 @@ Plugins register a handler with the bridge; the bridge is one `Extension`.
 pi extensions and DeepSeek Harness (DSH) plugins load unchanged through
 adapters, as far as yoagent can honour them; what it cannot (UI, commands)
 is ignored, and what would decide things yoagent cannot enforce is
-**refused**. Measured: of the 20 most-downloaded packages, pi 12 and DSH 4
-are usable (`docs/evals/plugin-compatibility.md`). Start from the
+**refused**. Measured (2026-10-16): of the 20 most-downloaded packages, pi 12 and
+DSH 3 are usable (`docs/evals/plugin-compatibility.md`). Start from the
 [yoagent-rutis README](https://github.com/yologdev/yoagent/tree/main/integrations/yoagent-rutis)
 and its examples.
 
@@ -198,6 +198,51 @@ and its examples.
 
 Newest first; the full list is `CHANGELOG.md`.
 
+- **0.25.11** — `tool_output_max_lines` is one budget per tool result,
+  shared by its text blocks (a many-block MCP result reached the model as
+  blocks × the budget): short blocks stay whole, long ones split the rest,
+  each cut with its own marker and stash key. Older multi-block results
+  over the budget are cut once more at their first level-1 compaction.
+- **0.25.10** — `ModelConfig::presets()` / `preset(provider, id)` /
+  `generic(provider, id)`: for a model given as text, write
+  `preset(p, id).or_else(|| generic(p, id))` and tell the user when the
+  fallback ran (its limits are the provider's defaults, not the model's).
+  `RunContext::spend_handle()` → `SpendHandle::add(&usage, &model)`: an
+  extension's own model calls (a host service's, for a plugin) count in
+  `Budget` and `SessionStats::extensions`. Steering and follow-ups taken
+  before a cancel are kept in the history (they were lost);
+  `Batched { size: 0 }` no longer answers a steered call twice.
+- **0.25.9** — a tool result with several text blocks reaches the model
+  whole (Anthropic, OpenAI-compatible, Responses, Gemini and Vertex sent
+  only the first block; an MCP server answering in blocks was seen as its
+  intro line). Upgrade if you use MCP tools.
+- **0.25.8** — eleven priced presets with real context windows and
+  output limits (`claude_sonnet_5_5`, `claude_haiku_5_5`, `gpt_6_1_sol`,
+  `gemini_4_argon`, `gemini_3_8_flash`, `grok_4_7`, `mistral_large_4`,
+  `glm_5_3`, `glm_5_3_flash`, `qwen_3_8_max`, `qwen_3_8_flash`; the three
+  on promotion carry the regular rate). Gemini thinking tokens and
+  OpenAI-compatible reasoning tokens reported beside `completion_tokens`
+  now count as output (cost, context tracking, `max_total_tokens`). The
+  file tools refuse a FIFO, device, socket or directory. **Behaviour
+  change:** `bash` returns when `bash` exits; a background job still
+  holding its output is left running with that output discarded
+  (`NOTE:` line, `details.output_still_open`) instead of holding the call
+  until the timeout killed it — redirect a job's output to keep it.
+- **0.25.7** — `McpToolAdapter::with_prefix` / `from_client_with_prefix`
+  name the tool `<prefix>__<tool>` (the prefix was ignored); the server is
+  still called with its own name. The `with_mcp_server_*` helpers add no
+  prefix: wrap a server yourself when two offer the same tool name.
+- **0.25.6** — DeepSeek is priced (after `prices::enable_bundled()`):
+  `deepseek-flash`, `deepseek-v4-pro`, `deepseek-v4-flash`, at the **peak**
+  rate (off-peak is half; a flat price has no time of day), so its costs are
+  an upper bound and a `Budget` stops early rather than late. Install the
+  off-peak rates as an override to count those (`docs/concepts/pricing.md`).
+- **0.25.5** — the built-in `search` tool ignores the user's ripgrep
+  config (`--no-config`) and `GREP_OPTIONS`, finds `rg` without `which`
+  (`details.engine` says `"rg"` or `"grep"`), and reports a search that
+  ended abnormally as an error, never as "No matches". The experimental
+  frontend and its examples moved to
+  [yobuild](https://github.com/yologdev/yobuild).
 - **0.25.4** — `ToolGate` (feature `decision`) sends a call's arguments
   whole when they fit (`with_max_argument_chars`, default 48,000, and the
   decision backend's token limits) and otherwise cuts only the longest
@@ -224,6 +269,43 @@ Newest first; the full list is `CHANGELOG.md`.
 - **0.24.2** — built-in tool sandbox fixes (path escapes, `search` flag
   injection, Gemini key out of the URL, tool panics contained).
 - **0.24.1** — `retry_safe_events`.
+- **yoagent-rutis 0.7.1** — pi adapter: `model` / `models` give
+  extensions `ctx.model` (default: the run's model id under provider
+  `yoagent`) and a read-only `ctx.modelRegistry`; `execFor` grants
+  `pi.exec` per extension file. pi observer events (`agent_end`,
+  `turn_end`, `tool_execution_*`, …) now fire. Opt-in DSH host
+  (`adapters::dsh_host_rows`) gives DSH plugins a stand-in DSH agent.
+- **yoagent-rutis 0.7.0** — pi adapter: **`pi.exec` is closed by
+  default** (row config `exec`: `true`, or an exact command list; only the
+  command is checked, so granting `git`/`sh`/`node` grants anything; a
+  refusal is code 126, never a throw). Fixed answers are logged as
+  `[pi] fixed answer: <question> → <answer>`; `projectTrusted` sets
+  `ctx.isProjectTrusted()` (default false). Loads write wrappers to
+  `$TMPDIR/yoagent-pi-wrappers-<uid>`.
+- **yoagent-rutis 0.6.1** — `rows::wait_running` (feature `loader`): a
+  host's plugin rows can wait for a service nobody provides, and `reconcile`
+  still reports success; this waits until they run and names, per waiting
+  row, the services it lacks.
+- **yoagent-rutis 0.6.0** — rutis 0.12 (move the npm / PyPI / Go runtimes
+  to 0.12 with it; undeclared `ctx.provide`d services now reach rutis, and
+  `ServiceCatalog::new()` shares every name). A TypeScript, Bun, Python or
+  Go plugin's handlers are owned by its row (`offered_by().owner()` is the
+  row id, seen by the host) and go when the row unloads or restarts —
+  declare `yoagent` in the plugin's `inject` to be attributed.
+- **yoagent-rutis 0.5.1** — pi adapter fix: a run calls only the tools it
+  was offered (top-level and nested), so `offered_by.source` names what
+  runs; `nestedCalls` (`"own-extension"`, `"off"`) narrows what a pi tool
+  can call through `ctx.executeTool`.
+- **yoagent-rutis 0.5.0** — rutis 0.11 (move the npm / PyPI / Go
+  runtimes to 0.11 with it: an integer beyond ±(2^53−1) now crosses as a
+  big integer, which older peers refuse); `Registry::offered_by(run_id,
+  tool)` names the plugin handler (and, for pi, the extension file) that
+  offered a tool, for policies that trust tools per plugin; per-handler hook
+  timing (`Registry::timings()` / `take_timings()`).
+- **yoagent-rutis 0.4.0** — `adapters()` (the pi and DSH adapter files the
+  crate ships: copy `root`, `npm ci` the copy) and the `probe` feature: vet
+  a pi extension or DSH plugin without running it as an agent; each
+  report's `problem()` is the verdict.
 - **yoagent-rutis 0.3.0** — rutis 0.9 (Rust 1.88); Bun and Go plugins;
   the 16 MiB guard.
 

@@ -31,8 +31,8 @@ contribute to live agents:
 Every event is also published on the rutis bus as `AgentEventEmitted`.
 
 yoagent does not depend on rutis; this crate uses only yoagent's public API.
-It depends on `rutis = "0.9"` (0.x caret: any 0.9.x, never 0.10) and, with a
-language feature, `rutis-bridge = "0.9"`: since 0.8 the packages in rutis's
+It depends on `rutis = "0.12"` (0.x caret: any 0.12.x, never 0.13) and, with a
+language feature, `rutis-bridge = "0.12"`: since 0.8 the packages in rutis's
 release train share one version. rutis types are part of this crate's API,
 so every rutis or rutis-bridge minor bump is a yoagent-rutis minor bump.
 
@@ -116,7 +116,7 @@ calls per tool, and a redactor).
 
 With a language feature, `RutisBridge::install` also provides the registry
 to plugins in other languages, through
-[rutis-bridge](https://crates.io/crates/rutis-bridge) 0.9, as the host
+[rutis-bridge](https://crates.io/crates/rutis-bridge) 0.12, as the host
 service `yoagent`:
 
 | Feature | Adds (rutis-bridge feature of the same name) |
@@ -127,6 +127,7 @@ service `yoagent`:
 | `python` | Python plugins in local Python runtimes (Python 3.10+, Linux/macOS) |
 | `go` | Go plugins built with the rutis Go SDK (Go 1.24+, Linux/macOS): each binary is a runtime, started when a `go:<plugin>` row needs it (rutis-loader's `GoResolver` / `GoRuntimes`). A handler is a map of Go functions; a hook's `context.Context` is cancelled when the host gives the call up, as a JavaScript hook's `signal` aborts — see [`plugins/go/main.go`](plugins/go/main.go) |
 | `websocket` | runtimes and nodes on other machines, over `wss` |
+| `loader` | `rows::wait_running`: wait until the plugin rows a host loaded with rutis-loader run — `reconcile` counts a row still waiting as settled, and since rutis 0.12 a row injecting a service nobody provides waits for good — and name, per row still waiting, the services it injects that do not exist |
 
 ```toml
 yoagent-rutis = { git = "https://github.com/yologdev/yoagent", features = ["node", "python"] }
@@ -137,7 +138,11 @@ class instance or a dict; in Go, a map of functions — see
 [`plugins/go/main.go`](plugins/go/main.go)) of async functions, passed by reference — rutis
 calls them in the plugin's own process. `register(name, handler, options?)`
 returns a function that unregisters it; pass it to `ctx.effect` so the
-handler goes when the plugin unloads.
+handler goes when the plugin unloads. A plugin loaded as a row of a
+runtime is also tied to that row by the host (rutis 0.12's caller row):
+its handlers go when the row unloads or restarts, while the runtime runs
+on, even if the plugin dropped the disposer, and their owner
+(`HandlerInfo::owner`, `ToolOwner::owner`) is the row's loader id.
 
 ```ts
 import { definePlugin } from '@arcships/rutis'
@@ -258,11 +263,11 @@ def apply(ctx, config):
   stand-in throws (Python: `AttributeError`): wrap the call and fall back
   to `console.warn` / `print`.
 - **The bridge never loads plugins**: the host does, typically with
-  [rutis-loader](https://crates.io/crates/rutis-loader) rows, and must share
-  `yoagent` in the loader's catalog (`catalog.register_shared("yoagent")` or
-  `share_by_name()`). [`examples/language_plugins.rs`](examples/language_plugins.rs)
+  [rutis-loader](https://crates.io/crates/rutis-loader) rows, whose catalog
+  must share `yoagent` (rutis 0.12's `ServiceCatalog::new()` shares every
+  name; after `share_registered_only()`, `catalog.register_shared("yoagent")`). [`examples/language_plugins.rs`](examples/language_plugins.rs)
   is a complete host: `npm ci` in `plugins/`, a Python 3.10+ with
-  `rutis==0.9.1` in `plugins/.venv`, then
+  `rutis==0.12.0` in `plugins/.venv`, then
   `cargo run --features node,python --example language_plugins`.
 
 ### Remote handlers: latency and trust
@@ -288,11 +293,14 @@ sits inside every run of every agent using the extension:
 - **Registration** with an object handler reads each hook name back with a
   synchronous call (about ten round trips per `register`; a Python dict
   needs none).
-- **Which session.** A handler is removed when the session that registered
+- **Which row, which session.** A handler registered by a row is removed
+  when that row unloads or restarts, and when the session that registered
   it closes. For a plugin behind a link, that is the link: a remote runtime
   that crashes while the link stays up leaves its handlers registered and
-  failing (every tool call denied) until the plugin's own `ctx.effect`
-  cleanup or the link goes, and its name stays taken.
+  failing (every tool call denied) until its row unloads or the link goes,
+  and its name stays taken. A plugin that finds `yoagent` without declaring
+  it in `inject` registers under no row: its session owns it (logged at
+  info), so declare it.
 - **Availability.** An unreachable handler fails closed for that call, but a
   peer that disconnects has its handlers removed: later runs have no policy
   from it, and allow, unless the extension has `.require_policy()`. Use it
@@ -302,6 +310,36 @@ The end-to-end tests cover local Node and Python runtimes; a remote node over
 `wss` is not tested here.
 
 ## Tools from other agent ecosystems
+
+The adapters below ship in the crate (`plugins/pi`, `plugins/dsh`,
+`plugins/yoagent.d.ts`, without `node_modules`), and
+`yoagent_rutis::adapters::adapters()` says where they are: the crate's own
+files, where it was built (cargo's registry or a path dependency). Copy
+the whole `root` (the adapters import `../yoagent.d.ts`) and run `npm ci`
+in the copy's `pi/` and `dsh/`; never install into the registry's.
+
+With the `probe` feature, `yoagent_rutis::probe` loads a pi or DSH package
+through its adapter and reports what an agent gets — tools, prompt
+additions, the DSH services it needs and whether they exist, skills, and
+what the plugin logged — without calling a tool or a model (loading runs
+the package's code, as its own host would). Each report's `problem()` is
+the verdict: `None` for a clean load, else what kept the package from
+giving an agent what it offers (a refusal after load included). Probes in
+one process run one at a time.
+
+```rust,no_run
+# async fn check() {
+use yoagent_rutis::probe;
+// A copy of `adapters().root`, with `npm ci` run in its `pi/` and `dsh/`.
+let plugins = std::path::Path::new("/path/to/plugins");
+let cwd = std::path::Path::new("/path/to/project");
+let report = probe::pi(plugins, cwd, &["/path/to/extension.ts".into()], &[], None).await;
+match report.problem() {
+    None => println!("usable: {:?}", report.tools),
+    Some(why) => println!("not usable: {why}"),
+}
+# }
+```
 
 ### dsh (DeepSeek Harness) tool plugins
 
@@ -315,6 +353,14 @@ offers every tool in dsh's tool registry (the `tools` service of
 | `tools` | `tools.schemas()` → name, description, parameters (config `tools`: an allowlist) |
 | `call_tool` | `tools.execute({callId, name, arguments, signal})` with the bridge's cancel handle as dsh's `signal`: cancelling the run aborts the dsh call. `isError` → an error tool result. Text blocks stay text; an image block — a reference into dsh's attachment store — becomes a yoagent image, its bytes read with the `attachments` service when one is loaded (looked up per image, so the adapter also runs without it). Without one, when a read fails, when dsh marked the image `offloaded`, or over 3.75 MB (under Anthropic's 5 MB once base64), the image is a text placeholder; an error result's images are not read; other blocks are named. The tool's own presenters (`presentCall` / `presentResult`, dsh's card vocabulary: generic, terminal, diff, search, read, web) go along with a successful result as `details.view = {call?, result?}`, for a frontend to draw (content blocks as text, other blocks as `[type block]`; over 100k JSON characters, or a presenter that throws, leaves the card out; an error result has none) |
 | `before_model` | the system-prompt sections dsh plugins added (the harness identity and persona slots left out, sections whose variables are unset skipped), as one note, capped at `maxNoteChars` (2000) |
+
+Arguments holding an integer beyond ±(2^53−1), a `bigint` in the plugin
+since rutis 0.11, are refused by dsh itself ("tool execution arguments must
+be losslessly JSON-serializable", an error result the model sees), before
+dsh's `tools/pre-execute` stage (its policies and the approval dialog).
+yoagent's own policies have already run by then. With rutis 0.9 such an
+integer arrived as a JS number, rounded when a float64 cannot hold it, and
+the tool ran.
 
 Load, as rows of one Node runtime whose `package.json` is `plugins/dsh/`'s:
 `@deepseek-ai/dsh-system-prompt`, `@deepseek-ai/dsh-tools`, your dsh tool
@@ -347,8 +393,8 @@ says which, per package.
 
 ```sh
 (cd plugins/dsh && npm ci)
-cargo run --features node --example dsh_tools            # scripted model, real web search: needs network
-cargo run --features node --example dsh_tools -- --live  # DeepSeek: DEEPSEEK_API_KEY
+cargo run --features node,loader --example dsh_tools            # scripted model, real web search: needs network
+cargo run --features node,loader --example dsh_tools -- --live  # DeepSeek: DEEPSEEK_API_KEY
 ```
 
 [`examples/dsh_tools.rs`](examples/dsh_tools.rs) loads `dsh-web`,
@@ -359,6 +405,65 @@ scripted, that free-search's prompt section reached the model).
 (`plugins/dsh/fixture-tools.ts`), for images a stand-in attachment
 store (`plugins/dsh/fixture-attachments.ts`), and that the host services
 start headless in a `DSH_HOME` of their own.
+
+**A DSH agent for the calls (`dsh-host.ts`).** Many DSH plugins expect
+the call's DSH agent: they read its workspace (`exec.agent.session.header.cwd`),
+ask approvals through DSH's own service, or ask agent-scoped questions.
+On the adapter's agentless calls they fail (dsh-univer-office's file tools
+answer `SESSION_SCOPE_UNAVAILABLE`). A host that wants them loads the rows
+`yoagent_rutis::adapters::dsh_host_rows(dsh, sessions)` returns: every row
+of `host-services.json` with the ones
+[`plugins/dsh/dsh-host.json`](plugins/dsh/dsh-host.json) also names replaced,
+then the rest of `dsh-host.json` — DSH's own `dsh-session`, `dsh-agent`,
+`dsh-user-approval`, the jsonl session log
+(`dsh-session-persistence-jsonl`, kept under `sessions`, in place of
+`host-services.json`'s storage-less `dsh-session-persistence`; rutis-loader
+keeps the **first** of two rows with one id, so loading `dsh-host.json`
+after `host-services.json` would not replace it), and
+[`plugins/dsh/dsh-host.ts`](plugins/dsh/dsh-host.ts) — and shares two host
+services into the runtime:
+
+| service | methods | used for |
+|---|---|---|
+| `host_session` | `info()` → `{id, generation}`; `wake(text)` | one stand-in per generation (a reset bumps it: plugin state does not carry over); a DSH plugin's `steer` / `followup` / waking `send` / `inject`, as text (a refusal is logged at warn) |
+| `host_workspace` | `cwd()` | the stand-in session's working directory (an absolute path) |
+
+The calls to them come from the `dsh-host` row (the host answers its
+services by the calling row), each bounded at 30 s; a call waits at most
+120 s for its stand-in, queue included, and a timeout names the step the
+host was stuck on. Each call carries the
+generation's stand-in agent — registered as a root with DSH's `agents`, its
+id its DSH session's (`yoagent-<uuid>`), its ctx a DSH scope — and each
+top-level run is one DSH turn: `turn/start` at its first DSH call, the
+runs it delegates to join it at any depth (every run carrying the bridge,
+as its own extension or a parent's tree extension, tells the host who
+delegated it — from the adapter's `tools` and `before_model` hooks; a run
+without the bridge in between breaks the chain), `turn/end` at its `finish`
+(`completed` — also for a stopped or rejected run, DSH having no stopped
+reason; a cancelled run `aborted`, a failed one `error` with the run's
+error). One stand-in holds one turn at a time: a turn another top-level run
+finds still open (a lost `finish`, or two top-level runs at once) is closed
+`aborted` and logged: two overlapping top-level runs take the turn from
+each other. The log is flushed after the turn ends, without
+holding up `finish`. The stand-in runs no model: its inbox stays empty;
+`cancel`, inbox writes and a non-waking `send` do nothing (each logged at
+warn, once per generation); `runMaintenance` runs its task at once.
+The session's events go to the jsonl log; no conversation is mirrored into
+it. A host that loaded it but cannot give a stand-in (no absolute workspace,
+a malformed `info`, a host service failing or not answering) fails the
+call with the reason, logged. `host-dialogs.ts` answers what these calls
+ask: DSH's `approval/request`, as a choice of "Allow once" / "Deny" (not a
+confirm: a host's confirm answers `false` for a no and for no answer
+alike) showing the call's arguments — Allow once → `allowed-once`, Deny →
+`rejected`, no answer or a host failure → `unavailable` (DSH: "no approval
+channel") — and the stand-in's questions, as below. Tested end to end with a fixture
+(`plugins/dsh/fixture-needs-agent.ts`: workspace, steering, approvals and
+their outcomes, turn ends, a reset, a grandchild run joining the top-level
+run's turn, a relative workspace refused, the session logs read back from
+disk), and with dsh-univer-office 0.3.7 in an
+opt-in test (`--ignored`: book, worktree, CSV import, an approved merge, an
+.xlsx export). `dsh-session-persistence-jsonl` depends on `koffi`, which has
+an install script.
 
 **Asking the user.** On its own, a dsh tool call the adapter makes cannot
 reach a person: an `ask` from a dsh tool policy is denied, and
@@ -377,9 +482,11 @@ it never starts:
   no answer in time, denies it ("not approved"); a cancelled call is
   cancelled; a host that fails while asking denies it ("asking the user
   failed"). dsh's own approval service is not used: it needs a dsh agent and
-  session, which these calls do not have (so no dsh audit entry).
+  session, which these calls do not have (so no dsh audit entry) — unless
+  `dsh-host.ts` gives them one (above): then `approval/request` is answered
+  instead, with DSH's audit pair in the stand-in's session.
 - **questions** — an answerer on `user-questions/request` for requests
-  without an agent, which is what `ask_user_question` sends from these
+  without an agent or from the stand-in, which is what `ask_user_question` sends from these
   calls. Each question becomes a select (its distinct option labels, plus
   "Other" — which then asks for typed text — unless an option already has
   that label), a multiple select, or a text input. A blank input or an empty
@@ -396,7 +503,7 @@ is withdrawn.
 
 ### rutis-agent tools
 
-[rutis-agent](https://github.com/arcships/rutis/tree/v0.9.1/crates/rutis-agent)
+[rutis-agent](https://github.com/arcships/rutis/tree/v0.12.0/crates/rutis-agent)
 keeps its tools in a `ToolRegistry` service.
 [`examples/rutis-agent-tools/`](examples/rutis-agent-tools/src/main.rs) is a
 Rust rutis plugin that maps every `ToolDef` to a yoagent tool per run
@@ -416,8 +523,8 @@ cargo run --manifest-path examples/rutis-agent-tools/Cargo.toml [-- --live]
 
 > **Pinning caveat.** rutis matches services by Rust type, so rutis-agent and
 > this bridge must share one `rutis` crate. crates.io's `rutis-agent` 0.2.0 is
-> built on rutis 0.2; the one on rutis 0.9 (the rutis repository at tag
-> v0.9.1) is unpublished. The example is therefore its own workspace: it takes
+> built on rutis 0.2; the one on rutis 0.12 (the rutis repository at tag
+> v0.12.0) is unpublished. The example is therefore its own workspace: it takes
 > rutis-agent from git at that tag and patches crates.io's `rutis` to the same
 > tag (`[patch.crates-io]`), leaving one `rutis` in the graph (`cargo tree -d`
 > shows none twice). Move the tag and the patch together.
@@ -441,13 +548,17 @@ onto one handler, following pi 1.1.0's own runner and agent loop:
 | pi | yoagent |
 |---|---|
 | `pi.registerTool` | a tool, while pi would activate it (exposure `direct` / `model-only`, `defaultActive` not false, in the `setActiveTools` allowlist if one was set; the first registration of a name wins). Arguments go through `prepareArguments` and pi's validation before any policy sees them, and `execute` runs only with the arguments the policies left — a call another handler rewrote afterwards is not run. A throw or `isError` is an error result; text and image blocks pass through (pi's shape is yoagent's) |
-| `ctx.executeTool` | another pi tool, the way pi runs a nested call: prepared, validated, judged by `tool_call` (with `parentToolCallId`), its result through `tool_result`; never rejects (an unknown tool, a block or a throw is `isError`). yoagent's own tools are not reachable from it; `ctx.tools` lists the callable ones |
+| `ctx.executeTool` | another pi tool, the way pi runs a nested call: prepared, validated, judged by `tool_call` (with `parentToolCallId`), its result through `tool_result`; never rejects (an unknown tool, a block or a throw is `isError`). yoagent's own tools are not reachable from it; `ctx.tools` lists the callable ones. The host narrows it with `nestedCalls` (`own-extension`, `off`) |
+| `pi.exec` | **closed by default**: a command runs only when the host's `exec` setting allows it (`true`, or a list of commands matched exactly; per extension with `execFor` — `"git"` allows `git`, not `/usr/bin/git` or `./git`). Only the command is checked: its arguments and `cwd` are the extension's, so allowing a command that can run others (`git`, `sh`, `node`, `npx`) allows those too. A refused call resolves as a failed command (code 126, empty `stdout`, the reason in `stderr`; never a throw, as pi's own `exec` resolves a failed command), so an extension that ignores the exit code reads nothing; it is a `warn` line in the host's log naming the extension file, once per extension and command. This gates pi's API only: an extension may start processes itself. Every load (whatever `exec` is) imports each extension through a small wrapper module the adapter writes to a per-user directory under the temp directory (`yoagent-pi-wrappers-<uid>`, kept and reused; refused unless it is a real directory owned by that user that no one else can write — on Windows, only that it is a directory) |
+| `ctx.model`, `ctx.modelRegistry` | the host's: `model` (`{provider, id, name?, contextWindow?, maxTokens?, reasoning?, input?}`; default the model id of the run's latest request under provider `yoagent` (an observer event carries its run's, `agent_end` included) — before a run's first request (`input`) or outside a run (`session_start`), any run's latest request; `undefined` before the first request — in pi's `Model` shape (`api` `yoagent`, no costs, no credentials), and a **read-only** registry over `models` (default `[model]`, so empty without `model`): `getAll`, `getAvailable`, `find`, `getProviderDisplayName`, `getRegisteredProviderIds`, the `*OfType` lookups (every model is a chat model), `refresh` (does nothing); `hasConfiguredAuth` / `isUsingOAuth` false; it cannot be written to; every other method — credentials, model calls, registering providers — throws "not available in yoagent" (logged once). Both logged as fixed answers |
+| `ctx.isProjectTrusted()`, `ctx.getContextUsage()`, print-mode `ctx.ui` dialogs | fixed answers: `projectTrusted` (default `false`; pi's own default is `true`), `undefined`, and no user to ask (`confirm` false, the others nothing). Each is an `info` line in the host's log the first time it is asked (once per question and answer in a runtime), tagged `[pi] fixed answer: <question> → <answer>`, so a plugin that does nothing can be traced to what it was told |
 | `pi.setActiveTools` | an allowlist over the tools pi knows — yoagent's built-ins under pi's names and the extensions' tools: those outside it are not offered and their calls are denied. Tools pi does not know (MCP tools, sub-agents, the host's own) are not affected, as in pi. As in pi, a tool named in it is activated even when `defaultActive` is false (not when hidden), and a tool registered later that pi would activate joins it. `getActiveTools` / `getAllTools` answer from the same view |
 | `on("tool_call")` | `before_tool` for every call. yoagent's built-ins are judged under pi's names (`bash`, `read_file`→`read`, `write_file`→`write`, `edit_file`→`edit` with `edits`, `search`→`grep` with `glob` / `ignoreCase` (yoagent's search is case-insensitive unless asked, pi's grep the reverse), `list_files`→`find`; config `toolNames` adds more), with a relative `path` resolved against `cwd` first so the tool acts where the policy looked (yoagent's built-ins only: another tool's `path` may be a repository's). `{ block }` denies (`terminate: true` also stops the run at its next model request — stricter than pi, which ends only a batch whose results all set it); in-place changes to `event.input` rewrite the arguments, and one the yoagent tool cannot take (a second edit, a `timeout` on `bash`) denies the call; a throwing handler blocks, as in pi |
 | `on("tool_result")` | `after_tool`: content, details and isError edits, chained; only the fields a handler set are applied (a replaced content keeps its text and image blocks). A throwing handler **withholds the result** — unlike pi, which skips it: a failed redaction must not let the raw output through |
 | `on("input")` | `on_input`: `handled` rejects the prompt (it never reaches the agent, as in pi); `transform` and a throwing handler reject it too (yoagent cannot rewrite a prompt) |
 | `on("before_agent_start")` | `before_model`: the handlers run once per run, and the text they add around `event.systemPrompt` is a note on the latest user turn of every request of that run. A handler that throws, replaces the prompt or changes `systemPromptOptions` is skipped with a warning — even under `strict` (a run cannot refuse the load), so a policy that replaces the prompt (a "read-only mode") does not apply; the others still count. A returned `message` is dropped, the same handler's addition kept |
 | `on("session_start")` / `on("session_shutdown")` | when the adapter loads / unloads; a `session_start` handler that throws refuses the load (its extension may be missing its policies) |
+| `on("agent_start")`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update`, `tool_execution_start` / `_update` / `_end` | fired from yoagent's event stream (the bridge's `on_event`, subscribed only to the event types the handlers present at load need, so `message_update`'s per-chunk traffic only when someone listens): after the fact and in order, each handler on its own copy. The handlers run on the adapter's own queue, so a slow one (a tracer flushing over the network) delays the observers after it but never the run; a handler that takes over 30 s is left running and the queue moves on (reported once per run); past 1000 waiting events, streaming events (`message_update`, `tool_execution_update`) are dropped, starts and ends only past 2000, and each burst of drops is counted in the log. Unloading waits up to 5 s for queued events, so `agent_end` comes before `session_shutdown`. Observers only: a result is ignored (a `turn_end` asking to `continue` or add `entries` is reported once), a throw is reported once per run and the others still run. Tool calls carry pi's names and argument shapes (`write_file` → `write`) in the tool events and inside messages; `turn_end` fires, as in pi, only for a turn that ended with an assistant message, with its turn index, message and tool results, generated entry ids and an empty `context` preview (yoagent keeps no pi session entries); `message_update`'s `assistantMessageEvent` is the delta (`text_delta`, `thinking_delta`, `toolcall_delta`). `message_end` stays on the checked path below and is **not ordered with these events** (a tool result's `message_end` comes after its turn's `turn_end`) |
 | `on("message_end")` / `on("context")` | checked, not applied: each message of the run goes (a copy) to the `message_end` handlers once — the assistant message in `before_tool`, before any of its tools runs; prompts and tool results before the next request; the answer in `on_stop` — and the messages each request sends go to the `context` handlers. A handler that reads (usage meters, footers, indexers) works; one that would change what it got (a returned `message` / `messages`, or an edit in place) stops the adapter, since yoagent cannot apply the change; a check cut short by the hook's timeout or a cancel does not pass. The answer is checked after it was given: a rewrite there fails the run only if the host made the bridge `.required()`, and refuses every later run. "Once" is per message as sent (a message compaction truncated counts as new). The adapter asks the bridge for the run's conversation (`options.messages`) only when such handlers exist at load; a later one is then checked too (without any at load, it is refused) |
 
 **What refuses the load** (fail closed, `strict` or not): an extension that
@@ -471,8 +582,8 @@ cannot go around it.
 
 **What is only reported** (a warning in the host's `tracing` logs, through the bridge's `log`; config
 `strict: true` makes it a load failure): every other unfired event —
-observers such as `agent_end` or `tool_execution_*`, pi's session events,
-the boundary events `turn_end` / `agent_before_settle` — commands,
+pi's session events, `agent_before_settle` / `agent_settled`, and an
+observer registered after load whose event types are not subscribed — commands,
 shortcuts, flags, renderers, model providers, virtual models and MCP
 servers. `pi.appendEntry` and `pi.sendMessage` are recorded in the
 adapter's in-memory session — readable through `ctx.sessionManager`, a
@@ -503,7 +614,17 @@ the same file (as in pi), nor tools outside `TOOL_NAMES` / `toolNames`
 Config: `extensions` (files, or directories with an `index.ts` /
 `index.js`, loaded in order; relative paths resolve against `cwd`), `cwd`
 (the project the extensions see; default the runtime's), `name`,
-`toolNames`, `withoutBuiltins`, `allowUnmapped`, `strict`. Load it as a
+`toolNames`, `withoutBuiltins`, `allowUnmapped`, `strict`, `exec` (default
+`false`; see `pi.exec` above), `execFor` (per extension file, as in
+`extensions` — resolved against `cwd` — its own grant over `exec`; a key
+naming no loaded extension refuses the load), `projectTrusted` (default
+`false`), `model` / `models` (see `ctx.model` above), `nestedCalls`
+(`"any"` by default, as pi; `"own-extension"`: a pi tool's `ctx.executeTool`
+reaches only tools whose winning registration (the first in the list) is
+its own extension's; `"off"`; a refused call is an error result to the
+calling tool and an `info` line in the host's log, and `ctx.tools` lists
+only what it may call; a codemode-style tool, which calls other tools by
+design, is then limited to its own extension's). Load it as a
 row of a Node runtime whose `package.json` is `plugins/pi/`'s (pi 1.1.0,
 pinned exactly: the adapter imports pi's loader by file, since the package
 exports only `discoverAndLoadExtensions`, which also loads
@@ -512,9 +633,9 @@ upgrade), with `yoagent` shared in the loader's catalog.
 
 ```sh
 (cd plugins/pi && npm ci)
-cargo run --features node --example pi_extensions                          # the fixture extension, scripted
-cargo run --features node --example pi_extensions -- hello.ts todo.ts ...  # your pi extensions
-cargo run --features node --example pi_extensions -- --live --prompt "..." [--without bash] EXT.ts ...  # DeepSeek
+cargo run --features node,loader --example pi_extensions                          # the fixture extension, scripted
+cargo run --features node,loader --example pi_extensions -- hello.ts todo.ts ...  # your pi extensions
+cargo run --features node,loader --example pi_extensions -- --live --prompt "..." [--without bash] EXT.ts ...  # DeepSeek
 ```
 
 The example runs yoagent's own tools in the temporary project the
@@ -552,7 +673,7 @@ downloads, among npm's first 1000 search results) load through these
 adapters is measured in
 [plugin compatibility](../../docs/evals/plugin-compatibility.md)
 (`scripts/ecosystem-matrix.mjs`, which runs `examples/ecosystem_probe.rs`
-per package).
+— `yoagent_rutis::probe` on the command line — per package).
 
 The point is that **a plugin's safety policy never silently stops
 applying**. Not every rule arises for every adapter: the DSH adapter maps
@@ -669,21 +790,73 @@ the others).
 - **Route rutis's `ErrorSink`** (default: `eprintln!`) into your logging with
   `Ctx::root_with_sink` — bus listener failures and cleanup errors are
   reported there, not to the agent.
+- **What each plugin costs the agent**: `bridge.registry().timings()` lists,
+  per handler and kind of hook — and per tool, for the executions of the
+  tools it offers (`hook: "tool"`) — the calls made, how many failed, how
+  many were cancelled (a hook of a cancelled run, a `finish` cut off by
+  yoagent's limit, a tool that returned `ToolError::Cancelled`), and the
+  total and longest time the agent waited for them, measured at the bridge.
+  For a language plugin that is the round trip to its runtime, and for its
+  `on_event` the time to queue an event it subscribed to; for a Rust
+  handler, the call itself. Always on: two clock reads and a short lock per
+  call. `take_timings()` reads and starts from zero, so called after each
+  run it gives that run's figures (with the bridge as a tree extension, the
+  sub-agent runs it served included). The numbers to decide whether a
+  plugin is worth rewriting in Rust.
+- **Which plugin offered a tool**: `bridge.registry().offered_by(run_id, tool)`
+  — and `offered_by` on the `ToolCall` every `before_tool` / `after_tool`
+  handler receives — is the `ToolOwner` of a plugin tool in that run: the
+  handler's name, the plugin it registered under (a Rust plugin's name; for a
+  language plugin, the loader id of the row that registered it, which the
+  host sees itself — rutis 0.12's caller row — so a policy can trust it;
+  the runtime session only for a call from outside any row; copies of one
+  row in an instanced group share its id, and row ids and Rust plugin names
+  (`Plugin::name()`) are one name space; a row is attributed only when the plugin declares
+  `yoagent` in its `inject`) and an
+  optional `source`, which the handler
+  declares per tool: the pi adapter gives the extension file that registered
+  the tool, a TypeScript, Python or Go plugin may set `source` on the tools it
+  returns, and the DSH adapter gives none (DSH's tool registry does not record
+  which plugin registered a tool). `None` for the agent's own tools; known from
+  the run's `tools` until it ends. For a policy that trusts a tool by where it
+  came from, say an allow list per plugin. `source` is self-declared, and when
+  the agent itself (or an extension before the bridge) has a tool of the same
+  name, yoagent keeps that one while `offered_by` still names the plugin —
+  keep your own tool names apart from your plugins'.
+  In the pi adapter a run's calls — top-level and nested (`ctx.executeTool`)
+  — run the definitions its `tools` offered, so `source` names what runs.
+  Two limits remain: a pi tool's **nested** calls are judged by pi's own
+  `tool_call` handlers only, never by the host's per-call policies (yoagent's
+  `before_tool`, an approval gate), so trusting a tool that calls
+  `ctx.executeTool` trusts what it calls — set the adapter's `nestedCalls`
+  to `"own-extension"` to keep that within the tool's own extension, or
+  `"off"`; and extensions in one runtime share a process, so per-extension
+  trust guards against honest name clashes, not against a hostile extension
+  loaded beside the others.
 
 ## Versions
 
 yoagent-rutis 0.1 (crates.io) requires yoagent 0.25 (the first release with
-`Extension`) and rutis 0.6; 0.2 requires rutis 0.8; 0.3 requires
-rutis 0.9 and Rust 1.88. rutis's release train (`rutis`, `rutis-bridge`,
-`rutis-loader`, the npm and PyPI runtimes) shares one version: move the host
-and the language runtimes together. yoagent and rutis types are in its API, so a minor bump of
-either is a minor bump of yoagent-rutis. Take `yoagent` from the same source
+`Extension`) and rutis 0.6; 0.2 requires rutis 0.8; 0.3 and 0.4 require
+rutis 0.9 and Rust 1.88; 0.5 requires rutis 0.11 (Rust 1.88; plugins built
+with rutis's 0.11 SDK need 0.11 runtimes, and an integer beyond ±(2^53−1)
+now crosses as a big integer, which a 0.10-or-older peer refuses); 0.6
+requires rutis 0.12 (Rust 1.88; services a plugin `ctx.provide`s without
+declaring them now reach rutis, so on a name clash the row providing it
+later fails: rename it or list it in that row's `isolate`; and
+`ServiceCatalog::new()` shares every name, so a row injecting a service
+nobody provides waits in rutis instead of reading as started —
+`share_registered_only()` keeps the old rule). rutis's release
+train (`rutis`, `rutis-bridge`, `rutis-loader`, the npm and PyPI runtimes)
+shares one version: move the host and the language runtimes together.
+yoagent and rutis types are in its API, so a minor bump of either is a
+minor bump of yoagent-rutis. Take `yoagent` from the same source
 as `yoagent-rutis`: a crates.io `yoagent` next to a git `yoagent-rutis` is two
 `yoagent` crates whose types do not match.
 
 ```toml
 yoagent = "0.25"
-yoagent-rutis = "0.3"
+yoagent-rutis = "0.7"
 ```
 
 ## License

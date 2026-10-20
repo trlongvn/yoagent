@@ -34,8 +34,17 @@ By default a command inherits the agent's whole environment, including any `*_AP
 `env_allowlist` to pass only the listed variables (plus `PATH`, `HOME`, `PWD` if present).
 
 Output beyond `max_output_bytes` is drained and discarded, so memory stays bounded. A timeout
-returns an error carrying the output so far. A timeout or cancel kills the `bash` process, but not
-what it started (pipeline stages, `&&` lists, background jobs).
+returns an error carrying the output so far. On Unix a timeout or cancel kills the whole process
+group (pipeline stages, `&&` lists, background jobs; only a process that starts its own session
+escapes); elsewhere it kills the `bash` process only.
+
+A command that finishes on its own leaves its background jobs running (a server it started, say),
+even if the call is cancelled after `bash` exits. The call ends when `bash` exits: the output is
+read for one more second, and a job that still holds the output pipes then is left running. What
+it prints from then on is read and discarded in the background (so a closed pipe does not kill
+it; a job that prints without pause keeps that reading busy), and the result says so with a
+`NOTE:` line and `details.output_still_open: true`. Redirect a job's output (`cmd >log 2>&1 &`)
+to keep it. Before 0.25.8 such a job held the call until the timeout, which then killed it.
 
 ### Example
 
@@ -71,6 +80,11 @@ Every file tool (`read_file`, `write_file`, `edit_file`, `list_files`, `search`)
 path, so `..` and symlinks (dangling ones included) cannot escape, and the tool does its I/O on
 the checked path (see `PathSandbox`). Before 0.24.2 a `..` after a missing directory, or a
 dangling symlink, could get past the check.
+
+`read_file`, `write_file` and `edit_file` refuse a path that is not a regular file (after
+following symlinks): a FIFO, a device, a socket or a directory. Before 0.25.8 a FIFO passed the
+size check (its length reads 0) and the read blocked until something wrote to it, and a device
+such as `/dev/zero` was read without end.
 
 ## WriteFileTool
 
@@ -133,6 +147,14 @@ can never be read as flags. When some files cannot be searched (unreadable, remo
 matches found elsewhere are still returned, followed by the tool's stderr under `Warnings:`
 (`details.warnings` holds the same text, capped at 2,000 characters, or `null`); only a search
 that found nothing and hit an error fails.
+
+The tool uses ripgrep when an `rg` is on `PATH` (looked up directly, no `which` needed) and
+`grep -r` otherwise; `details.engine` says which ran. Your own options never reach it: `rg` runs
+with `--no-config`, and `RIPGREP_CONFIG_PATH` and `GREP_OPTIONS` are cleared, so neither can change
+the `path:line:text` output or follow a symlink out of `allowed_paths`. They still apply to `rg` or
+`grep` run through `bash`. A search that ends abnormally (killed by a signal, an unexpected exit
+code, an unreadable output) is an error when it found nothing, and its matches carry a warning
+otherwise: it never reads as "No matches".
 
 ## SharedStateTool
 

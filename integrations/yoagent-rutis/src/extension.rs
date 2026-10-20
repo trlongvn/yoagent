@@ -51,6 +51,7 @@
 //! was unloaded with it, so an empty registry must not read as "no policy
 //! objected".
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,10 +68,10 @@ use yoagent::{
 };
 
 use crate::handler::{
-    join_notes, llm_messages, EventSink, Input, Messages, RunInfo, Stop, ToolCall, Turn,
+    join_notes, llm_messages, EventSink, Input, Messages, Offer, RunInfo, Stop, ToolCall, Turn,
 };
 use crate::host::{Host, NOT_RUNNING};
-use crate::registry::{LiveTool, Registered, Registry};
+use crate::registry::{LiveTool, Outcome, Registered, Registry, ToolOwner};
 
 /// Default bound on one handler's `before_tool`, `after_tool` and `on_stop`
 /// call (the tool call is denied / the result withheld / the handler skipped
@@ -253,6 +254,9 @@ impl Extension for RutisExtension {
             .collect();
         let unjudged = self.require_policy && !handlers.iter().any(|h| h.hooks.before_tool);
         Ok(Box::new(RunState {
+            registry: self.registry.clone(),
+            offered: Arc::default(),
+            recorded: false,
             host: self.host.clone(),
             run: info,
             required: self.mode == ExtensionMode::Required,
@@ -266,6 +270,14 @@ impl Extension for RutisExtension {
     }
 }
 
+impl Drop for RunState {
+    fn drop(&mut self) {
+        if self.recorded {
+            self.registry.forget_offers(&self.run.run_id);
+        }
+    }
+}
+
 /// One handler's event delivery for the run.
 struct Observer {
     handler: Registered,
@@ -276,6 +288,12 @@ struct Observer {
 
 /// One run's hooks over the snapshot of handlers.
 struct RunState {
+    registry: Arc<Registry>,
+    /// Which handler offered each plugin tool of the run (set by `tools`,
+    /// also in the registry until the run's hooks are dropped).
+    offered: Arc<HashMap<String, ToolOwner>>,
+    /// This run's `tools` made the registry's record of `offered`.
+    recorded: bool,
     host: Host,
     run: RunInfo,
     required: bool,
@@ -321,7 +339,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// it panics, abandoned past `limit` or when its plugin unloads mid-call.
 async fn call<T>(
     h: &Registered,
-    hook: &str,
+    hook: &'static str,
     limit: Option<Duration>,
     fut: impl std::future::Future<Output = Result<T, ExtensionError>>,
 ) -> Result<T, Missed> {
@@ -331,6 +349,18 @@ async fn call<T>(
             h.name
         )));
     }
+    let timer = h.time(hook);
+    let result = call_timed(h, hook, limit, fut).await;
+    timer.done(Outcome::answered(result.is_ok()));
+    result
+}
+
+async fn call_timed<T>(
+    h: &Registered,
+    hook: &'static str,
+    limit: Option<Duration>,
+    fut: impl std::future::Future<Output = Result<T, ExtensionError>>,
+) -> Result<T, Missed> {
     let guarded = AssertUnwindSafe(fut).catch_unwind();
     let raced = async {
         tokio::select! {
@@ -466,12 +496,24 @@ fn answer_text(answer: &Message) -> String {
 impl RunHooks for RunState {
     async fn tools(&mut self, _run: &RunContext<'_>) -> Vec<Arc<dyn AgentTool>> {
         let mut tools: Vec<Arc<dyn AgentTool>> = Vec::new();
-        let mut taken = std::collections::HashSet::new();
-        let mut offer = |tool: Arc<dyn AgentTool>, h: &Registered, tools: &mut Vec<_>| {
-            if taken.insert(tool.name().to_string()) {
+        let mut offered = HashMap::new();
+        let mut offer = |tool: Arc<dyn AgentTool>,
+                         source: Option<String>,
+                         h: &Registered,
+                         tools: &mut Vec<_>| {
+            if !offered.contains_key(tool.name()) {
+                offered.insert(
+                    tool.name().to_string(),
+                    ToolOwner {
+                        handler: h.name.to_string(),
+                        owner: h.owner.to_string(),
+                        source,
+                    },
+                );
                 tools.push(Arc::new(LiveTool {
                     inner: tool,
                     gate: h.gate.clone(),
+                    handler: h.clone(),
                 }) as Arc<dyn AgentTool>);
             } else {
                 tracing::warn!(
@@ -488,7 +530,7 @@ impl RunHooks for RunState {
                 continue;
             }
             for tool in h.handler.static_tools() {
-                offer(tool, h, &mut tools);
+                offer(tool, None, h, &mut tools);
             }
             if h.hooks.tools {
                 match call(
@@ -500,8 +542,8 @@ impl RunHooks for RunState {
                 .await
                 {
                     Ok(dynamic) => {
-                        for tool in dynamic {
-                            offer(tool, h, &mut tools);
+                        for Offer { tool, source } in dynamic {
+                            offer(tool, source, h, &mut tools);
                         }
                     }
                     // Not raised as a panic: recorded, and handed to yoagent
@@ -510,6 +552,7 @@ impl RunHooks for RunState {
                 }
             }
         }
+        (self.offered, self.recorded) = self.registry.record_offers(&self.run.run_id, offered);
         tools
     }
 
@@ -593,7 +636,12 @@ impl RunHooks for RunState {
             return ToolDecision::Deny(UNJUDGED.into());
         }
         let handlers: Vec<&Registered> = self.with(|h| h.hooks.before_tool).collect();
-        let mut event = ToolCall::from_request(request, &self.run, wants_messages(&handlers));
+        let mut event = ToolCall::from_request(
+            request,
+            &self.run,
+            wants_messages(&handlers),
+            self.offered.get(request.tool_name).cloned(),
+        );
         for h in handlers {
             let decision = call(
                 h,
@@ -628,7 +676,12 @@ impl RunHooks for RunState {
         if let Some(why) = self.pending() {
             return Err(ExtensionError::new(why));
         }
-        let event = ToolCall::from_request(request, &self.run, false);
+        let event = ToolCall::from_request(
+            request,
+            &self.run,
+            false,
+            self.offered.get(request.tool_name).cloned(),
+        );
         for h in self.with(|h| h.hooks.after_tool) {
             let edited = call(
                 h,
@@ -728,16 +781,27 @@ impl RunHooks for RunState {
             if observer.off.load(Ordering::Relaxed) || !observer.handler.gate.is_available() {
                 continue;
             }
+            let timer = observer.handler.time("on_event");
             let sent = std::panic::catch_unwind(AssertUnwindSafe(|| observer.sink.send(event)));
             let failed = match sent {
                 // A Rust handler panicked.
-                Err(payload) => Some(format!(
-                    "plugin handler `{}` panicked in `on_event`: {} (not called again this run)",
-                    observer.handler.name,
-                    panic_text(&*payload)
-                )),
+                Err(payload) => {
+                    timer.done(Outcome::Failed);
+                    Some(format!(
+                        "plugin handler `{}` panicked in `on_event`: {} (not called again this run)",
+                        observer.handler.name,
+                        panic_text(&*payload)
+                    ))
+                }
                 // A language plugin's delivery failed (its message says how).
-                Ok(()) => observer.sink.failure(),
+                Ok(taken) => {
+                    if taken {
+                        timer.done(Outcome::Ok);
+                    } else {
+                        timer.discard();
+                    }
+                    observer.sink.failure()
+                }
             };
             if let Some(why) = failed {
                 observer.off.store(true, Ordering::Relaxed);
